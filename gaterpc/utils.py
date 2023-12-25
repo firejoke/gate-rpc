@@ -3,14 +3,19 @@
 # Created Date: 2023/5/22 16:36
 import asyncio
 import platform
+import struct
+from asyncio import Task
 from collections import UserDict, deque
+from copy import deepcopy
+from functools import wraps
 from logging import getLogger
 from typing import (
-    Any, Coroutine, Dict, Iterable, MutableMapping, Optional, TypeVar,
+    Any, Dict, Iterable, MutableMapping, Optional, TypeVar,
     Union, overload, ByteString,
 )
 
 from .mixins import _LoopBoundMixin
+from gaterpc.conf.global_settings import Settings
 
 
 KT = TypeVar("KT")
@@ -216,9 +221,32 @@ class BoundedDict(UserDict, _LoopBoundMixin):
 def to_bytes(s: Union[str, bytes, float, int]):
     if isinstance(s, str):
         return s.encode("utf-8")
-    elif isinstance(s, (int, float)):
-        return f"{s}".encode("utf-8")
+    elif isinstance(s, int):
+        if -128 <= s <= 127:
+            return struct.pack("!b", s)
+        elif -32768 <= s <= 32767:
+            return struct.pack("!h", s)
+        elif -2147483648 <= s <= 2147483647:
+            return struct.pack("!i", s)
+        return struct.pack("!d", s)
+    elif isinstance(s, float):
+        return struct.pack("!d", s)
     return s
+
+
+def from_bytes(b: bytes) -> Union[str, float, int]:
+    fmt = {
+        1: "!b",
+        2: "!h",
+        4: "!i",
+        8: "!d"
+    }
+    if b_len := len(b) in fmt:
+        try:
+            return struct.unpack(fmt[b_len], b)
+        except struct.error:
+            pass
+    return b.decode("utf-8")
 
 
 def msg_dump(obj: Any) -> ByteString:
@@ -247,3 +275,32 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
     if proto not in ("inproc", "ipc", "tcp", "pgm", "epgm"):
         raise SystemError(f"The protocol \"{proto}\" is not supported.")
     return socket_addr
+
+
+async def gen_reply(
+    task: Task = None, result: Any = None, exception: Exception = None
+):
+    reply = deepcopy(Settings.RPC_REPLY_TEMPLATE)
+    if task:
+        try:
+            await task
+            reply["result"] = task.result()
+            reply["exception"] = task.exception()
+        except asyncio.CancelledError as error:
+            reply["result"] = None
+            reply["exception"] = error
+    else:
+        reply["result"] = result
+        reply["exception"] = exception
+    return reply
+
+
+def interface(methode):
+    @wraps(methode)
+    def wrapper(*args, **kwargs):
+        logger.debug(
+            f"method: {methode.__name__}, args: {args}, kwargs: {kwargs}"
+        )
+        return methode(*args, **kwargs)
+    wrapper.__interface__ = True
+    return wrapper
