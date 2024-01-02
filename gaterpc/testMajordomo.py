@@ -10,15 +10,15 @@ from gaterpc.global_settings import Settings
 from gaterpc.core import IOWorker, Service, AMajordomo, Client
 
 
-class SRWorker(IOWorker):
+class GRWorker(IOWorker):
     pass
 
 
-class SRService(Service):
+class GRService(Service):
     pass
 
 
-class SRMajordomo(AMajordomo):
+class GRMajordomo(AMajordomo):
     pass
 
 
@@ -28,33 +28,33 @@ class SRClient(Client):
 
 async def test():
     Settings.setup()
-    sr_majordomo = SRMajordomo(backend_addr="tcp://127.0.0.1:5555")
-    sr_majordomo.bind("tcp://127.0.0.1:777")
-    sr_majordomo.run()
-    sr = SRService(name="SRkv")
-    sr_worker = sr.create_worker(
-        "io", SRWorker, "tcp://127.0.0.1:5555"
+    gr_majordomo = GRMajordomo(backend_addr="tcp://127.0.0.1:5555")
+    gr_majordomo.bind("tcp://127.0.0.1:777")
+    gr_majordomo.run()
+    gr = GRService(name="")
+    gr_worker = gr.create_worker(
+        "io", GRWorker, "tcp://127.0.0.1:5555"
     )
-    print(sr_worker.service)
-    if sr_worker.service is not sr:
+    print(gr_worker.service)
+    if gr_worker.service is not gr:
         return
-    print(sr_worker.interfaces)
-    sr_worker.run()
+    print(gr_worker.interfaces)
+    gr_worker.run()
     await asyncio.sleep(5)
-    sr_cli = SRClient("tcp://127.0.0.1:777")
+    gr_cli = SRClient("tcp://127.0.0.1:777")
     i = 100
     print("start test")
     try:
         while i:
-            result = sr_cli.SRkv.atest("a", "b", "c", time=time())
+            result = gr_cli.SRkv.atest("a", "b", "c", time=time())
             print(await result)
             i -= 1
     except Exception:
         for line in format_exception(*sys.exc_info()):
             print(line)
-        sr_cli.disconnect()
-        await sr_worker.stop()
-        sr_majordomo.stop()
+        gr_cli.disconnect()
+        await gr_worker.stop()
+        gr_majordomo.stop()
 
 
 if __name__ == "__main__":
