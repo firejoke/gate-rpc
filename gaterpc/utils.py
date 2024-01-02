@@ -2,20 +2,30 @@
 # Author      : ShiFan
 # Created Date: 2023/5/22 16:36
 import asyncio
+import atexit
+import copy
+import inspect
 import platform
 import struct
-from asyncio import Task
+import sys
+from asyncio import (
+    CancelledError, Task, Queue as AQueue,
+    QueueEmpty as AQueueEmpty,
+)
 from collections import UserDict, deque
-from copy import deepcopy
+from collections.abc import Callable
 from functools import wraps
-from logging import getLogger
+from importlib import import_module
+from logging import Handler, getLogger
+from traceback import format_tb
 from typing import (
     Any, Dict, Iterable, MutableMapping, Optional, TypeVar,
     Union, overload, ByteString,
 )
 
+import msgpack
+
 from .mixins import _LoopBoundMixin
-from gaterpc.conf.global_settings import Settings
 
 
 KT = TypeVar("KT")
@@ -33,7 +43,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
     """
 
     def __init__(
-        self, data: dict = None, maxsize: int = 1000, timeout: int = 0,
+        self, data: dict = None, maxsize: int = 1000, timeout: float = 0,
         /, **kwargs
     ):
         """
@@ -45,8 +55,10 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         self.maxsize = maxsize
         self.usable_size = maxsize
         self.timeout = timeout
-        self._set_waiters: deque[asyncio.Future] = deque()
-        self._get_waiters: Dict[KT, deque[asyncio.Future]] = dict()
+        self._set_waiters: deque = deque()
+        self._get_waiters: Dict[KT, deque] = dict()
+        if not data:
+            data = {}
         if (len(data) + len(kwargs)) > maxsize:
             raise RuntimeError(
                 "The initial data size exceeds the maximum size limit."
@@ -58,7 +70,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             any(not w.cancelled() for w in self._set_waiters)
         )
 
-    async def aset(self, key: KT, value: VT, timeout: int = None):
+    async def aset(self, key: KT, value: VT, timeout: float = None):
         if not self._set_locked():
             if key not in self.data:
                 self.usable_size -= 1
@@ -71,8 +83,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
 
             try:
                 try:
-                    async with asyncio.timeout(timeout):
-                        await fut
+                    await asyncio.wait_for(fut, timeout)
                 except asyncio.TimeoutError:
                     is_timeout = True
                 finally:
@@ -97,7 +108,10 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         return
 
     def set(self, key: KT, value: VT):
-        return asyncio.run(self.aset(key, value, timeout=None))
+        loop = self._get_loop()
+        t = loop.create_task(self.aset(key, value, timeout=None))
+        self._set_waiters.append(t)
+        t.add_done_callback(self._set_waiters.remove)
 
     def _release_set(self):
         if self.usable_size >= self.maxsize:
@@ -121,14 +135,14 @@ class BoundedDict(UserDict, _LoopBoundMixin):
     async def aget(
         self, key: KT,
         default: VT = None,
-        timeout: int = None,
+        timeout: float = None,
         ignore: bool = True
     ) -> VT:
         """
         :param key: 要查询的 key
         :param default: 没有 key 时返回的值
         :param timeout: 超时时间
-        :param ignore: 没有 key 时是否引发索引错误
+        :param ignore: 没有 key 时是否引发键错误
         :return:
         """
         is_timeout = False
@@ -142,8 +156,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             key_waiters.append(fut)
             try:
                 try:
-                    async with asyncio.timeout(timeout):
-                        await fut
+                    await asyncio.wait_for(fut, timeout)
                 except asyncio.TimeoutError:
                     is_timeout = True
                 finally:
@@ -157,7 +170,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         except KeyError:
             if ignore:
                 return default
-            raise
+            raise KeyError(key)
         finally:
             if is_timeout and timeout > 0:
                 raise asyncio.TimeoutError(f'get "{key}" timeout.')
@@ -205,6 +218,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         pass
 
     def update(self, m: None, **kwargs: VT) -> None:
+        loop = self._get_loop()
         if isinstance(m, MutableMapping):
             items = m.items()
         elif isinstance(m, Iterable):
@@ -212,57 +226,169 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         else:
             items = []
         for k, v in items:
-            asyncio.run(self.aset(key=k, value=v))
+            t = loop.create_task(self.aset(key=k, value=v))
+            self._set_waiters.append(t)
+            t.add_done_callback(self._set_waiters.remove)
         for k, v in kwargs.items():
-            asyncio.run(self.aset(key=k, value=v))
+            t = loop.create_task(self.aset(key=k, value=v))
+            self._set_waiters.append(t)
+            t.add_done_callback(self._set_waiters.remove)
         return
 
 
-def to_bytes(s: Union[str, bytes, float, int]):
-    if isinstance(s, str):
-        return s.encode("utf-8")
-    elif isinstance(s, int):
-        if -128 <= s <= 127:
-            return struct.pack("!b", s)
-        elif -32768 <= s <= 32767:
-            return struct.pack("!h", s)
-        elif -2147483648 <= s <= 2147483647:
-            return struct.pack("!i", s)
-        return struct.pack("!d", s)
-    elif isinstance(s, float):
-        return struct.pack("!d", s)
-    return s
+class AQueueListener(object):
+    _sentinel = None
+
+    def __init__(
+        self, loop, handlers: Union[list[Handler], tuple[Handler]] = None,
+        respect_handler_level=False
+    ):
+        self.respect_handler_level = respect_handler_level
+        if isinstance(loop, str):
+            loop = resolve_module_attr(loop)
+        if isinstance(loop, Callable):
+            loop = loop()
+        sys.stdout.write(f"AQueueListener.loop: {loop.__class__}\n")
+        sys.stdout.flush()
+        self._loop: asyncio.AbstractEventLoop = loop
+        self.queue = AQueue()
+        self.handlers = dict()
+        self._task = None
+        if handlers:
+            self.add_handlers(handlers)
+        atexit.register(self.stop)
+        self._loop.call_soon(self.start)
+
+    def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
+        for handler in handlers:
+            self.handlers[handler.get_name()] = handler
+
+    async def dequeue(self, block=True):
+        return await self.queue.get()
+
+    async def prepare(self, record):
+        return record
+
+    async def handle(self, record):
+        record = await self.prepare(record)
+        handler = self.handlers.get(record.h_name)
+        if handler:
+            if not self.respect_handler_level:
+                process = True
+            else:
+                process = record.levelno >= handler.level
+            if process:
+                await asyncio.to_thread(handler.handle, record)
+                # await self._loop.create_task(handler.handle(record))
+
+    def enqueue_sentinel(self):
+        self.queue.put_nowait(self._sentinel)
+
+    async def _monitor(self):
+        while True:
+            try:
+                record = await self.dequeue()
+                if record is self._sentinel:
+                    self.queue.task_done()
+                    break
+                await self.handle(record)
+                self.queue.task_done()
+            except AQueueEmpty:
+                break
+            except CancelledError:
+                self.queue.task_done()
+                break
+
+    def start(self):
+        if not self._task:
+            self._task = self._loop.create_task(self._monitor())
+
+    def stop(self):
+        if self._task:
+            self.enqueue_sentinel()
+            if not self._task.done():
+                self._task.cancel()
+            self._task = None
 
 
-def from_bytes(b: bytes) -> Union[str, float, int]:
-    fmt = {
-        1: "!b",
-        2: "!h",
-        4: "!i",
-        8: "!d"
-    }
-    if b_len := len(b) in fmt:
+class QueueHandler(Handler):
+    def __init__(
+        self, handler_class: Union[Handler, str], *args, **kwargs
+    ):
+        Handler.__init__(self)
+        if isinstance(handler_class, str):
+            handler_class = resolve_module_attr(handler_class)
+        self.listener: Optional[AQueueListener] = None
+        self.handler = handler_class(*args, **kwargs)
+        self.h_name = f"QueueHandler-handler"
+
+    def prepare(self, record):
+        msg = self.format(record)
+        record = copy.copy(record)
+        record.message = msg
+        record.msg = msg
+        record.args = None
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        record.h_name = self.h_name
+        return record
+
+    def enqueue(self, record):
+        self.listener.queue.put_nowait(record)
+
+    def emit(self, record):
         try:
-            return struct.unpack(fmt[b_len], b)
-        except struct.error:
-            pass
-    return b.decode("utf-8")
+            self.enqueue(self.prepare(record))
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        self.listener.stop()
+        super().close()
 
 
-def msg_dump(obj: Any) -> ByteString:
-    """
-    TODO: python对象序列化为数据
-    """
-    data = obj
-    return data
+class AQueueHandler(QueueHandler):
+    def __init__(
+        self, *args, handler_class: Union[Handler, str],
+        loop, **kwargs
+    ):
+        super().__init__(handler_class, *args, **kwargs)
+        self._name = f"AQueueHandler{id(self.handler)}"
+        self.h_name = f"{self._name}-handler"
+        self.handler.set_name(self.h_name)
+        self.listener = singleton_aqueue_listener(loop)
+        self.listener.add_handlers((self.handler,))
 
 
-def msg_load(data: ByteString) -> Any:
-    """
-    TODO: 数据反序列化为python对象
-    """
-    obj = data
-    return obj
+def singleton(cls):
+    instances = dict()
+
+    def get_instance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances.get(cls)
+    return get_instance
+
+
+singleton_aqueue_listener = singleton(AQueueListener)
+
+
+def resolve_module_attr(s: str):
+    name = s.split('.')
+    module_name = name.pop(0)
+    try:
+        found = import_module(module_name)
+        for frag in name:
+            try:
+                found = getattr(found, frag)
+            except AttributeError:
+                import_module(f"{module_name}.{frag}")
+                found = getattr(found, frag)
+        return found
+    except ImportError as e:
+        v = ValueError(f"Cannot resolve {s}: {e}")
+        raise v from e
 
 
 def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
@@ -277,24 +403,6 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
     return socket_addr
 
 
-async def gen_reply(
-    task: Task = None, result: Any = None, exception: Exception = None
-):
-    reply = deepcopy(Settings.RPC_REPLY_TEMPLATE)
-    if task:
-        try:
-            await task
-            reply["result"] = task.result()
-            reply["exception"] = task.exception()
-        except asyncio.CancelledError as error:
-            reply["result"] = None
-            reply["exception"] = error
-    else:
-        reply["result"] = result
-        reply["exception"] = exception
-    return reply
-
-
 def interface(methode):
     @wraps(methode)
     def wrapper(*args, **kwargs):
@@ -302,5 +410,95 @@ def interface(methode):
             f"method: {methode.__name__}, args: {args}, kwargs: {kwargs}"
         )
         return methode(*args, **kwargs)
+
+    @wraps(methode)
+    async def awrapper(*args, **kwargs):
+        logger.debug(
+            f"method: {methode.__name__}, args: {args}, kwargs: {kwargs}"
+        )
+        return await methode(*args, **kwargs)
+
     wrapper.__interface__ = True
+    awrapper.__interface__ = True
+    if inspect.iscoroutinefunction(methode):
+        return awrapper
     return wrapper
+
+
+async def to_bytes(s: Union[str, bytes, float, int]):
+    if isinstance(s, bytes):
+        return s
+    if isinstance(s, str):
+        return s.encode("utf-8")
+    fmt = "!d"
+    if isinstance(s, int):
+        if -128 <= s <= 127:
+            fmt = "!b"
+        elif -32768 <= s <= 32767:
+            fmt = "!h"
+        elif -2147483648 <= s <= 2147483647:
+            fmt = "!i"
+    return await asyncio.to_thread(struct.pack, fmt, s)
+
+
+async def from_bytes(b: bytes) -> Union[str, float, int]:
+    fmt = {
+        1: "!b",
+        2: "!h",
+        4: "!i",
+        8: "!d"
+    }
+    if b_len := len(b) in fmt:
+        try:
+            return await asyncio.to_thread(
+                struct.unpack, fmt[b_len], b
+            )
+        except struct.error:
+            pass
+    return b.decode("utf-8")
+
+
+async def encrypt(data):
+    # 考虑在协程里该如何避免阻塞
+    hash_str = data
+    return hash_str
+
+
+async def decrypt(hash_str):
+    # 考虑在协程里该如何避免阻塞
+    data = hash_str
+    return data
+
+
+async def msg_pack(obj: Any) -> ByteString:
+    data = await asyncio.to_thread(
+        msgpack.packb, obj
+    )
+    return data
+
+
+async def msg_unpack(data: ByteString) -> Any:
+    obj = await asyncio.to_thread(msgpack.unpackb, data)
+    return obj
+
+
+async def gen_reply(
+    task: Task = None, result: Any = None, exception: Exception = None
+):
+    if task:
+        try:
+            await task
+            result = task.result()
+        except Exception as error:
+            result = None
+            exception = error
+    if exception:
+        exception = (
+            str(exception.__class__),
+            str(exception),
+            "".join(format_tb(exception.__traceback__))
+        )
+    return {
+        "result": result,
+        "exception": exception
+    }

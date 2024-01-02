@@ -1,13 +1,13 @@
-from setuptools import setup
+from distutils.core import setup
 
 
 setup(
     name='gaterpc',
-    version='0.1',
-    packages=[''],
-    url='',
+    version='0.1.0',
+    packages=['gaterpc'],
+    url='https://github.com/firejoke/gate-rpc',
     license='',
-    author='ShiFan',
+    author='shifan',
     author_email='',
-    description=''
+    description='A RPC software based on ZeroMQ with built-in Majordomo.'
 )

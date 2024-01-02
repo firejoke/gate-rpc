@@ -1,2 +1,2 @@
-pyzmq>=25.0.2
-setuptools>=57.4.0
+msgpack==1.0.7
+pyzmq==25.1.2
