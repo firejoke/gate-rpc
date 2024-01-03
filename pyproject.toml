@@ -1,0 +1,22 @@
+[project]
+name = "gaterpc"
+dynamic = ["version"]
+dependencies = [
+    "msgpack>=1.0.7",
+    "pyzmq>=25.1.2",
+]
+requires-python = ">= 3.9"
+authors = [
+    {name = "Shi Fan", email="firejokeshi@gmail.com"},
+]
+description = "A RPC software based on ZeroMQ with built-in Majordomo."
+readme = "README.rst"
+license = {file = "LICENSE"}
+keywords = ["zero", "zeroMQ", "rpc"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3.9",
+]
+[project.urls]
+Repository = "https://github.com/firejoke/gate-rpc"
