@@ -11,15 +11,20 @@ class DefaultSettings(object):
     全局配置，运行Worker、AMajorodomo、Client之前都需要先执行该配置类的setup函数
     """
     # Base
-    DEBUG = True
+    DEBUG = False
     EVENT_LOOP_POLICY = None
     RUN_PATH: str = "/var/run/gate-rpc/"
     WINDOWS_MAX_WORKERS: int = 63 - 2
     CLIENT_TIMEOUT: int = 2  # second
-    IO_WORKER_ADDR: str = "inproc://io_worker"
-    CPU_WORKER_ADDR: str = f"ipc://{RUN_PATH}cpu_worker"
+    WORKER_ADDR: str = f"ipc://{RUN_PATH}cpu_worker"
     ZMQ_HWM: int = 1000
     MESSAGE_MAX: int = 1000
+    STREAM_GENERATOR_TAG = b"GateStreamGenerator"
+    STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
+    STREAM_END_MESSAGE = b"GateStreamEnd"
+    HUGE_DATA_SIZEOF = 1000
+    HUGE_DATA_COMPRESS_MODULE: str = "gzip"
+    HUGE_DATA_COMPRESS_LEVEL: int = 9
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
     ZAP_DEFAULT_DOMAIN: bytes = b"gate"
@@ -93,22 +98,22 @@ class DefaultSettings(object):
                 "class": "gaterpc.utils.AQueueHandler",
                 "handler_class": "logging.StreamHandler",
                 "loop": "asyncio.get_running_loop",
-                "formatter": "simple" if not DEBUG else "debug",
+                "formatter": "simple",
             },
         },
         "loggers": {
             "asyncio": {
-                "level": "DEBUG" if DEBUG else "INFO",
+                "level": "INFO",
                 "handlers": ["asyncio"],
                 "propagate": False,
             },
             "gaterpc": {
-                "level": "DEBUG" if DEBUG else "INFO",
-                "handlers": ["gaterpc", "console"] if DEBUG else ["gaterpc"],
+                "level": "INFO",
+                "handlers": ["gaterpc"],
                 "propagate": True,
             },
             "commands": {
-                "level": "DEBUG" if DEBUG else "INFO",
+                "level": "INFO",
                 "handlers": ["gaterpc", "console"],
                 "propagate": False,
             },
@@ -121,6 +126,13 @@ class DefaultSettings(object):
                 Warning(f"Settings {name} must be uppercase.")
                 continue
             setattr(self, name, value)
+        if self.DEBUG:
+            for handler in self.LOGGING["handlers"].values():
+                handler["formatter"] = "debug"
+            for logger in self.LOGGING["loggers"].values():
+                logger["level"] = "DEBUG"
+                logger["handlers"].append("console")
+        self.LOG_PATH.mkdir(exist_ok=True)
         dictConfig(self.LOGGING)
         if self.EVENT_LOOP_POLICY:
             import asyncio

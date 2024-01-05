@@ -1,35 +1,37 @@
 # -*- coding: utf-8 -*-
 # Author      : ShiFan
 # Created Date: 2023/3/30 11:09
+import contextvars
 import functools
 import secrets
 import inspect
-import os
 import sys
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Coroutine, Callable
+from collections.abc import Coroutine, Callable, AsyncGenerator, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from time import time
-from .global_settings import Settings
+from traceback import format_exception, format_tb
+from typing import Annotated, Union, overload, Optional
+from uuid import uuid4
 from logging import getLogger
 
 
 import asyncio
-from traceback import format_exception, format_tb
-from typing import Annotated, Union, overload, Optional
-from uuid import uuid4
-from gettext import gettext as _
 
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
 from zmq.auth.asyncio import AsyncioAuthenticator
 
-from .exceptions import BuysWorkersError, RemoteException, ServiceUnAvailableError
+from .global_settings import Settings
+from .exceptions import (
+    BuysWorkersError, RemoteException, ServiceUnAvailableError
+)
 from .mixins import _LoopBoundMixin
 from .utils import (
-    BoundedDict, check_socket_addr, from_bytes, gen_reply, interface,
-    msg_pack, msg_unpack, to_bytes,
+    BoundedDict, StreamReply, check_socket_addr, gen_reply,
+    interface,
+    msg_pack, msg_unpack, from_bytes, to_bytes,
 )
 
 
@@ -107,7 +109,11 @@ class ABCService(ABC):
 
 class RemoteWorker(ABCWorker):
     def __init__(
-        self, identity: bytes, address: bytes, heartbeat: int, service: "Service"
+        self,
+        identity: bytes,
+        address: bytes,
+        heartbeat: int,
+        service: "Service"
     ) -> None:
         """
         远程 worker 的本地映射
@@ -142,7 +148,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
         identity: str = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
         context: Context = None,
-        executor: Union[ThreadPoolExecutor, ProcessPoolExecutor] = None
+        thread_executor: ThreadPoolExecutor = None,
+        process_executor: ProcessPoolExecutor = None
     ):
         """
         :param broker_addr: 要连接的代理地址
@@ -150,7 +157,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
         :param identity: id
         :param heartbeat: 心跳间隔，单位是毫秒
         :param context: 用于创建socket的zeroMQ的上下文
-        :param executor: 用于执行协程的执行器
+        :param thread_executor: 用于执行io密集型任务
+        :param process_executor: 用于执行cpu密集型任务
         """
         self.heartbeat = heartbeat
         self.expiry = self.heartbeat_liveness * self.heartbeat
@@ -161,7 +169,13 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self._socket = None
         self._poller = z_aio.Poller()
         self._broker_addr = broker_addr
-        self.executor = executor
+        if not thread_executor:
+            thread_executor = ThreadPoolExecutor()
+        self.thread_executor = thread_executor
+        if not process_executor:
+            process_executor = ProcessPoolExecutor()
+        self.process_executor = process_executor
+        self.default_executor = self.thread_executor
         if not identity:
             identity = uuid4().hex
         self.identity = f"gw-{identity}".encode("utf-8")
@@ -202,7 +216,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
     async def connect(self):
         if not self.is_alive():
             logger.info(
-                _("Connecting to broker at {0} ...").format(self._broker_addr)
+                f"Connecting to broker at {self._broker_addr} ..."
             )
             self._socket = self._ctx.socket(
                 z_const.DEALER, z_aio.Socket
@@ -218,7 +232,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
 
     async def disconnect(self):
         if self.is_alive():
-            logger.warning(_("Disconnecting from broker"))
+            logger.warning("Disconnecting from broker")
             await self.send_to_broker(
                 Settings.MDP_COMMAND_DISCONNECT
             )
@@ -231,7 +245,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
         """
         关闭打开的资源。
         """
-        self.executor.shutdown()
+        self.thread_executor.shutdown()
+        self.process_executor.shutdown()
 
     async def stop(self):
         if self.is_alive():
@@ -247,9 +262,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.error(
-                f"process request task exception:\n{exception_info}"
-            )
+            logger.debug(f"process request task exception:\n{exception_info}")
 
     async def send_to_broker(
         self,
@@ -274,9 +287,20 @@ class Worker(ABCWorker, _LoopBoundMixin):
             *option,
             *message
         ]
-        message = [await to_bytes(s) for s in message]
-        logger.debug(_("send a message to broker: {0}").format(message))
+        message = [to_bytes(s) for s in message]
         await self._socket.send_multipart(message)
+
+    def run_in_executor(self, executor, func, *args, **kwargs):
+        loop = self._get_loop()
+        func_call = functools.partial(
+            func, *args, **kwargs
+        )
+        if isinstance(executor, ThreadPoolExecutor):
+            ctx = contextvars.copy_context()
+            func_call = functools.partial(
+                ctx.run, func, *args, **kwargs
+            )
+        return loop.run_in_executor(executor, func_call)
 
     async def process_request(
         self, cli_id: bytes, cli_addr: bytes, request_id: bytes,
@@ -294,37 +318,61 @@ class Worker(ABCWorker, _LoopBoundMixin):
                     func_details["kwargs"]
                 )
             except Exception:
-                logger.error(
-                    f'{_("Invalid function details")}: {func_details}'
-                )
-                raise AttributeError(_("Invalid function details"))
+                raise AttributeError("Invalid function details")
             if not self.interfaces.get(func_name, None):
                 raise AttributeError(
-                    _("Function not found: {0}").format(func_name)
+                    "Function not found: {0}".format(func_name)
                 )
             func = getattr(self, func_name)
-            if not asyncio.iscoroutinefunction(func):
-                task = loop.run_in_executor(
-                    self.executor,
-                    functools.partial(func, *args, **kwargs)
-                )
-            else:
+            if asyncio.iscoroutinefunction(func):
                 coro = func(*args, **kwargs)
                 task = loop.create_task(coro)
+            else:
+                task = self.run_in_executor(
+                    self.default_executor, func, *args, **kwargs
+                )
         except Exception as e:
             reply = await gen_reply(exception=e)
         else:
             reply = await gen_reply(task)
         option = [b"@".join((cli_id, cli_addr, request_id))]
-        message = [await msg_pack(reply)]
-        await self.send_to_broker(
-            Settings.MDP_COMMAND_REPLY, option, message
-        )
+        if isinstance(reply["result"], (Generator, AsyncGenerator)):
+            option.append(Settings.STREAM_GENERATOR_TAG)
+            if isinstance(reply["result"], Generator):
+                for sub_reply in reply["result"]:
+                    message = [msg_pack(sub_reply)]
+                    await self.send_to_broker(
+                        Settings.MDP_COMMAND_REPLY, option, message
+                    )
+            elif isinstance(reply["result"], AsyncGenerator):
+                async for sub_reply in reply["result"]:
+                    message = [msg_pack(sub_reply)]
+                    await self.send_to_broker(
+                        Settings.MDP_COMMAND_REPLY, option, message
+                    )
+            await self.send_to_broker(
+                Settings.MDP_COMMAND_REPLY, option,
+                [Settings.STREAM_END_MESSAGE]
+            )
+        else:
+            # TODO: 过大的对象，先压缩，再用流式传输。
+            if sys.getsizeof(
+                    reply, Settings.HUGE_DATA_SIZEOF
+            ) > Settings.HUGE_DATA_SIZEOF:
+                reply = await self.run_in_executor(
+                    self.process_executor, msg_pack, reply
+                )
+            else:
+                reply = msg_pack(reply)
+            message = [reply]
+            await self.send_to_broker(
+                Settings.MDP_COMMAND_REPLY, option, message
+            )
 
     async def recv(self):
         try:
             await self.connect()
-            logger.info(_("Worker event loop starts running."))
+            logger.info("Worker event loop starts running.")
             loop = self._get_loop()
             self.ready = True
             heartbeat_at = 1e-3 * self.heartbeat + loop.time()
@@ -351,20 +399,13 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         if empty:
                             continue
                     except ValueError:
-                        logger.debug(
-                            _(
-                                "Worker({worker_id}) receives invalid message:"
-                                "\n{message}"
-                            ).format(worker_id=self.identity, message=message)
-                        )
                         continue
                     if mdp_worker_version != Settings.MDP_WORKER:
-                        logger.error(_("The second frame is not an MDP_WORKER"))
                         continue
                     if command == Settings.MDP_COMMAND_HEARTBEAT:
                         pass
                     elif command == Settings.MDP_COMMAND_DISCONNECT:
-                        logger.info(f"{self.identity} disconnected")
+                        logger.debug(f"{self.identity} disconnected")
                         break
                     elif command == Settings.MDP_COMMAND_REQUEST:
                         try:
@@ -373,11 +414,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
                                 raise ValueError
                             client_id, client_addr = client.split(b"@")
                         except ValueError:
-                            logger.error(
-                                _("Request frame invalid: {0}").format(message)
-                            )
                             continue
-                        details = await msg_unpack(body)
+                        details = msg_unpack(body)
                         task = loop.create_task(
                             self.process_request(
                                 client_id, client_addr,
@@ -388,14 +426,12 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         task.add_done_callback(
                             lambda fut: self.release_request(request_id)
                         )
-                    else:
-                        logger.debug(_("Invalid MDP command."))
                 else:
                     broker_liveness -= 1
                     if broker_liveness == 0:
-                        logger.warning(_("Broker offline"))
+                        logger.warning("Broker offline")
                         if self._reconnect:
-                            logger.warning(_("Reconnect to Majordomo"))
+                            logger.warning("Reconnect to Majordomo")
                             await self.disconnect()
                             self._recv_task = loop.create_task(self.recv())
                             break
@@ -430,57 +466,20 @@ class Worker(ABCWorker, _LoopBoundMixin):
             "loop_time": time()
         }
 
+    @interface
+    def test_generator(self, maximum: int):
+        i = 0
+        while i < maximum:
+            yield i
+            i += 1
 
-class IOWorker(Worker):
-    def __init__(
-        self,
-        broker_addr: str,
-        service: "Service",
-        identity: str = None,
-        heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
-        context: Context = None,
-        executor_max_workers: int = None,
-        thread_name_prefix: str = "",
-        executor_initializer: Callable = None,
-        executor_initargs: tuple = ()
-    ):
-        if not thread_name_prefix:
-            thread_name_prefix = f"AsyncWorkThread_{identity}"
-        executor = ThreadPoolExecutor(
-            max_workers=executor_max_workers,
-            thread_name_prefix=thread_name_prefix,
-            initializer=executor_initializer,
-            initargs=executor_initargs
-        )
-        super().__init__(
-            broker_addr, service, identity,
-            heartbeat, context, executor
-        )
-
-
-class CPUWorker(Worker):
-    def __init__(
-        self,
-        broker_addr: str,
-        service: "Service",
-        identity: str = None,
-        heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
-        context: Context = None,
-        executor_max_workers: int = None,
-        executor_mp_context=None,
-        executor_initializer: Callable = None,
-        executor_initargs: tuple = ()
-    ):
-        executor = ProcessPoolExecutor(
-            max_workers=executor_max_workers,
-            mp_context=executor_mp_context,
-            initializer=executor_initializer,
-            initargs=executor_initargs
-        )
-        super().__init__(
-            broker_addr, service, identity,
-            heartbeat, context, executor
-        )
+    @interface
+    async def test_agenerator(self, maximum: int):
+        i = 0
+        while i < maximum:
+            await asyncio.sleep(0.1)
+            yield i
+            i += 1
 
 
 class Service(ABCService):
@@ -506,11 +505,6 @@ class Service(ABCService):
     def add_worker(self, worker: ABCWorker):
         if worker.identity in self.workers:
             return
-        logger.info(
-            _("'{name}' has added a worker {worker_id}").format(
-                name=self.name, worker_id=worker.identity
-            )
-        )
         worker.service = self
         self.workers[worker.identity] = worker
         self.idle_workers.appendleft(worker.identity)
@@ -543,40 +537,26 @@ class Service(ABCService):
 
     def create_worker(
         self,
-        preference: str,
         worker_class: Callable[..., Worker] = None,
         workers_addr: str = None,
         workers_heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
-        executor_max_number: int = 1
+        context: Context = None,
+        thread_executor: ThreadPoolExecutor = None,
+        process_executor: ProcessPoolExecutor = None
     ) -> Worker:
-        if preference not in ("io", "cpu"):
-            raise ValueError(_("preference must be 'io' or 'cpu'"))
-        if preference == "io":
-            if not workers_addr:
-                workers_addr = Settings.IO_WORKER_ADDR
-            max_workers = max((os.cpu_count() or 1), 4, executor_max_number)
-            if not worker_class:
-                worker_class = IOWorker
-            worker = worker_class(
-                workers_addr,
-                self,
-                identity=f"{self.name}_IOWorker",
-                heartbeat=workers_heartbeat,
-                executor_max_workers=max_workers
-            )
-        else:
-            if not workers_addr:
-                workers_addr = Settings.CPU_WORKER_ADDR
-            max_workers = max((os.cpu_count() or 1), executor_max_number)
-            if not worker_class:
-                worker_class = CPUWorker
-            worker = worker_class(
-                workers_addr,
-                self,
-                identity=f"{self.name}_CPUWorker",
-                heartbeat=workers_heartbeat,
-                executor_max_workers=max_workers
-            )
+        if not workers_addr:
+            workers_addr = Settings.WORKER_ADDR
+        if not worker_class:
+            worker_class = Worker
+        worker = worker_class(
+            workers_addr,
+            self,
+            identity=f"{self.name}_Worker",
+            heartbeat=workers_heartbeat,
+            context=context,
+            thread_executor=thread_executor,
+            process_executor=process_executor
+        )
         self.add_worker(worker)
         return worker
 
@@ -620,8 +600,7 @@ class AMajordomo(_LoopBoundMixin):
         self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         self.backend_tasks = BoundedDict(None, 10*Settings.ZMQ_HWM, 0.1)
         if not backend_addr:
-            backend_addr = Settings.IO_WORKER_ADDR
-        logger.debug(_("backend socket bound to: {0}").format(backend_addr))
+            backend_addr = Settings.WORKER_ADDR
         self.backend.bind(check_socket_addr(backend_addr))
         # majordomo
         self.heartbeat = heartbeat
@@ -685,14 +664,9 @@ class AMajordomo(_LoopBoundMixin):
                 self.ban_timer_handle.pop(worker.identity)
         else:
             await asyncio.sleep(wait)
-        logger.warning(
-            _("Ban the worker: {worker_id}({address}).").format(
-                worker_id=worker.identity, address=worker.address
-            )
-        )
         if worker.is_alive():
             request = [
-                await to_bytes(worker.address),
+                to_bytes(worker.address),
                 b"",
                 Settings.MDP_WORKER,
                 Settings.MDP_COMMAND_DISCONNECT
@@ -703,11 +677,6 @@ class AMajordomo(_LoopBoundMixin):
                 pass
         worker.service.remove_worker(worker)
         if worker.identity not in self.workers:
-            logger.warning(
-                _(
-                    "The worker '{worker_id}' has been banned."
-                ).format(worker_id=worker.identity)
-            )
             return True
         self.workers.pop(worker.identity, None)
 
@@ -719,7 +688,7 @@ class AMajordomo(_LoopBoundMixin):
             self.ban_worker(worker, wait=worker.expiry)
         )
         t.add_done_callback(
-            lambda fut: self.ban_timer_handle.pop(worker.identity)
+            lambda fut: self.ban_timer_handle.pop(worker.identity, None)
         )
 
     async def internal_service(
@@ -730,7 +699,7 @@ class AMajordomo(_LoopBoundMixin):
         service = service_name.lstrip(Settings.MDP_INTERNAL_SERVICE_PREFIX)
         stat_code = b"501"
         if service == b"service":
-            if await from_bytes(body) in self.services:
+            if from_bytes(body) in self.services:
                 stat_code = b"200"
             else:
                 stat_code = b"404"
@@ -763,7 +732,7 @@ class AMajordomo(_LoopBoundMixin):
                          identity,  # 身份id
                          mechanism,
                      ] + credentials
-        zap_frames = [await to_bytes(s) for s in zap_frames]
+        zap_frames = [to_bytes(s) for s in zap_frames]
         failed_reply = {
                 "user_id": identity,
                 "metadata": "",
@@ -783,7 +752,7 @@ class AMajordomo(_LoopBoundMixin):
             except KeyError:
                 zap_reply = failed_reply
         if zap_reply["status_code"] != b"200":
-            logger.error(f"Authentication failure: {zap_reply['status_code']}")
+            logger.debug(f"Authentication failure: {zap_reply['status_code']}")
             return False
         return True
 
@@ -803,7 +772,7 @@ class AMajordomo(_LoopBoundMixin):
                 metadata
             ) = replies
         except ValueError:
-            logger.error(_("ZAP replies frame invalid."))
+            logger.debug("ZAP replies frame invalid.")
             return
         await self.zap_replies.aset(
             f"{user_id}-{request_id}",
@@ -822,9 +791,7 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = ''.join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.error(
-                f"frontend task exception:\n{exception_info}"
-            )
+            logger.debug(f"frontend task exception:\n{exception_info}")
 
     def release_backend_task(self, task_name):
         task: asyncio.Task = self.backend_tasks.pop(task_name)
@@ -832,12 +799,9 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.error(
-                f"backend task exception:\n{exception_info}"
-            )
+            logger.debug(f"backend task exception:\n{exception_info}")
 
     async def process_replies_from_backend(self, replies: list):
-        logger.debug(_("replies from backend: {0}").format("replies"))
         try:
             (
                 worker_addr,
@@ -850,34 +814,20 @@ class AMajordomo(_LoopBoundMixin):
             if empty:
                 raise ValueError
         except ValueError:
-            logger.warning(f"invalid replies: {replies}")
             return
         if mdp_worker_version != Settings.MDP_WORKER:
-            logger.debug(_("The second frame is not an MDP_WORKER"))
             return
         # MDP 定义的 Worker 命令
         if not (worker := self.workers.get(worker_id, None)):
-            logger.warning(
-                _("The worker({worker_id}) was not registered").format(
-                    worker_id=worker_id
-                )
-            )
-
+            logger.debug(f"The worker({worker_id}) was not registered")
         if command == Settings.MDP_COMMAND_READY:
             if len(message) > 1:
-                logger.error(
-                    _(
-                        "This message does not conform to the format of the "
-                        "READY command."
-                    )
-                )
                 return
             try:
                 service_name, service_description = (
-                    await from_bytes(message[0])
+                    from_bytes(message[0])
                 ).split(":")
             except ValueError:
-                logger.debug(_("Not found description for service frame"))
                 return False
             if service_name not in self.services:
                 service = self.remote_service_class(
@@ -892,11 +842,6 @@ class AMajordomo(_LoopBoundMixin):
                     self.heartbeat, service
                 )
             elif worker.ready:
-                logger.error(
-                    _(
-                        'The worker({0}) had already sent the "READY" command'
-                    ).format(worker.identity)
-                )
                 return await self.ban_worker(worker)
             worker.ready = True
             service.add_worker(worker)
@@ -905,21 +850,10 @@ class AMajordomo(_LoopBoundMixin):
 
         elif command == Settings.MDP_COMMAND_HEARTBEAT:
             if len(message) > 1:
-                logger.error(
-                    _(
-                        "This message does not conform to the format of the "
-                        "HEARTBEAT command."
-                    )
-                )
                 return
             if not worker:
                 return
             elif not worker.ready:
-                logger.error(
-                    _(
-                        'The worker({0}) don\'t sent the "READY" command'
-                    ).format(worker.identity)
-                )
                 return await self.ban_worker(worker)
             worker.expiry = 1e-3 * worker.heartbeat_liveness * worker.heartbeat + time()
             if t := self.ban_timer_handle.get(worker.identity):
@@ -931,12 +865,6 @@ class AMajordomo(_LoopBoundMixin):
                 client, *body = message
                 client_id, client_addr, request_id = client.split(b"@")
             except ValueError:
-                logger.error(
-                    _(
-                        "This message does not conform to the format of the "
-                        "REPLY command."
-                    )
-                )
                 return
             if not worker:
                 return
@@ -959,24 +887,18 @@ class AMajordomo(_LoopBoundMixin):
             worker.ready = False
             worker.expiry = time()
             await self.ban_worker(worker)
-        else:
-            logger.error(_("Invalid command: {0}").format(command))
 
     async def reply_frontend(self, reply: list):
-        reply = [await to_bytes(frame) for frame in reply]
+        reply = [to_bytes(frame) for frame in reply]
         try:
             await self.frontend.send_multipart(reply)
-            logger.debug(_("send reply to frontend: {0}").format(reply))
-        except Exception as e:
-            logger.error(
-                _(
-                    "The reply({reply}) sent to frontend failed.error:\n"
-                    "{error}"
-                ).format(reply=reply, error=e)
+        except Exception as error:
+            logger.debug(
+                f"The reply({reply}) sent to frontend failed.error:\n"
+                f"{error}"
             )
 
     async def process_request_from_frontend(self, request: list):
-        logger.debug(_("replies from frontend: {0}").format(request))
         try:
             (
                 client_addr,
@@ -989,14 +911,13 @@ class AMajordomo(_LoopBoundMixin):
             if empty:
                 raise ValueError
         except ValueError:
-            logger.warning(_("invalid request: {0}").format(request))
             return False
 
         if self.zap_socket:
             try:
                 mechanism, *credentials, request_id, body = message
             except ValueError:
-                logger.debug(_("ZAP frames invalid"))
+                logger.debug("ZAP frames invalid")
                 return False
             zap_result = await self.request_zap(
                 client_id, client_addr, request_id, mechanism, credentials
@@ -1007,9 +928,7 @@ class AMajordomo(_LoopBoundMixin):
             try:
                 request_id, body = message
             except ValueError:
-                logger.error(_("body frames invalid: {0}").format(message))
                 return False
-        logger.debug(_("request service: {0}").format(service_name))
         if service_name.startswith(Settings.MDP_INTERNAL_SERVICE_PREFIX):
             await self.internal_service(
                 service_name, client_id, client_addr,
@@ -1028,7 +947,7 @@ class AMajordomo(_LoopBoundMixin):
         service_name: bytes, client_id: bytes, client_addr: bytes,
         request_id: bytes, body: bytes
     ):
-        service_name = await from_bytes(service_name)
+        service_name = from_bytes(service_name)
         for wid, worker in self.workers.items():
             if not worker.is_alive():
                 await self.ban_worker(worker)
@@ -1043,10 +962,9 @@ class AMajordomo(_LoopBoundMixin):
                 service_name,
                 client_id,
                 request_id,
-                await msg_pack(exception)
+                msg_pack(exception)
         ]
         if not service or not service.running:
-            logger.error(_("Service({0}) unavailable").format(service.name))
             await self.reply_frontend(except_reply)
         elif worker := service.acquire_idle_worker():
             request = [
@@ -1059,29 +977,21 @@ class AMajordomo(_LoopBoundMixin):
                 request_id,
                 body
             ]
-            request = [await to_bytes(frame) for frame in request]
+            request = [to_bytes(frame) for frame in request]
             try:
-                logger.debug(_("send backend: {0}").format(request))
                 await self.backend.send_multipart(request)
-            except Exception as e:
-                logger.error(
-                    _(
-                        "The request({request}) sent to backend failed.\n"
-                        "error: {error}"
-                    ).format(request=request, error=e)
-                )
+            except Exception as error:
                 await self.reply_frontend(except_reply)
         else:
-            logger.error(f'"{service_name}" service has no idle workers.')
             exception = await gen_reply(exception=BuysWorkersError())
-            except_reply[-1] = await msg_pack(exception)
+            except_reply[-1] = msg_pack(exception)
             await self.reply_frontend(except_reply)
 
     async def send_heartbeat(self):
         loop = self._get_loop()
         for worker in self.workers.values():
             message = [
-                await to_bytes(worker.address),
+                to_bytes(worker.address),
                 b"",
                 Settings.MDP_WORKER,
                 Settings.MDP_COMMAND_HEARTBEAT
@@ -1103,7 +1013,6 @@ class AMajordomo(_LoopBoundMixin):
         if self.zap_socket:
             self._poller.register(self.zap_socket, z_const.POLLIN)
         self.running = True
-        logger.debug(_("broker loop running."))
 
         while 1:
             try:
@@ -1115,11 +1024,11 @@ class AMajordomo(_LoopBoundMixin):
                         self.process_replies_from_backend(replies)
                     )
                     bt_id = secrets.token_hex()
-                    tn = f"backend_task_{bt_id}"
+                    btn = f"backend_task_{bt_id}"
                     # bt_id += 1
-                    await self.backend_tasks.aset(tn, bt)
+                    await self.backend_tasks.aset(btn, bt)
                     bt.add_done_callback(
-                        lambda fut: self.release_backend_task(tn)
+                        lambda fut: self.release_backend_task(btn)
                     )
 
                 if self.frontend in socks:
@@ -1129,11 +1038,11 @@ class AMajordomo(_LoopBoundMixin):
                         self.process_request_from_frontend(replies)
                     )
                     ft_id = secrets.token_hex()
-                    tn = f"frontend_task_{ft_id}"
+                    ftn = f"frontend_task_{ft_id}"
                     # ft_id += 1
-                    await self.frontend_tasks.aset(tn, ft)
+                    await self.frontend_tasks.aset(ftn, ft)
                     ft.add_done_callback(
-                        lambda fut: self.release_frontend_task(tn)
+                        lambda fut: self.release_frontend_task(ftn)
                     )
 
                 if self.zap_socket and self.zap_socket in socks:
@@ -1151,11 +1060,11 @@ class AMajordomo(_LoopBoundMixin):
         self._poller.unregister(self.backend)
         if self.zap_socket:
             self._poller.unregister(self.zap_socket)
-        logger.info(_("broker loop exit."))
+        logger.info("broker loop exit.")
 
     async def disconnect_all(self):
         # TODO: 需要通知客户端吗？
-        logger.warning(_("Disconnected and all the workers."))
+        logger.warning("Disconnected and all the workers.")
         for work in self.workers.values():
             await self.ban_worker(work)
 
@@ -1166,7 +1075,8 @@ class AMajordomo(_LoopBoundMixin):
 
     def stop(self):
         if self._broker_task:
-            self._broker_task.cancel()
+            if not self._broker_task.cancelled():
+                self._broker_task.cancel()
             self.close()
             self._broker_task = None
 
@@ -1217,6 +1127,7 @@ class Client(_LoopBoundMixin):
         self.requests: BoundedDict[str, list] = BoundedDict(
             None, msg_max, 1.5
         )
+        self.stream_reply_maxsize = msg_max
         self._recv_task = None
 
         self.default_service = Settings.SERVICE_DEFAULT_NAME
@@ -1258,9 +1169,7 @@ class Client(_LoopBoundMixin):
     def connect(self):
         if not self.ready:
             loop = self._get_loop()
-            logger.info(
-                _("Connecting to broker at {0} ...").format(self._broker_addr)
-            )
+            logger.info(f"Connecting to broker at {self._broker_addr} ...")
             self.socket = self.ctx.socket(
                 z_const.DEALER, z_aio.Socket
             )
@@ -1278,7 +1187,8 @@ class Client(_LoopBoundMixin):
 
     def close(self):
         if self.ready:
-            self._recv_task.cancel()
+            if not self._recv_task.cancelled:
+                self._recv_task.cancel()
             self._recv_task = None
             self.disconnect()
             self.ready = False
@@ -1299,8 +1209,7 @@ class Client(_LoopBoundMixin):
             request_id,
             body
         ]
-        request = [await to_bytes(frame) for frame in request]
-        logger.debug(f"request: {request}")
+        request = [to_bytes(frame) for frame in request]
         await self.socket.send_multipart(request)
         return request[-2]
 
@@ -1314,7 +1223,7 @@ class Client(_LoopBoundMixin):
         :param args: 要调用的该函数要传递的位置参数
         :param kwargs: 要调用的该函数要传递的关键字参数
         """
-        body = await msg_pack(
+        body = msg_pack(
             {
                 "func": func_name,
                 "args": args,
@@ -1328,8 +1237,10 @@ class Client(_LoopBoundMixin):
             )
         except KeyError:
             raise TimeoutError(
-                _("Timeout while requesting the Majordomo service.")
+                "Timeout while requesting the Majordomo service."
             )
+        if isinstance(response, StreamReply):
+            return response
         if exception := response.get("exception"):
             raise RemoteException(*exception)
         return response.get("result")
@@ -1370,12 +1281,18 @@ class Client(_LoopBoundMixin):
                             service_name,
                             client_id,
                             request_id,
-                            body
+                            # steam tag
+                            *body
                         ) = message
                         if empty:
                             continue
                     except ValueError:
-                        logger.debug(_("invalid message: {0}").format(message))
+                        continue
+                    if mdp_client_version != Settings.MDP_CLIENT:
+                        continue
+                    if client_id != self.identity:
+                        continue
+                    if service_name == b"gate.client_heartbeat":
                         continue
                     logger.debug(
                         f"Reply: \n"
@@ -1384,17 +1301,28 @@ class Client(_LoopBoundMixin):
                         f"frame 2: {service_name},\n"
                         f"frame 3: {client_id},\n"
                         f"frame 4: {request_id},\n"
-                        f"frame 5: {body}"
+                        f"frame 5+: {body}"
                     )
-                    if mdp_client_version != Settings.MDP_CLIENT:
-                        logger.error(_("The second frame is not an MDP_CLIENT"))
-                        continue
-                    if client_id != self.identity:
-                        continue
-                    if service_name == b"gate.client_heartbeat":
-                        continue
-                    body = await msg_unpack(body)
-                    await self.requests.aset(request_id, body)
+                    if len(body) == 1:
+                        body = msg_unpack(body[0])
+                        await self.requests.aset(request_id, body)
+                    else:
+                        *option, body = body
+                        if option[0] == Settings.STREAM_GENERATOR_TAG:
+                            # TODO: 接收处理流式数据
+                            if request_id not in self.requests:
+                                stream_reply = StreamReply(
+                                    maxsize=self.stream_reply_maxsize,
+                                    timeout=self.reply_timeout
+                                )
+                                await self.requests.aset(
+                                    request_id, stream_reply
+                                )
+                            else:
+                                stream_reply = self.requests[request_id]
+                            if body != Settings.STREAM_END_MESSAGE:
+                                body = msg_unpack(body)
+                            await stream_reply.asend(body)
             except Exception:
                 exception = "".join(format_exception(*sys.exc_info()))
                 logger.error(exception)

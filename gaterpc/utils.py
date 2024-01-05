@@ -3,20 +3,28 @@
 # Created Date: 2023/5/22 16:36
 import asyncio
 import atexit
+import bz2
+import contextvars
 import copy
+import functools
+import gzip
 import inspect
+import lzma
 import platform
+import queue
 import struct
 import sys
+import threading
 from asyncio import (
     CancelledError, Task, Queue as AQueue,
-    QueueEmpty as AQueueEmpty,
+    QueueEmpty as AQueueEmpty, events,
 )
 from collections import UserDict, deque
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable, Generator
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import wraps
 from importlib import import_module
-from logging import Handler, getLogger
+from logging import Handler
 from traceback import format_tb
 from typing import (
     Any, Dict, Iterable, MutableMapping, Optional, TypeVar,
@@ -25,14 +33,12 @@ from typing import (
 
 import msgpack
 
+from .global_settings import Settings
 from .mixins import _LoopBoundMixin
 
 
 KT = TypeVar("KT")
 VT = TypeVar("VT")
-
-
-logger = getLogger(__name__)
 
 
 class BoundedDict(UserDict, _LoopBoundMixin):
@@ -56,6 +62,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         self.usable_size = maxsize
         self.timeout = timeout
         self._set_waiters: deque = deque()
+        self._sync_task: set = set()
         self._get_waiters: Dict[KT, deque] = dict()
         if not data:
             data = {}
@@ -110,8 +117,8 @@ class BoundedDict(UserDict, _LoopBoundMixin):
     def set(self, key: KT, value: VT):
         loop = self._get_loop()
         t = loop.create_task(self.aset(key, value, timeout=None))
-        self._set_waiters.append(t)
-        t.add_done_callback(self._set_waiters.remove)
+        self._sync_task.add(t)
+        t.add_done_callback(self._sync_task.remove)
 
     def _release_set(self):
         if self.usable_size >= self.maxsize:
@@ -227,13 +234,113 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             items = []
         for k, v in items:
             t = loop.create_task(self.aset(key=k, value=v))
-            self._set_waiters.append(t)
-            t.add_done_callback(self._set_waiters.remove)
+            self._sync_task.add(t)
+            t.add_done_callback(self._sync_task.remove)
         for k, v in kwargs.items():
             t = loop.create_task(self.aset(key=k, value=v))
-            self._set_waiters.append(t)
-            t.add_done_callback(self._set_waiters.remove)
+            self._sync_task.add(t)
+            t.add_done_callback(self._sync_task.remove)
         return
+
+
+class StreamReply(AsyncGenerator):
+    def __init__(self, maxsize=0, timeout=0):
+        self.replies = asyncio.Queue(maxsize)
+        self.timeout = timeout
+        self._exit = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._exit:
+            raise GeneratorExit
+        if self.timeout:
+            try:
+                value = await asyncio.wait_for(self.replies.get(), self.timeout)
+            except asyncio.TimeoutError:
+                raise StopAsyncIteration
+        else:
+            try:
+                value = self.replies.get_nowait()
+            except asyncio.QueueEmpty:
+                raise StopAsyncIteration
+        self.replies.task_done()
+        if value == Settings.STREAM_END_MESSAGE:
+            await asyncio.sleep(1)
+            raise StopAsyncIteration
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def asend(self, value):
+        if value:
+            await self.replies.put(value)
+        return
+
+    async def athrow(self, __type: BaseException, value=None, traceback=None):
+        if traceback:
+            await self.replies.put(__type.with_traceback(traceback))
+        elif isinstance(value, BaseException):
+            await self.replies.put(value)
+        else:
+            if value:
+                value = __type(value)
+            else:
+                value = __type()
+            await self.replies.put(__type(value))
+
+    async def aclose(self):
+        if not self._exit:
+            self._exit = True
+
+
+class HugeDataReply(_LoopBoundMixin):
+    def __init__(self, compress_module: str, compress_level: int):
+        self.compress_module = compress_module
+        if self.compress_module == "bz2":
+            self._compress = bz2.compress
+            self._decompress = bz2.decompress
+            self._compress_kwargs = {
+                "compresslevel": compress_level
+            }
+        elif self.compress_module == "lzma":
+            self._compress = lzma.compress
+            self._decompress = lzma.decompress
+            self._compress_kwargs = {
+                "preset": compress_level
+            }
+        else:
+            self.compress_module = "gzip"
+            self._compress = gzip.compress
+            self._decompress = gzip.decompress
+            self._compress_kwargs = {
+                "compresslevel": compress_level
+            }
+
+    async def compress(self, data: bytes) -> bytes:
+        loop = self._get_loop()
+        ctx = contextvars.copy_context()
+        _compress = functools.partial(
+            ctx.run, self._compress, data, **self._compress_kwargs
+        )
+        with ProcessPoolExecutor() as executor:
+            data = await loop.run_in_executor(
+                executor, _compress
+            )
+        return data
+
+    async def decompress(self, data: bytes) -> bytes:
+        loop = self._get_loop()
+        ctx = contextvars.copy_context()
+        _decompress = functools.partial(
+            ctx.run, self._decompress, data
+        )
+        with ProcessPoolExecutor() as executor:
+            data = await loop.run_in_executor(
+                executor, _decompress
+            )
+        return data
 
 
 class AQueueListener(object):
@@ -241,7 +348,7 @@ class AQueueListener(object):
 
     def __init__(
         self, loop, handlers: Union[list[Handler], tuple[Handler]] = None,
-        respect_handler_level=False
+        respect_handler_level=True
     ):
         self.respect_handler_level = respect_handler_level
         if isinstance(loop, str):
@@ -251,26 +358,28 @@ class AQueueListener(object):
         sys.stdout.write(f"AQueueListener.loop: {loop.__class__}\n")
         sys.stdout.flush()
         self._loop: asyncio.AbstractEventLoop = loop
-        self.queue = AQueue()
+        self.queue = queue.Queue()
         self.handlers = dict()
         self._task = None
+        self._thread = None
         if handlers:
             self.add_handlers(handlers)
         atexit.register(self.stop)
-        self._loop.call_soon(self.start)
+        # self._loop.call_soon(self.start)
+        self.start()
 
     def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
         for handler in handlers:
             self.handlers[handler.get_name()] = handler
 
-    async def dequeue(self, block=True):
-        return await self.queue.get()
+    def dequeue(self, block=True):
+        return self.queue.get()
 
-    async def prepare(self, record):
+    def prepare(self, record):
         return record
 
-    async def handle(self, record):
-        record = await self.prepare(record)
+    def handle(self, record):
+        record = self.prepare(record)
         handler = self.handlers.get(record.h_name)
         if handler:
             if not self.respect_handler_level:
@@ -278,37 +387,40 @@ class AQueueListener(object):
             else:
                 process = record.levelno >= handler.level
             if process:
-                await asyncio.to_thread(handler.handle, record)
-                # await self._loop.create_task(handler.handle(record))
+
+                handler.handle(record)
 
     def enqueue_sentinel(self):
         self.queue.put_nowait(self._sentinel)
 
-    async def _monitor(self):
+    def _monitor(self):
+        q = self.queue
+        has_task_done = hasattr(q, 'task_done')
         while True:
             try:
-                record = await self.dequeue()
+                record = self.dequeue(True)
                 if record is self._sentinel:
-                    self.queue.task_done()
+                    if has_task_done:
+                        q.task_done()
                     break
-                await self.handle(record)
-                self.queue.task_done()
-            except AQueueEmpty:
+                self.handle(record)
+                if has_task_done:
+                    q.task_done()
+            except queue.Empty:
                 break
-            except CancelledError:
-                self.queue.task_done()
-                break
+            except Exception as e:
+                print(e)
 
     def start(self):
-        if not self._task:
-            self._task = self._loop.create_task(self._monitor())
+        self._thread = t = threading.Thread(target=self._monitor)
+        t.daemon = True
+        t.start()
 
     def stop(self):
-        if self._task:
+        if self._thread:
             self.enqueue_sentinel()
-            if not self._task.done():
-                self._task.cancel()
-            self._task = None
+            self._thread.join()
+            self._thread = None
 
 
 class QueueHandler(Handler):
@@ -340,7 +452,8 @@ class QueueHandler(Handler):
     def emit(self, record):
         try:
             self.enqueue(self.prepare(record))
-        except Exception:
+        except Exception as e:
+            print(e)
             self.handleError(record)
 
     def close(self):
@@ -406,16 +519,10 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
 def interface(methode):
     @wraps(methode)
     def wrapper(*args, **kwargs):
-        logger.debug(
-            f"method: {methode.__name__}, args: {args}, kwargs: {kwargs}"
-        )
         return methode(*args, **kwargs)
 
     @wraps(methode)
     async def awrapper(*args, **kwargs):
-        logger.debug(
-            f"method: {methode.__name__}, args: {args}, kwargs: {kwargs}"
-        )
         return await methode(*args, **kwargs)
 
     wrapper.__interface__ = True
@@ -425,7 +532,7 @@ def interface(methode):
     return wrapper
 
 
-async def to_bytes(s: Union[str, bytes, float, int]):
+def to_bytes(s: Union[str, bytes, float, int]):
     if isinstance(s, bytes):
         return s
     if isinstance(s, str):
@@ -438,10 +545,10 @@ async def to_bytes(s: Union[str, bytes, float, int]):
             fmt = "!h"
         elif -2147483648 <= s <= 2147483647:
             fmt = "!i"
-    return await asyncio.to_thread(struct.pack, fmt, s)
+    return struct.pack(fmt, s)
 
 
-async def from_bytes(b: bytes) -> Union[str, float, int]:
+def from_bytes(b: bytes) -> Union[str, float, int]:
     fmt = {
         1: "!b",
         2: "!h",
@@ -450,35 +557,31 @@ async def from_bytes(b: bytes) -> Union[str, float, int]:
     }
     if b_len := len(b) in fmt:
         try:
-            return await asyncio.to_thread(
-                struct.unpack, fmt[b_len], b
-            )
+            return struct.unpack(fmt[b_len], b)[0]
         except struct.error:
             pass
     return b.decode("utf-8")
 
 
-async def encrypt(data):
-    # 考虑在协程里该如何避免阻塞
+def encrypt(data):
+    # 在进程池执行器中执行
     hash_str = data
     return hash_str
 
 
-async def decrypt(hash_str):
-    # 考虑在协程里该如何避免阻塞
+def decrypt(hash_str):
+    # 在进程池执行器中执行
     data = hash_str
     return data
 
 
-async def msg_pack(obj: Any) -> ByteString:
-    data = await asyncio.to_thread(
-        msgpack.packb, obj
-    )
+def msg_pack(obj: Any) -> ByteString:
+    data = msgpack.packb(obj)
     return data
 
 
-async def msg_unpack(data: ByteString) -> Any:
-    obj = await asyncio.to_thread(msgpack.unpackb, data)
+def msg_unpack(data: ByteString) -> Any:
+    obj = msgpack.unpackb(data)
     return obj
 
 
