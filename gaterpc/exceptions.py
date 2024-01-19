@@ -23,3 +23,11 @@ class RemoteException(Exception):
                    f"  {except_value}\n"
                    f"  {except_traceback}")
         super().__init__(message)
+
+
+class BadGzip(OSError):
+    pass
+
+
+class HugeDataException(OSError):
+    pass

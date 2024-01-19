@@ -18,11 +18,11 @@ class DefaultSettings(object):
     CLIENT_TIMEOUT: int = 2  # second
     WORKER_ADDR: str = f"ipc://{RUN_PATH}cpu_worker"
     ZMQ_HWM: int = 1000
-    MESSAGE_MAX: int = 1000
+    MESSAGE_MAX: int = 1000  # 参考ZMQ HWM
     STREAM_GENERATOR_TAG = b"GateStreamGenerator"
     STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
     STREAM_END_MESSAGE = b"GateStreamEnd"
-    HUGE_DATA_SIZEOF = 1000
+    HUGE_DATA_SIZEOF = 1000  # MTU 1500 减去20字节ip头部，20字节tcp头部，去掉MDP的前几帧
     HUGE_DATA_COMPRESS_MODULE: str = "gzip"
     HUGE_DATA_COMPRESS_LEVEL: int = 9
     # ZAP
@@ -102,6 +102,11 @@ class DefaultSettings(object):
             },
         },
         "loggers": {
+            "multiprocessing": {
+                "handlers": ["gaterpc", "console"],
+                "propagate": False,
+                "level": "DEBUG"
+            },
             "asyncio": {
                 "level": "INFO",
                 "handlers": ["asyncio"],

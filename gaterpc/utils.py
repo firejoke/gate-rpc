@@ -4,28 +4,36 @@
 import asyncio
 import atexit
 import bz2
-import contextvars
 import copy
 import functools
 import gzip
 import inspect
+import io
+import logging
 import lzma
+import os
 import platform
 import queue
 import struct
 import sys
 import threading
-from asyncio import (
-    CancelledError, Task, Queue as AQueue,
-    QueueEmpty as AQueueEmpty, events,
-)
+import time
+import warnings
+import zlib
+
+from asyncio import Task
 from collections import UserDict, deque
 from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import wraps
 from importlib import import_module
-from logging import Handler
-from traceback import format_tb
+from logging import Handler, getLogger
+from multiprocessing import Manager
+from multiprocessing.managers import (
+    ArrayProxy, DictProxy, ListProxy, ValueProxy,
+)
+from multiprocessing.shared_memory import SharedMemory
+from traceback import format_exception, format_tb
 from typing import (
     Any, Dict, Iterable, MutableMapping, Optional, TypeVar,
     Union, overload, ByteString,
@@ -33,12 +41,41 @@ from typing import (
 
 import msgpack
 
+from .exceptions import BadGzip, RemoteException
 from .global_settings import Settings
 from .mixins import _LoopBoundMixin
 
 
+SyncManager = Manager()
 KT = TypeVar("KT")
 VT = TypeVar("VT")
+
+
+def singleton(cls):
+    instances = dict()
+
+    def get_instance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances.get(cls)
+    return get_instance
+
+
+def resolve_module_attr(s: str):
+    name = s.split('.')
+    module_name = name.pop(0)
+    try:
+        found = import_module(module_name)
+        for frag in name:
+            try:
+                found = getattr(found, frag)
+            except AttributeError:
+                import_module(f"{module_name}.{frag}")
+                found = getattr(found, frag)
+        return found
+    except ImportError as e:
+        v = ValueError(f"Cannot resolve {s}: {e}")
+        raise v from e
 
 
 class BoundedDict(UserDict, _LoopBoundMixin):
@@ -243,106 +280,6 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         return
 
 
-class StreamReply(AsyncGenerator):
-    def __init__(self, maxsize=0, timeout=0):
-        self.replies = asyncio.Queue(maxsize)
-        self.timeout = timeout
-        self._exit = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self._exit:
-            raise GeneratorExit
-        if self.timeout:
-            try:
-                value = await asyncio.wait_for(self.replies.get(), self.timeout)
-            except asyncio.TimeoutError:
-                raise StopAsyncIteration
-        else:
-            try:
-                value = self.replies.get_nowait()
-            except asyncio.QueueEmpty:
-                raise StopAsyncIteration
-        self.replies.task_done()
-        if value == Settings.STREAM_END_MESSAGE:
-            await asyncio.sleep(1)
-            raise StopAsyncIteration
-        if isinstance(value, BaseException):
-            raise value
-        return value
-
-    async def asend(self, value):
-        if value:
-            await self.replies.put(value)
-        return
-
-    async def athrow(self, __type: BaseException, value=None, traceback=None):
-        if traceback:
-            await self.replies.put(__type.with_traceback(traceback))
-        elif isinstance(value, BaseException):
-            await self.replies.put(value)
-        else:
-            if value:
-                value = __type(value)
-            else:
-                value = __type()
-            await self.replies.put(__type(value))
-
-    async def aclose(self):
-        if not self._exit:
-            self._exit = True
-
-
-class HugeDataReply(_LoopBoundMixin):
-    def __init__(self, compress_module: str, compress_level: int):
-        self.compress_module = compress_module
-        if self.compress_module == "bz2":
-            self._compress = bz2.compress
-            self._decompress = bz2.decompress
-            self._compress_kwargs = {
-                "compresslevel": compress_level
-            }
-        elif self.compress_module == "lzma":
-            self._compress = lzma.compress
-            self._decompress = lzma.decompress
-            self._compress_kwargs = {
-                "preset": compress_level
-            }
-        else:
-            self.compress_module = "gzip"
-            self._compress = gzip.compress
-            self._decompress = gzip.decompress
-            self._compress_kwargs = {
-                "compresslevel": compress_level
-            }
-
-    async def compress(self, data: bytes) -> bytes:
-        loop = self._get_loop()
-        ctx = contextvars.copy_context()
-        _compress = functools.partial(
-            ctx.run, self._compress, data, **self._compress_kwargs
-        )
-        with ProcessPoolExecutor() as executor:
-            data = await loop.run_in_executor(
-                executor, _compress
-            )
-        return data
-
-    async def decompress(self, data: bytes) -> bytes:
-        loop = self._get_loop()
-        ctx = contextvars.copy_context()
-        _decompress = functools.partial(
-            ctx.run, self._decompress, data
-        )
-        with ProcessPoolExecutor() as executor:
-            data = await loop.run_in_executor(
-                executor, _decompress
-            )
-        return data
-
-
 class AQueueListener(object):
     _sentinel = None
 
@@ -355,8 +292,6 @@ class AQueueListener(object):
             loop = resolve_module_attr(loop)
         if isinstance(loop, Callable):
             loop = loop()
-        sys.stdout.write(f"AQueueListener.loop: {loop.__class__}\n")
-        sys.stdout.flush()
         self._loop: asyncio.AbstractEventLoop = loop
         self.queue = queue.Queue()
         self.handlers = dict()
@@ -373,7 +308,7 @@ class AQueueListener(object):
             self.handlers[handler.get_name()] = handler
 
     def dequeue(self, block=True):
-        return self.queue.get()
+        return self.queue.get(block=block)
 
     def prepare(self, record):
         return record
@@ -409,7 +344,7 @@ class AQueueListener(object):
             except queue.Empty:
                 break
             except Exception as e:
-                print(e)
+                warnings.warn(e.__repr__())
 
     def start(self):
         self._thread = t = threading.Thread(target=self._monitor)
@@ -453,11 +388,12 @@ class QueueHandler(Handler):
         try:
             self.enqueue(self.prepare(record))
         except Exception as e:
-            print(e)
             self.handleError(record)
+            warnings.warn(e.__repr__())
 
     def close(self):
-        self.listener.stop()
+        if self.listener:
+            self.listener.stop()
         super().close()
 
 
@@ -474,34 +410,7 @@ class AQueueHandler(QueueHandler):
         self.listener.add_handlers((self.handler,))
 
 
-def singleton(cls):
-    instances = dict()
-
-    def get_instance(*args, **kwargs):
-        if cls not in instances:
-            instances[cls] = cls(*args, **kwargs)
-        return instances.get(cls)
-    return get_instance
-
-
 singleton_aqueue_listener = singleton(AQueueListener)
-
-
-def resolve_module_attr(s: str):
-    name = s.split('.')
-    module_name = name.pop(0)
-    try:
-        found = import_module(module_name)
-        for frag in name:
-            try:
-                found = getattr(found, frag)
-            except AttributeError:
-                import_module(f"{module_name}.{frag}")
-                found = getattr(found, frag)
-        return found
-    except ImportError as e:
-        v = ValueError(f"Cannot resolve {s}: {e}")
-        raise v from e
 
 
 def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
@@ -514,22 +423,6 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
     if proto not in ("inproc", "ipc", "tcp", "pgm", "epgm"):
         raise SystemError(f"The protocol \"{proto}\" is not supported.")
     return socket_addr
-
-
-def interface(methode):
-    @wraps(methode)
-    def wrapper(*args, **kwargs):
-        return methode(*args, **kwargs)
-
-    @wraps(methode)
-    async def awrapper(*args, **kwargs):
-        return await methode(*args, **kwargs)
-
-    wrapper.__interface__ = True
-    awrapper.__interface__ = True
-    if inspect.iscoroutinefunction(methode):
-        return awrapper
-    return wrapper
 
 
 def to_bytes(s: Union[str, bytes, float, int]):
@@ -575,17 +468,436 @@ def decrypt(hash_str):
     return data
 
 
+class MessagePack(object):
+    """
+    用于配置全局的msgpack
+    """
+    def __init__(self):
+        self.prepare_pack: Optional[Callable] = None
+        self.unpack_object_hook: Optional[Callable] = None
+        self.unpack_object_pairs_hook: Optional[Callable] = None
+        self.unpack_list_hook: Optional[Callable] = None
+
+    def __setattr__(self, key, value):
+        if key in (
+                "prepare_pack",
+                "unpack_object_hook",
+                "unpack_object_pairs_hook",
+                "unpack_list_hook"
+        ) and value and not callable(value):
+            raise TypeError(f"`{key}` is not callable")
+        super().__setattr__(key, value)
+
+    def __delattr__(self, item):
+        if item in (
+                "prepare_pack",
+                "unpack_object_hook",
+                "unpack_object_pairs_hook",
+                "unpack_list_hook"
+        ):
+            setattr(self, item, None)
+        super().__delattr__(item)
+
+    def loads(self, data: bytes):
+        obj = msgpack.unpackb(
+            data,
+            object_hook=self.unpack_object_hook,
+            object_pairs_hook=self.unpack_object_pairs_hook,
+            list_hook=self.unpack_list_hook
+        )
+        return obj
+
+    def dumps(self, obj):
+        data = msgpack.packb(obj, default=self.prepare_pack)
+        return data
+
+
+message_pack = MessagePack()
+
+
 def msg_pack(obj: Any) -> ByteString:
-    data = msgpack.packb(obj)
+    if isinstance(obj, ValueProxy):
+        obj = obj.get()
+    elif isinstance(obj, ArrayProxy):
+        obj = obj.tolist()
+    elif isinstance(obj, (DictProxy, ListProxy)):
+        obj = obj._getvalue()
+    data = message_pack.dumps(obj)
     return data
 
 
 def msg_unpack(data: ByteString) -> Any:
-    obj = msgpack.unpackb(data)
+    obj = message_pack.loads(data)
     return obj
 
 
-async def gen_reply(
+class StreamReply(AsyncGenerator):
+    def __init__(self, maxsize=0, timeout=0):
+        self.replies = asyncio.Queue(maxsize)
+        self.timeout = timeout
+        self._exit = False
+        self._pause = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._exit:
+            raise GeneratorExit
+        if self.timeout:
+            try:
+                value = await asyncio.wait_for(self.replies.get(), self.timeout)
+            except asyncio.TimeoutError:
+                raise StopAsyncIteration
+        else:
+            try:
+                value = self.replies.get_nowait()
+            except asyncio.QueueEmpty:
+                raise StopAsyncIteration
+        self.replies.task_done()
+        if value == Settings.STREAM_END_MESSAGE:
+            await asyncio.sleep(1)
+            raise StopAsyncIteration
+        if self._pause and isinstance(value, BaseException):
+            self._pause = False
+            raise value
+        return value
+
+    async def asend(self, value):
+        if value:
+            await self.replies.put(value)
+        return
+
+    async def athrow(self, __type, value=None, traceback=None):
+        self._pause = True
+        if traceback:
+            await self.replies.put(__type.with_traceback(traceback))
+        elif isinstance(value, BaseException):
+            await self.replies.put(value)
+        else:
+            if value:
+                value = __type(value)
+            else:
+                value = __type()
+            await self.replies.put(__type(value))
+
+    async def aclose(self):
+        if not self._exit:
+            self._exit = True
+
+
+class GzipCompressor(object):
+    def __init__(self, compresslevel):
+        self.compresslevel = compresslevel
+        self.crc = zlib.crc32(b"")
+        self.size = 0
+        self._add_header = True
+        self._compressor = zlib.compressobj(
+            self.compresslevel,
+            zlib.DEFLATED,
+            -zlib.MAX_WBITS,
+            zlib.DEF_MEM_LEVEL,
+            zlib.Z_DEFAULT_STRATEGY
+        )
+
+    def _generate_header(self, mtime=None) -> bytes:
+        header = b"\037\213\010\000"
+        if not mtime:
+            mtime = time.time()
+        header += struct.pack("<L", int(mtime))
+        if self.compresslevel == 9:
+            header += b"\002"
+        elif self.compresslevel == 1:
+            header += b"\004"
+        else:
+            header += b"\000"
+        header += b"\377"
+        return header
+
+    def compress(self, data):
+        if isinstance(data, bytes):
+            length = len(data)
+        else:
+            data = memoryview(data)
+            length = data.nbytes
+        if length > 0:
+            self.crc = zlib.crc32(data, self.crc)
+            data = self._compressor.compress(data)
+            self.size += length
+            if self._add_header:
+                data = self._generate_header() + data
+                self._add_header = False
+        return data
+
+    def flush(self):
+        data = self._compressor.flush()
+        data += struct.pack("<L", self.crc)
+        data += struct.pack("<L", self.size & 0xffffffff)
+        return data
+
+
+class GzipDecompressor(object):
+    def __init__(self):
+        self._buffer = b""
+        self._crc = zlib.crc32(b"")
+        self._stream_size = 0
+        self._new_member = True
+        self._decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+
+    def _remove_header(self, data):
+        index = 0
+        magic = data[index: (index := index + 2)]
+        if magic != b"\037\213":
+            raise BadGzip("Not a gzipped data.")
+        method, flag, self.last_mtime = struct.unpack(
+            "<BBIxx", data[index: (index := index + 8)]
+        )
+        if method != 8:
+            raise BadGzip("Unknown conmpression method")
+        if flag & 4:
+            # Read & discard the extra field, if present
+            extra_len, = struct.unpack(
+                "<H", data[index: (index := index + 2)]
+            )
+            index += extra_len
+        if flag & 8:
+            # Read and discard a null-terminated string containing the filename
+            while True:
+                s = data[(index := index + 1)]
+                if not s or s == b'\000':
+                    break
+        if flag & 16:
+            # Read and discard a null-terminated string containing a comment
+            while True:
+                s = data[(index := index + 1)]
+                if not s or s == b'\000':
+                    break
+        if flag & 2:
+            index += 2
+        return data[index:]
+
+    @property
+    def eof(self):
+        return self._decompressor.eof
+
+    @property
+    def needs_input(self):
+        return self._decompressor.unconsumed_tail == b""
+
+    def _read_eof(self):
+        crc32, isize = struct.unpack("<II", self._decompressor.unused_data[:8])
+        if crc32 != self._crc:
+            raise BadGzip(f"CRC check failed {hex(crc32)} != {hex(self._crc)}")
+        elif isize != (self._stream_size & 0xffffffff):
+            raise BadGzip("Incorrect length of data produced")
+
+    def decompress(self, data, max_length=0):
+        if max_length < 0:
+            max_length = 0
+        if self._new_member:
+            data = self._remove_header(data)
+            self._new_member = False
+        if not self.needs_input:
+            data = self._decompressor.unconsumed_tail + data
+        data = self._decompressor.decompress(data, max_length)
+        if data == b"":
+            raise EOFError("Compressed data ended before the "
+                           "end-of-stream marker was reached")
+        self._crc = zlib.crc32(data, self._crc)
+        self._stream_size += len(data)
+        if self._decompressor.eof:
+            self._read_eof()
+        return data
+
+
+class HugeData(object):
+    end_tag = b"HugeDataEND"
+    except_tag = b"HugeDataException"
+
+    def __init__(
+        self, *,
+        data: Optional[bytes] = None,
+        compress_module: str = Settings.HUGE_DATA_COMPRESS_MODULE,
+        compress_level: int = Settings.HUGE_DATA_COMPRESS_LEVEL
+    ):
+        if data:
+            self.data: SharedMemory = SharedMemory(create=True, size=len(data))
+            self.data.buf[:len(data)] = data
+        else:
+            self.data: queue.Queue = SyncManager.Queue()
+        self._queue: queue.Queue = SyncManager.Queue()
+        self.compress_module = compress_module
+        self.compress_level = compress_level
+
+        atexit.register(self.destroy)
+
+    def destroy(self):
+        if isinstance(self.data, SharedMemory):
+            if self.data.buf is not None:
+                self.data.buf.release()
+            self.data.close()
+            try:
+                self.data.unlink()
+            except (FileNotFoundError, ImportError):
+                pass
+        atexit.unregister(self.destroy)
+
+    def __del__(self):
+        self.destroy()
+
+    def _incremental_compress(self):
+        try:
+            if self.compress_module == "gzip":
+                compressor = GzipCompressor(self.compress_level)
+            elif self.compress_module == "bz2":
+                compressor = bz2.BZ2Compressor(self.compress_level)
+            elif self.compress_module == "lzma":
+                compressor = lzma.LZMACompressor(preset=self.compress_level)
+            else:
+                compress_module = resolve_module_attr(self.compress_module)
+                compressor = compress_module.compressor(self.compress_level)
+            buffer = b""
+            stream_end = False
+            shm_index = 0
+            while 1:
+                if stream_end and not buffer:
+                    break
+                elif not stream_end:
+                    if isinstance(self.data, SharedMemory):
+                        data = self.data.buf[
+                               shm_index:
+                               (shm_index := shm_index + io.DEFAULT_BUFFER_SIZE)
+                               ]
+                        if not data:
+                            stream_end = True
+                    else:
+                        data = self.data.get()
+                        if data == self.end_tag:
+                            data = b""
+                            stream_end = True
+                    if data:
+                        data = compressor.compress(data)
+                        buffer += data
+                elif buffer:
+                    data, buffer = (
+                        buffer[:Settings.HUGE_DATA_SIZEOF],
+                        buffer[Settings.HUGE_DATA_SIZEOF:]
+                    )
+                    self._queue.put(data)
+            buffer = compressor.flush()
+            while buffer:
+                data, buffer = (
+                    buffer[:Settings.HUGE_DATA_SIZEOF],
+                    buffer[Settings.HUGE_DATA_SIZEOF:]
+                )
+                self._queue.put(data)
+        except Exception as error:
+            except_info = (
+                    str(error.__class__),
+                    str(error),
+                    "".join(format_tb(error.__traceback__))
+                )
+            logging.error("\n".join(except_info))
+            self._queue.put(HugeData.except_tag)
+            self._queue.put(except_info)
+        finally:
+            self._queue.put(self.end_tag)
+
+    def _incremental_decompress(self, max_length=-1):
+        try:
+            if self.compress_module == "gzip":
+                decompressor = GzipDecompressor()
+            elif self.compress_module == "bz2":
+                decompressor = bz2.BZ2Decompressor()
+            elif self.compress_module == "lzma":
+                decompressor = lzma.LZMADecompressor()
+            else:
+                compress_module = resolve_module_attr(self.compress_module)
+                decompressor = compress_module.decompressor()
+            shm_index = 0
+            throw = False
+            while not decompressor.eof:
+                if not decompressor.needs_input:
+                    data = b""
+                elif isinstance(self.data, SharedMemory):
+                    data = self.data.buf[
+                           shm_index:
+                           (shm_index := shm_index + Settings.HUGE_DATA_SIZEOF)
+                           ]
+                else:
+                    data = self.data.get()
+                    self.data.task_done()
+                if throw:
+                    exception = msg_unpack(data)
+                    raise RemoteException(*exception)
+                if data == self.end_tag:
+                    raise OSError("The compressed data is incomplete")
+                if data == self.except_tag:
+                    throw = True
+                    continue
+                data = decompressor.decompress(data, max_length)
+                self._queue.put(data)
+        except Exception as error:
+            except_info = (
+                str(error.__class__),
+                str(error),
+                "".join(format_tb(error.__traceback__))
+            )
+            self._queue.put(HugeData.except_tag)
+            self._queue.put(except_info)
+        finally:
+            self._queue.put(self.end_tag)
+
+    async def _data_agenerator(
+        self,
+        func, *args, **kwargs
+    ) -> AsyncGenerator[Union[bytes, tuple]]:
+        loop = asyncio.get_event_loop()
+        func = functools.partial(func, *args, **kwargs)
+        with ProcessPoolExecutor() as executor:
+            f = loop.run_in_executor(executor, func)
+            while 1:
+                if self._queue.empty():
+                    await asyncio.sleep(1)
+                    continue
+                data = self._queue.get()
+                self._queue.task_done()
+                if data == self.end_tag:
+                    break
+                yield data
+            await f
+        if exc := f.exception():
+            raise exc
+
+    def compress(self) -> AsyncGenerator[Union[bytes, tuple]]:
+        return self._data_agenerator(self._incremental_compress)
+
+    def decompress(self, max_length=-1) -> AsyncGenerator[Union[bytes, tuple]]:
+        return self._data_agenerator(self._incremental_decompress, max_length)
+
+
+def interface(methode):
+    @wraps(methode)
+    def wrapper(*args, **kwargs):
+        return methode(*args, **kwargs)
+
+    @wraps(methode)
+    async def awrapper(*args, **kwargs):
+        return await methode(*args, **kwargs)
+
+    wrapper.__interface__ = True
+    awrapper.__interface__ = True
+    if inspect.iscoroutinefunction(methode):
+        return awrapper
+    return wrapper
+
+
+async def generator_to_agenerator(generator: Generator) -> AsyncGenerator:
+    for element in generator:
+        yield element
+
+
+async def generate_reply(
     task: Task = None, result: Any = None, exception: Exception = None
 ):
     if task:
@@ -601,7 +913,22 @@ async def gen_reply(
             str(exception),
             "".join(format_tb(exception.__traceback__))
         )
-    return {
-        "result": result,
-        "exception": exception
-    }
+    if isinstance(result, Generator):
+        result = generator_to_agenerator(result)
+    if isinstance(result, AsyncGenerator):
+        return result
+    if sys.getsizeof(
+            result, Settings.HUGE_DATA_SIZEOF
+    ) > Settings.HUGE_DATA_SIZEOF:
+        loop = asyncio.get_event_loop()
+        with ProcessPoolExecutor() as executor:
+            _msg_pack = functools.partial(
+                msg_pack, result
+            )
+            data = await loop.run_in_executor(executor, _msg_pack)
+        return HugeData(data=data)
+    else:
+        return {
+            "result": result,
+            "exception": exception
+        }

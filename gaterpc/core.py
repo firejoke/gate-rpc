@@ -3,6 +3,7 @@
 # Created Date: 2023/3/30 11:09
 import contextvars
 import functools
+import os
 import secrets
 import inspect
 import sys
@@ -25,12 +26,12 @@ from zmq.auth.asyncio import AsyncioAuthenticator
 
 from .global_settings import Settings
 from .exceptions import (
-    BuysWorkersError, RemoteException, ServiceUnAvailableError
+    BuysWorkersError, HugeDataException, RemoteException,
+    ServiceUnAvailableError,
 )
 from .mixins import _LoopBoundMixin
 from .utils import (
-    BoundedDict, StreamReply, check_socket_addr, gen_reply,
-    interface,
+    BoundedDict, HugeData, StreamReply, check_socket_addr, generate_reply,
     msg_pack, msg_unpack, from_bytes, to_bytes,
 )
 
@@ -268,27 +269,27 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self,
         command: bytes,
         option: list[Union[bytes, str]] = None,
-        message: list[Union[bytes, str]] = None
+        messages: list[Union[bytes, str]] = None
     ):
         """
         在MDP的Worker端发出的消息的命令帧后面加一个worker id帧，用作掉线重连，幂等。
         """
         if not self._socket:
             return
-        if not message:
-            message = []
+        if not messages:
+            messages = []
         if not option:
             option = []
-        message = [
+        messages = [
             b"",
             Settings.MDP_WORKER,
             command,
             self.identity,
             *option,
-            *message
+            *messages
         ]
-        message = [to_bytes(s) for s in message]
-        await self._socket.send_multipart(message)
+        messages = [to_bytes(s) for s in messages]
+        await self._socket.send_multipart(messages)
 
     def run_in_executor(self, executor, func, *args, **kwargs):
         loop = self._get_loop()
@@ -332,41 +333,41 @@ class Worker(ABCWorker, _LoopBoundMixin):
                     self.default_executor, func, *args, **kwargs
                 )
         except Exception as e:
-            reply = await gen_reply(exception=e)
+            reply = await generate_reply(exception=e)
         else:
-            reply = await gen_reply(task)
+            reply = await generate_reply(task)
         option = [b"@".join((cli_id, cli_addr, request_id))]
-        if isinstance(reply["result"], (Generator, AsyncGenerator)):
+        if isinstance(reply, HugeData):
+            option.append(Settings.STREAM_HUGE_DATA_TAG)
+            reply_except = False
+            async for data in reply.compress():
+                if reply_except:
+                    data = msg_pack(data)
+                if data == HugeData.except_tag:
+                    reply_except = True
+                await self.send_to_broker(
+                    Settings.MDP_COMMAND_REPLY, option, [data]
+                )
+            await self.send_to_broker(
+                Settings.MDP_COMMAND_REPLY, option,
+                [Settings.STREAM_END_MESSAGE]
+            )
+            reply.destroy()
+        elif isinstance(reply, AsyncGenerator):
             option.append(Settings.STREAM_GENERATOR_TAG)
-            if isinstance(reply["result"], Generator):
-                for sub_reply in reply["result"]:
-                    message = [msg_pack(sub_reply)]
-                    await self.send_to_broker(
-                        Settings.MDP_COMMAND_REPLY, option, message
-                    )
-            elif isinstance(reply["result"], AsyncGenerator):
-                async for sub_reply in reply["result"]:
-                    message = [msg_pack(sub_reply)]
-                    await self.send_to_broker(
-                        Settings.MDP_COMMAND_REPLY, option, message
-                    )
+            async for sub_reply in reply:
+                messages = [msg_pack(sub_reply)]
+                await self.send_to_broker(
+                    Settings.MDP_COMMAND_REPLY, option, messages
+                )
             await self.send_to_broker(
                 Settings.MDP_COMMAND_REPLY, option,
                 [Settings.STREAM_END_MESSAGE]
             )
         else:
-            # TODO: 过大的对象，先压缩，再用流式传输。
-            if sys.getsizeof(
-                    reply, Settings.HUGE_DATA_SIZEOF
-            ) > Settings.HUGE_DATA_SIZEOF:
-                reply = await self.run_in_executor(
-                    self.process_executor, msg_pack, reply
-                )
-            else:
-                reply = msg_pack(reply)
-            message = [reply]
+            messages = [msg_pack(reply)]
             await self.send_to_broker(
-                Settings.MDP_COMMAND_REPLY, option, message
+                Settings.MDP_COMMAND_REPLY, option, messages
             )
 
     async def recv(self):
@@ -387,15 +388,15 @@ class Worker(ABCWorker, _LoopBoundMixin):
                     )
                     heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 if socks:
-                    message = await self._socket.recv_multipart()
+                    messages = await self._socket.recv_multipart()
                     broker_liveness = self.heartbeat_liveness
                     try:
                         (
                             empty,
                             mdp_worker_version,
                             command,
-                            *message
-                        ) = message
+                            *messages
+                        ) = messages
                         if empty:
                             continue
                     except ValueError:
@@ -409,7 +410,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         break
                     elif command == Settings.MDP_COMMAND_REQUEST:
                         try:
-                            client, empty, request_id, body = message
+                            client, empty, request_id, body = messages
                             if empty:
                                 raise ValueError
                             client_id, client_addr = client.split(b"@")
@@ -446,40 +447,6 @@ class Worker(ABCWorker, _LoopBoundMixin):
         if not self._recv_task:
             loop = self._get_loop()
             self._recv_task = loop.create_task(self.recv())
-
-    @interface
-    async def atest(self, *args, **kwargs):
-        loop = self._get_loop()
-        return {
-            "name": "async atest",
-            "args": args,
-            "kwargs": kwargs,
-            "loop_time": loop.time()
-        }
-
-    @interface
-    def test(self, *args, **kwargs):
-        return {
-            "name": "test",
-            "args": args,
-            "kwargs": kwargs,
-            "loop_time": time()
-        }
-
-    @interface
-    def test_generator(self, maximum: int):
-        i = 0
-        while i < maximum:
-            yield i
-            i += 1
-
-    @interface
-    async def test_agenerator(self, maximum: int):
-        i = 0
-        while i < maximum:
-            await asyncio.sleep(0.1)
-            yield i
-            i += 1
 
 
 class Service(ABCService):
@@ -573,7 +540,6 @@ class AMajordomo(_LoopBoundMixin):
     Asynchronous Majordomo
     https://zguide.zeromq.org/docs/chapter4/#Asynchronous-Majordomo-Pattern
     多偏好服务集群，连接多个提供不同服务的 Service（远程的 Service 也可能是一个代理，进行负载均衡）
-    TODO: 分布式计算，均衡任务到不同节点。
     """
 
     ctx = Context()
@@ -676,10 +642,8 @@ class AMajordomo(_LoopBoundMixin):
             except Exception:
                 pass
         worker.service.remove_worker(worker)
-        if worker.identity not in self.workers:
-            return True
-        self.workers.pop(worker.identity, None)
-
+        if worker.identity in self.workers:
+            self.workers.pop(worker.identity, None)
         return True
 
     def ban_worker_after_expiration(self, worker: RemoteWorker):
@@ -809,7 +773,7 @@ class AMajordomo(_LoopBoundMixin):
                 mdp_worker_version,
                 command,
                 worker_id,
-                *message
+                *messages
             ) = replies
             if empty:
                 raise ValueError
@@ -821,11 +785,11 @@ class AMajordomo(_LoopBoundMixin):
         if not (worker := self.workers.get(worker_id, None)):
             logger.debug(f"The worker({worker_id}) was not registered")
         if command == Settings.MDP_COMMAND_READY:
-            if len(message) > 1:
+            if len(messages) > 1:
                 return
             try:
                 service_name, service_description = (
-                    from_bytes(message[0])
+                    from_bytes(messages[0])
                 ).split(":")
             except ValueError:
                 return False
@@ -849,7 +813,7 @@ class AMajordomo(_LoopBoundMixin):
             self.ban_worker_after_expiration(worker)
 
         elif command == Settings.MDP_COMMAND_HEARTBEAT:
-            if len(message) > 1:
+            if len(messages) > 1:
                 return
             if not worker:
                 return
@@ -862,7 +826,7 @@ class AMajordomo(_LoopBoundMixin):
 
         elif command == Settings.MDP_COMMAND_REPLY:
             try:
-                client, *body = message
+                client, *body = messages
                 client_id, client_addr, request_id = client.split(b"@")
             except ValueError:
                 return
@@ -906,7 +870,7 @@ class AMajordomo(_LoopBoundMixin):
                 mdp_client_version,
                 service_name,
                 client_id,
-                *message
+                *messages
             ) = request
             if empty:
                 raise ValueError
@@ -915,7 +879,7 @@ class AMajordomo(_LoopBoundMixin):
 
         if self.zap_socket:
             try:
-                mechanism, *credentials, request_id, body = message
+                mechanism, *credentials, request_id, body = messages
             except ValueError:
                 logger.debug("ZAP frames invalid")
                 return False
@@ -926,7 +890,7 @@ class AMajordomo(_LoopBoundMixin):
                 return False
         else:
             try:
-                request_id, body = message
+                request_id, body = messages
             except ValueError:
                 return False
         if service_name.startswith(Settings.MDP_INTERNAL_SERVICE_PREFIX):
@@ -952,7 +916,7 @@ class AMajordomo(_LoopBoundMixin):
             if not worker.is_alive():
                 await self.ban_worker(worker)
         service = self.services.get(service_name)
-        exception = await gen_reply(
+        exception = await generate_reply(
             exception=ServiceUnAvailableError(service_name)
         )
         except_reply = [
@@ -983,20 +947,20 @@ class AMajordomo(_LoopBoundMixin):
             except Exception as error:
                 await self.reply_frontend(except_reply)
         else:
-            exception = await gen_reply(exception=BuysWorkersError())
+            exception = await generate_reply(exception=BuysWorkersError())
             except_reply[-1] = msg_pack(exception)
             await self.reply_frontend(except_reply)
 
     async def send_heartbeat(self):
         loop = self._get_loop()
         for worker in self.workers.values():
-            message = [
+            messages = [
                 to_bytes(worker.address),
                 b"",
                 Settings.MDP_WORKER,
                 Settings.MDP_COMMAND_HEARTBEAT
             ]
-            fut = self.backend.send_multipart(message)
+            fut = self.backend.send_multipart(messages)
             if fut.done():
                 continue
             ht = loop.create_task(fut)
@@ -1131,7 +1095,7 @@ class Client(_LoopBoundMixin):
         self._recv_task = None
 
         self.default_service = Settings.SERVICE_DEFAULT_NAME
-        self._temp_service = self._temp_func = None
+        self._remote_service = self._remote_func = None
 
         if credential_frames is None:
             credential_frames = list()
@@ -1187,10 +1151,10 @@ class Client(_LoopBoundMixin):
 
     def close(self):
         if self.ready:
+            self.disconnect()
             if not self._recv_task.cancelled:
                 self._recv_task.cancel()
             self._recv_task = None
-            self.disconnect()
             self.ready = False
 
     async def _request(self, service_name: str, body: Union[str, bytes]) -> bytes:
@@ -1223,6 +1187,7 @@ class Client(_LoopBoundMixin):
         :param args: 要调用的该函数要传递的位置参数
         :param kwargs: 要调用的该函数要传递的关键字参数
         """
+        loop = self._get_loop()
         body = msg_pack(
             {
                 "func": func_name,
@@ -1241,6 +1206,23 @@ class Client(_LoopBoundMixin):
             )
         if isinstance(response, StreamReply):
             return response
+        if isinstance(response, HugeData):
+            result = b""
+            throw = False
+            async for data in response.decompress(Settings.HUGE_DATA_SIZEOF):
+                if throw:
+                    exception = "\n".join(data)
+                    raise HugeDataException(exception)
+                if data == HugeData.except_tag:
+                    throw = True
+                else:
+                    result += data
+            with ProcessPoolExecutor() as executor:
+                _msg_unpack = functools.partial(
+                    msg_unpack, result
+                )
+                result = await loop.run_in_executor(executor, _msg_unpack)
+            return result
         if exception := response.get("exception"):
             raise RemoteException(*exception)
         return response.get("result")
@@ -1273,7 +1255,7 @@ class Client(_LoopBoundMixin):
                     heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 socks = await self._poller.poll(self.heartbeat)
                 if socks:
-                    message = await self.socket.recv_multipart()
+                    messages = await self.socket.recv_multipart()
                     try:
                         (
                             empty,
@@ -1283,7 +1265,7 @@ class Client(_LoopBoundMixin):
                             request_id,
                             # steam tag
                             *body
-                        ) = message
+                        ) = messages
                         if empty:
                             continue
                     except ValueError:
@@ -1310,7 +1292,8 @@ class Client(_LoopBoundMixin):
                         *option, body = body
                         if option[0] == Settings.STREAM_GENERATOR_TAG:
                             # TODO: 接收处理流式数据
-                            if request_id not in self.requests:
+                            stream_reply = self.requests.get(request_id, None)
+                            if not stream_reply:
                                 stream_reply = StreamReply(
                                     maxsize=self.stream_reply_maxsize,
                                     timeout=self.reply_timeout
@@ -1318,26 +1301,33 @@ class Client(_LoopBoundMixin):
                                 await self.requests.aset(
                                     request_id, stream_reply
                                 )
-                            else:
-                                stream_reply = self.requests[request_id]
                             if body != Settings.STREAM_END_MESSAGE:
                                 body = msg_unpack(body)
                             await stream_reply.asend(body)
+                        elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
+                            huge_reply = self.requests.get(request_id, None)
+                            if not huge_reply:
+                                huge_reply = HugeData()
+                                await self.requests.aset(
+                                    request_id, huge_reply
+                                )
+                            huge_reply.data.put_nowait(body)
             except Exception:
                 exception = "".join(format_exception(*sys.exc_info()))
                 logger.error(exception)
+                return
 
     def __getattr__(self, item):
-        if not self._temp_func:
-            self._temp_service = self.default_service
+        if not self._remote_func:
+            self._remote_service = self.default_service
         else:
-            if self._temp_service == self.default_service:
-                self._temp_service = self._temp_func
+            if self._remote_service == self.default_service:
+                self._remote_service = self._remote_func
             else:
-                self._temp_service = ".".join(
-                    (self._temp_service, self._temp_func)
+                self._remote_service = ".".join(
+                    (self._remote_service, self._remote_func)
                 )
-        self._temp_func = item
+        self._remote_func = item
         return self
 
     def __call__(self, *args, **kwargs) -> Coroutine:
@@ -1345,7 +1335,7 @@ class Client(_LoopBoundMixin):
         返回一个执行rpc调用的协程
         """
         waiting = self.knock(
-                self._temp_service, self._temp_func, *args, **kwargs
+                self._remote_service, self._remote_func, *args, **kwargs
             )
-        self._temp_service = self._temp_func = None
+        self._remote_service = self._remote_func = None
         return waiting
