@@ -26,6 +26,7 @@ gate-rpc
     Settings.MDP_HEARTBEAT_INTERVAL = 服务端和客户端相对于中间代理的心跳间隔时间
     Settings.MDP_HEARTBEAT_LIVENESS = 判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线
     Settings.REPLY_TIMEOUT = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
+    Settings.setup()
 
 ********
 测试示范
