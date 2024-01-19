@@ -69,7 +69,7 @@ class ABCWorker(ABC):
     identity: bytes
     service: "ABCService"
     address: Union[str, bytes]
-    heartbeat_liveness = 3
+    heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
     heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL
     expiry: float
     max_allowed_request_queue: int = 0
@@ -1053,7 +1053,7 @@ class Client(_LoopBoundMixin):
         identity: str = None,
         context: Context = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
-        reply_timeout: float = Settings.MDP_REPLY_TIMEOUT,
+        reply_timeout: float = Settings.REPLY_TIMEOUT,
         msg_max: int = Settings.MESSAGE_MAX,
         zap_mechanism: str = None,
         credential_frames: list = None,

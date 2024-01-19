@@ -11,6 +11,21 @@ gate-rpc
 - 使用可以异步设置键值和异步获取键值的 BoundedDict 来简化超时等待获取
 - 在每次实例化 Worker、Server、AMajordomo、Client 各类之前，通过修改 Settings 的属性来修改运行配置
 
+********
+配置
+********
+在实例化 Worker、Service、AMajordomo、Client 各类之前，需要运行 Settings.setup 函数来配置全局配置
+
+::
+
+    # 可能会修改的几个主要配置
+    Settings.MESSAGE_MAX = Worker 和 Client 实例里等待处理的消息最大数量
+    Settings.HUGE_DATA_SIZEOF = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
+    Settings.SERVICE_DEFAULT_NAME = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
+    Settings.MDP_INTERNAL_SERVICE_PREFIX = MDP 内部服务的前缀
+    Settings.MDP_HEARTBEAT_INTERVAL = 服务端和客户端相对于中间代理的心跳间隔时间
+    Settings.MDP_HEARTBEAT_LIVENESS = 判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线
+    Settings.REPLY_TIMEOUT = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
 
 ********
 测试示范
@@ -57,7 +72,7 @@ gate-rpc
                 i += 1
 
     Settings.setup()
-    gr = Server(name="SRkv")
+    gr = Service(name="SRkv")
     gr_worker = gr.create_worker(GRWorker, "tcp://127.0.0.1:5555")
     gr_worker.run()
 

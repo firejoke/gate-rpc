@@ -19,12 +19,6 @@ class DefaultSettings(object):
     WORKER_ADDR: str = f"ipc://{RUN_PATH}cpu_worker"
     ZMQ_HWM: int = 1000
     MESSAGE_MAX: int = 1000  # 参考ZMQ HWM
-    STREAM_GENERATOR_TAG = b"GateStreamGenerator"
-    STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
-    STREAM_END_MESSAGE = b"GateStreamEnd"
-    HUGE_DATA_SIZEOF = 1000  # MTU 1500 减去20字节ip头部，20字节tcp头部，去掉MDP的前几帧
-    HUGE_DATA_COMPRESS_MODULE: str = "gzip"
-    HUGE_DATA_COMPRESS_LEVEL: int = 9
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
     ZAP_DEFAULT_DOMAIN: bytes = b"gate"
@@ -35,10 +29,8 @@ class DefaultSettings(object):
     ZAP_PLAIN_DEFAULT_PASSWORD: bytes = "哔哔哔哔哔".encode("utf-8")
     ZAP_INPROC_ADDR: str = "inproc://zeromq.zap.01"
     # MDP
-    SERVICE_DEFAULT_NAME: str = "gate-rpc"
     MDP_HEARTBEAT_INTERVAL: int = 1500
     MDP_HEARTBEAT_LIVENESS: int = 3
-    MDP_REPLY_TIMEOUT: float = 60.0
     MDP_INTERNAL_SERVICE_PREFIX: bytes = b"gate."
     MDP_VERSION: str = "01"
     MDP_CLIENT: bytes = f"MDPC{MDP_VERSION}".encode("utf-8")
@@ -49,6 +41,14 @@ class DefaultSettings(object):
     MDP_COMMAND_HEARTBEAT: bytes = b"\x04"
     MDP_COMMAND_DISCONNECT: bytes = b"\x05"
     # RPC
+    STREAM_GENERATOR_TAG = b"GateStreamGenerator"
+    STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
+    STREAM_END_MESSAGE = b"GateStreamEnd"
+    HUGE_DATA_SIZEOF = 1000  # MTU 1500 减去20字节ip头部，20字节tcp头部，去掉MDP的前几帧
+    HUGE_DATA_COMPRESS_MODULE: str = "gzip"
+    HUGE_DATA_COMPRESS_LEVEL: int = 9
+    SERVICE_DEFAULT_NAME: str = "gate-rpc"
+    REPLY_TIMEOUT: float = 60.0
     TASK_TIMEOUT: int = 3  # second
     LOG_PATH = Path("/tmp/gate-rpc/")
     LOGGING = {
