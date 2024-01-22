@@ -1063,7 +1063,6 @@ class Client(_LoopBoundMixin):
         TODO：连接远程的 MDP 服务，连接后发送一条查询有哪些服务的消息，
           然后将包含的服务添加为客户端关联的服务实例，链式调用服务包含的方法。
         TODO: 对于没有收到回复的请求记录并保存下来，可以设置重试次数来重新请求。
-        TODO: 从rpc获取的所有函数，在客户端这里都用这个生成对应的本地函数。
         :param context: zmq 的上下文实例，为空则创建。
         :param heartbeat: 维持连接的心跳消息间隔，默认为 MDP_HEARTBEAT，单位是毫秒。
         :param reply_timeout: 等待回复的超时时间

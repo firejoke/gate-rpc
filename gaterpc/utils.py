@@ -556,7 +556,7 @@ class StreamReply(AsyncGenerator):
                 raise StopAsyncIteration
         self.replies.task_done()
         if value == Settings.STREAM_END_MESSAGE:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
             raise StopAsyncIteration
         if self._pause and isinstance(value, BaseException):
             self._pause = False
@@ -717,6 +717,7 @@ class HugeData(object):
     def __init__(
         self, *,
         data: Optional[bytes] = None,
+        get_timeout: int = 0,
         compress_module: str = Settings.HUGE_DATA_COMPRESS_MODULE,
         compress_level: int = Settings.HUGE_DATA_COMPRESS_LEVEL
     ):
@@ -725,6 +726,7 @@ class HugeData(object):
             self.data.buf[:len(data)] = data
         else:
             self.data: queue.Queue = SyncManager.Queue()
+        self.get_timeout = get_timeout
         self._queue: queue.Queue = SyncManager.Queue()
         self.compress_module = compress_module
         self.compress_level = compress_level
@@ -771,7 +773,10 @@ class HugeData(object):
                         if not data:
                             stream_end = True
                     else:
-                        data = self.data.get()
+                        if self.get_timeout:
+                            data = self.data.get(timeout=self.get_timeout)
+                        else:
+                            data = self.data.get(block=False)
                         if data == self.end_tag:
                             data = b""
                             stream_end = True
