@@ -12,6 +12,17 @@ gate-rpc
 - 在每次实例化 Worker、Server、AMajordomo、Client 各类之前，通过修改 Settings 的属性来修改运行配置
 
 ********
+安装
+********
+
+可以直接使用pip安装，或直接下载源码随意放置。
+
+::
+
+    pip install gaterpc
+
+
+********
 配置
 ********
 在实例化 Worker、Service、AMajordomo、Client 各类之前，需要运行 Settings.setup 函数来配置全局配置 [#f1]_ ，
