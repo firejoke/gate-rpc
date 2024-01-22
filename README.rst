@@ -14,14 +14,15 @@ gate-rpc
 ********
 配置
 ********
-在实例化 Worker、Service、AMajordomo、Client 各类之前，需要运行 Settings.setup 函数来配置全局配置，特殊返回值的序列化通过 MessagePack 的全局实例来定制
+在实例化 Worker、Service、AMajordomo、Client 各类之前，需要运行 Settings.setup 函数来配置全局配置 [#f1]_ ，
+特殊返回值的序列化通过 MessagePack 的全局实例来定制 [#f2]_
 
 ::
 
     # 可能会修改的几个主要配置
     Settings.MESSAGE_MAX = Worker 和 Client 实例里等待处理的消息最大数量
     Settings.HUGE_DATA_SIZEOF = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
-    Settings.HUGE_DATA_COMPRESS_MODULE = 使用的压缩模块的名称 \[#f1\]_
+    Settings.HUGE_DATA_COMPRESS_MODULE = 使用的压缩模块的名称 [#f1]_
     Settings.SERVICE_DEFAULT_NAME = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
     Settings.MDP_INTERNAL_SERVICE_PREFIX = MDP 内部服务的前缀
     Settings.MDP_HEARTBEAT_INTERVAL = 服务端和客户端相对于中间代理的心跳间隔时间
@@ -29,7 +30,7 @@ gate-rpc
     Settings.REPLY_TIMEOUT = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
     Settings.setup()
 
-    # 特殊返回值的序列化配置 \[#f2\]_
+    # 特殊返回值的序列化配置 [#f2]_
     from gaterpc.utils.message_pack
     message_pack.prepare_pack = 在使用 msgpack.packb 时，传递给 default 参数的可执行对象
     message_pack.unpack_object_hook = 在使用 msgpack.unpackb 时，传递给 object_hook 的可执行对象
@@ -38,7 +39,7 @@ gate-rpc
 
 
 .. rubric:: Footnotes
-.. [#f1] 除了内置的 gzip，bz2，lzma，还可以使用外部模块，只要模块提供 compressor 和 decompressor 方法即可，
+.. [#f1] Settings.HUGE_DATA_COMPRESS_MODULE 除了内置的 gzip，bz2，lzma，还可以使用外部模块，只要模块提供 compressor 和 decompressor 方法即可，
    compressor 需要返回一个带有 compress 方法的增量压缩器对象，decompressor 需要返回一个带有 decompress 的增量解压缩器对象
 .. [#f2] 单一返回值和生成器的元素返回值，以及巨型返回值都会使用 utils.msg_pack 和 utils.msg_unpack 来序列化和反序列化
    这两个方法内部是使用的 utils.MessagePack 的全局实例，如果不能返回常规的“字符串”，“列表”，“字典”返回值，建议配置这几个配置
