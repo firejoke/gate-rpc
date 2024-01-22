@@ -21,7 +21,7 @@ gate-rpc
     # 可能会修改的几个主要配置
     Settings.MESSAGE_MAX = Worker 和 Client 实例里等待处理的消息最大数量
     Settings.HUGE_DATA_SIZEOF = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
-    Settings.HUGE_DATA_COMPRESS_MODULE = 使用的压缩模块的名称[#f1]_
+    Settings.HUGE_DATA_COMPRESS_MODULE = 使用的压缩模块的名称 [#f1]_
     Settings.SERVICE_DEFAULT_NAME = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
     Settings.MDP_INTERNAL_SERVICE_PREFIX = MDP 内部服务的前缀
     Settings.MDP_HEARTBEAT_INTERVAL = 服务端和客户端相对于中间代理的心跳间隔时间
@@ -29,7 +29,7 @@ gate-rpc
     Settings.REPLY_TIMEOUT = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
     Settings.setup()
 
-    # 特殊返回值的序列化配置[#f2]_
+    # 特殊返回值的序列化配置 [#f2]_
     from gaterpc.utils.message_pack
     message_pack.prepare_pack = 在使用 msgpack.packb 时，传递给 default 参数的可执行对象
     message_pack.unpack_object_hook = 在使用 msgpack.unpackb 时，传递给 object_hook 的可执行对象
