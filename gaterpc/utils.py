@@ -21,7 +21,7 @@ import time
 import warnings
 import zlib
 
-from asyncio import Task
+from asyncio import Future, Task
 from collections import UserDict, deque
 from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -41,7 +41,7 @@ from typing import (
 
 import msgpack
 
-from .exceptions import BadGzip, RemoteException
+from .exceptions import BadGzip, DictFull, RemoteException
 from .global_settings import Settings
 from .mixins import _LoopBoundMixin
 
@@ -78,6 +78,10 @@ def resolve_module_attr(s: str):
         raise v from e
 
 
+class Temp:
+    pass
+
+
 class BoundedDict(UserDict, _LoopBoundMixin):
     """
     参考 asyncio.BoundedSemaphore
@@ -86,23 +90,22 @@ class BoundedDict(UserDict, _LoopBoundMixin):
     """
 
     def __init__(
-        self, data: dict = None, maxsize: int = 1000, timeout: float = 0,
+        self, maxsize: int = 1000, timeout: float = 0,
         /, **kwargs
     ):
         """
-        :param data: 原始字典数据，可为空。
         :param maxsize: 键值对最大数量。
         :param timeout: 任何异步操作的超时时间，单位是秒。
         :param kwargs: 初始键值对。
         """
         self.maxsize = maxsize
+        if self.maxsize <= 0:
+            self.maxsize = float("+inf")
         self.usable_size = maxsize
         self.timeout = timeout
-        self._set_waiters: deque = deque()
+        self._waiters: dict[KT, tuple[Future, deque[Future]]] = dict()
         self._sync_task: set = set()
-        self._get_waiters: Dict[KT, deque] = dict()
-        if not data:
-            data = {}
+        data = kwargs
         if (len(data) + len(kwargs)) > maxsize:
             raise RuntimeError(
                 "The initial data size exceeds the maximum size limit."
@@ -110,45 +113,45 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         super().__init__(data, **kwargs)
 
     def _set_locked(self):
-        return self.usable_size == 0 or (
-            any(not w.cancelled() for w in self._set_waiters)
-        )
+        return self.usable_size == 0
+
+    def full(self):
+        return self._set_locked()
 
     async def aset(self, key: KT, value: VT, timeout: float = None):
-        if not self._set_locked():
+        if timeout is None:
+            timeout = self.timeout
+        fut, waiters = self._waiters.get(key, (None, None))
+        if not fut and not self._set_locked():
             if key not in self.data:
                 self.usable_size -= 1
-        else:
-            if timeout is None:
-                timeout = self.timeout
-            is_timeout = False
+            self.data[key] = value
+            return
+        elif fut and not self._set_locked():
+            if not fut.done():
+                fut.set_result(None)
+        elif not fut:
             fut = self._get_loop().create_future()
-            self._set_waiters.append(fut)
-
-            try:
-                try:
-                    await asyncio.wait_for(fut, timeout)
-                except asyncio.TimeoutError:
-                    is_timeout = True
-                finally:
-                    self._set_waiters.remove(fut)
-            except asyncio.CancelledError:
-                if not fut.cancelled():
-                    self.usable_size += 1
-                    self._wake_up_next_set()
-                raise
-
-            if is_timeout:
-                raise asyncio.TimeoutError(
-                    f"The number of keys reached the maximum of {self.maxsize},"
-                    f" and no key was released within {self.timeout} seconds"
-                )
-            if self.usable_size > 0:
-                self._wake_up_next_set()
-
-        self.data[key] = value
-        if key in self._get_waiters:
-            self._release_get(key)
+            waiters: deque[Future] = deque()
+            self._waiters[key] = (fut, waiters)
+        try:
+            await asyncio.wait_for(fut, timeout)
+            self.data[key] = value
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(True)
+        except asyncio.CancelledError:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            self.usable_size += 1
+            self._wake_up_next_set()
+            raise
+        except asyncio.TimeoutError:
+            raise DictFull(self.maxsize)
+        finally:
+            self._waiters.pop(key)
+            self._wake_up_next_set()
         return
 
     def set(self, key: KT, value: VT):
@@ -164,71 +167,96 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         self._wake_up_next_set()
 
     def _wake_up_next_set(self):
-        if not self._set_waiters:
-            return
-
-        try:
-            fut = self._set_waiters.popleft()
+        for key, (fut, waiters) in self._waiters.items():
             if not fut.done():
                 self.usable_size -= 1
                 fut.set_result(True)
-        except IndexError:
-            pass
-        return
+            return
+
+    async def apop(
+        self,
+        key: KT,
+        default: VT = Temp,
+        timeout: float = None,
+    ):
+        """
+        :param key: 要弹出的 key
+        :param default: 没有 key 时返回的值
+        :param timeout: 超时时间
+        :return:
+        """
+        if timeout is None:
+            timeout = self.timeout
+
+        try:
+            value = self.data.pop(key)
+            return value
+        except KeyError:
+            if self.full():
+                if default is not Temp:
+                    return default
+                raise
+            fut = self._get_loop().create_future()
+            if key not in self._waiters:
+                self._waiters[key] = (self._get_loop().create_future(), deque())
+            self._waiters[key][1].append(fut)
+            try:
+                await asyncio.wait_for(fut, timeout)
+                try:
+                    return self.data.pop(key)
+                except KeyError:
+                    if default is not Temp:
+                        return default
+                    raise
+            except asyncio.TimeoutError:
+                if default is not Temp:
+                    return default
+                raise KeyError
+            finally:
+                if key in self._waiters:
+                    self._waiters[key][1].remove(fut)
 
     async def aget(
         self, key: KT,
-        default: VT = None,
+        default: VT = Temp,
         timeout: float = None,
-        ignore: bool = True
     ) -> VT:
         """
         :param key: 要查询的 key
         :param default: 没有 key 时返回的值
         :param timeout: 超时时间
-        :param ignore: 没有 key 时是否引发键错误
         :return:
         """
-        is_timeout = False
         if timeout is None:
             timeout = self.timeout
-        
-        if key not in self.data:
-            if not (key_waiters := self._get_waiters.get(key)):
-                self._get_waiters[key] = key_waiters = deque()
-            fut = self._get_loop().create_future()
-            key_waiters.append(fut)
-            try:
-                try:
-                    await asyncio.wait_for(fut, timeout)
-                except asyncio.TimeoutError:
-                    is_timeout = True
-                finally:
-                    key_waiters.remove(fut)
-            except asyncio.CancelledError:
-                if not fut.cancelled():
-                    fut.set_result(None)
-                raise
+
         try:
-            return self.data[key]
+            value = self.data[key]
+            return value
         except KeyError:
-            if ignore:
-                return default
-            raise KeyError(key)
-        finally:
-            if is_timeout and timeout > 0:
-                raise asyncio.TimeoutError(f'get "{key}" timeout.')
-
-    def _release_get(self, key):
-        if key in self._get_waiters:
-            for fut in self._get_waiters[key]:
-                if not fut.done():
-                    fut.set_result(True)
-            self._get_waiters.pop(key)
-        return True
-
-    # def get(self, key: KT, default: VT = None, ignore=True) -> Coroutine:
-    #     return self.aget(key, default, None, ignore)
+            if self.full():
+                if default is not Temp:
+                    return default
+                raise
+            fut = self._get_loop().create_future()
+            if key not in self._waiters:
+                self._waiters[key] = (self._get_loop().create_future(), deque())
+            self._waiters[key][1].append(fut)
+            try:
+                await asyncio.wait_for(fut, timeout)
+                try:
+                    return self.data[key]
+                except KeyError:
+                    if default is not Temp:
+                        return default
+                    raise
+            except asyncio.TimeoutError:
+                if default is not Temp:
+                    return default
+                raise KeyError
+            finally:
+                if key in self._waiters:
+                    self._waiters[key][1].remove(fut)
 
     def __getitem__(self, key) -> VT:
         return self.data[key]
@@ -249,8 +277,8 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         k, v = super().popitem()
         return k, v
 
-    def pop(self, key: KT) -> VT:
-        value = super().pop(key)
+    def pop(self, key: KT, default=None) -> VT:
+        value = super().pop(key, default=default)
         return value
 
     @overload
@@ -937,3 +965,37 @@ async def generate_reply(
             "result": result,
             "exception": exception
         }
+
+
+def check_zap_args(mechanism: Optional[str], credentials: Optional[tuple]):
+    if not mechanism:
+        return mechanism, credentials
+    mechanism = mechanism.encode("utf-8")
+    if credentials is None:
+        credentials = tuple()
+    if (mechanism == Settings.ZAP_MECHANISM_NULL
+            and len(credentials) != 0):
+        AttributeError(
+            f'The "{Settings.ZAP_MECHANISM_NULL}" mechanism '
+            f'should not have credential frames.'
+        )
+    elif (mechanism == Settings.ZAP_MECHANISM_PLAIN
+          and len(credentials) != 2):
+        AttributeError(
+            f'The "{Settings.ZAP_MECHANISM_PLAIN}" mechanism '
+            f'should have tow credential frames: '
+            f'a username and a password.'
+        )
+    elif mechanism == Settings.ZAP_MECHANISM_CURVE:
+        raise RuntimeError(
+            f'The "{Settings.ZAP_MECHANISM_CURVE}"'
+            f' mechanism is not implemented yet.'
+        )
+    elif mechanism:
+        raise ValueError(
+            f'mechanism can only be '
+            f'"{Settings.ZAP_MECHANISM_NULL}" or '
+            f'"{Settings.ZAP_MECHANISM_PLAIN}" or '
+            f'"{Settings.ZAP_MECHANISM_CURVE}"'
+        )
+    return mechanism, credentials

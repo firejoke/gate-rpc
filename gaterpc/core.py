@@ -3,8 +3,6 @@
 # Created Date: 2023/3/30 11:09
 import contextvars
 import functools
-import os
-import secrets
 import inspect
 import sys
 from abc import ABC, abstractmethod
@@ -31,7 +29,8 @@ from .exceptions import (
 )
 from .mixins import _LoopBoundMixin
 from .utils import (
-    BoundedDict, HugeData, StreamReply, check_socket_addr, generate_reply,
+    BoundedDict, HugeData, StreamReply, check_socket_addr, check_zap_args,
+    generate_reply,
     msg_pack, msg_unpack, from_bytes, to_bytes,
 )
 
@@ -128,13 +127,12 @@ class RemoteWorker(ABCWorker):
         self.heartbeat = heartbeat
         self.expiry = 1e-3 * self.heartbeat_liveness * self.heartbeat + time()
         self.address = address
+        self.destroy_task: Optional[asyncio.Task] = None
 
     def is_alive(self):
         if time() > self.expiry:
             return False
         return True
-
-# TODO: 发送消息的部分，需要测试是否可以从list改成tuple
 
 
 class Worker(ABCWorker, _LoopBoundMixin):
@@ -149,6 +147,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
         identity: str = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
         context: Context = None,
+        zap_mechanism: str = None,
+        zap_credentials: tuple = None,
         thread_executor: ThreadPoolExecutor = None,
         process_executor: ProcessPoolExecutor = None
     ):
@@ -158,18 +158,38 @@ class Worker(ABCWorker, _LoopBoundMixin):
         :param identity: id
         :param heartbeat: 心跳间隔，单位是毫秒
         :param context: 用于创建socket的zeroMQ的上下文
+        :param zap_mechanism: 使用的 ZAP 验证机制
+        :param zap_credentials: 用于 ZAP 验证的凭据
         :param thread_executor: 用于执行io密集型任务
         :param process_executor: 用于执行cpu密集型任务
         """
-        self.heartbeat = heartbeat
-        self.expiry = self.heartbeat_liveness * self.heartbeat
+        if not identity:
+            identity = uuid4().hex
+        self.identity = f"gw-{identity}".encode("utf-8")
+        self.service = service
+        self.ready = False
+        self._broker_addr = check_socket_addr(broker_addr)
+        zap_mechanism, zap_credentials = check_zap_args(
+            zap_mechanism, zap_credentials
+        )
+        if not zap_mechanism:
+            self.zap_frames = []
+        else:
+            self.zap_frames = [zap_mechanism, *zap_credentials]
+
         if not context:
             self._ctx = Context()
         else:
             self._ctx = context
         self._socket = None
         self._poller = z_aio.Poller()
-        self._broker_addr = broker_addr
+        self.heartbeat = heartbeat
+        self.expiry = self.heartbeat_liveness * self.heartbeat
+
+        self.requests = BoundedDict(
+            Settings.MESSAGE_MAX, 0.1
+        )
+
         if not thread_executor:
             thread_executor = ThreadPoolExecutor()
         self.thread_executor = thread_executor
@@ -177,15 +197,9 @@ class Worker(ABCWorker, _LoopBoundMixin):
             process_executor = ProcessPoolExecutor()
         self.process_executor = process_executor
         self.default_executor = self.thread_executor
-        if not identity:
-            identity = uuid4().hex
-        self.identity = f"gw-{identity}".encode("utf-8")
-        self.service = service
-        self.ready = False
+
         self.interfaces: dict = self.get_interfaces()
-        self.requests = BoundedDict(
-            maxsize=Settings.MESSAGE_MAX, timeout=0.1
-        )
+
         self._reconnect: bool = False
         self._recv_task: Optional[asyncio.Task] = None
 
@@ -257,8 +271,10 @@ class Worker(ABCWorker, _LoopBoundMixin):
             self.close()
             self.ready = False
 
-    def release_request(self, task_name):
-        task: asyncio.Task = self.requests.pop(task_name)
+    def release_request(self, task: asyncio.Task):
+        self._get_loop().call_later(
+            1, self.requests.pop, task.get_name()
+        )
         if exception := task.exception():
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
@@ -280,6 +296,8 @@ class Worker(ABCWorker, _LoopBoundMixin):
             messages = []
         if not option:
             option = []
+        if self.zap_frames:
+            option.extend(self.zap_frames)
         messages = [
             b"",
             Settings.MDP_WORKER,
@@ -304,8 +322,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
         return loop.run_in_executor(executor, func_call)
 
     async def process_request(
-        self, cli_id: bytes, cli_addr: bytes, request_id: bytes,
-        func_details: dict
+        self, cli_id: bytes, request_id: bytes, func_details: dict
     ):
         """
         MDP的reply命令的命令帧后加上一个worker id帧，掉线重连，幂等
@@ -336,7 +353,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
             reply = await generate_reply(exception=e)
         else:
             reply = await generate_reply(task)
-        option = [b"@".join((cli_id, cli_addr, request_id))]
+        option = [cli_id, request_id]
         if isinstance(reply, HugeData):
             option.append(Settings.STREAM_HUGE_DATA_TAG)
             reply_except = False
@@ -409,24 +426,30 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         logger.debug(f"{self.identity} disconnected")
                         break
                     elif command == Settings.MDP_COMMAND_REQUEST:
+                        if self.requests.usable_size == 0:
+                            continue
                         try:
-                            client, empty, request_id, body = messages
+                            client_id, empty, request_id, body = messages
                             if empty:
                                 raise ValueError
-                            client_id, client_addr = client.split(b"@")
                         except ValueError:
                             continue
                         details = msg_unpack(body)
                         task = loop.create_task(
                             self.process_request(
-                                client_id, client_addr,
-                                request_id, details
+                                client_id, request_id, details
+                            ), name=request_id
+                        )
+                        try:
+                            await self.requests.aset(request_id, task)
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                f"The number of pending requests has exceeded"
+                                f" the cache limit for the requesting task."
+                                f"The limit is {self.requests.maxsize} "
+                                f"requests."
                             )
-                        )
-                        await self.requests.aset(request_id, task)
-                        task.add_done_callback(
-                            lambda fut: self.release_request(request_id)
-                        )
+                        task.add_done_callback(self.release_request)
                 else:
                     broker_liveness -= 1
                     if broker_liveness == 0:
@@ -508,6 +531,8 @@ class Service(ABCService):
         workers_addr: str = None,
         workers_heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
         context: Context = None,
+        zap_mechanism: str = None,
+        zap_credentials: tuple = None,
         thread_executor: ThreadPoolExecutor = None,
         process_executor: ProcessPoolExecutor = None
     ) -> Worker:
@@ -521,6 +546,8 @@ class Service(ABCService):
             identity=f"{self.name}_Worker",
             heartbeat=workers_heartbeat,
             context=context,
+            zap_mechanism=zap_mechanism,
+            zap_credentials=zap_credentials,
             thread_executor=thread_executor,
             process_executor=process_executor
         )
@@ -562,9 +589,9 @@ class AMajordomo(_LoopBoundMixin):
         """
         # frontend backend
         self.frontend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        self.frontend_tasks = BoundedDict(None, 10*Settings.ZMQ_HWM, 0.1)
+        self.frontend_tasks = deque()
         self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        self.backend_tasks = BoundedDict(None, 10*Settings.ZMQ_HWM, 0.1)
+        self.backend_tasks = deque()
         if not backend_addr:
             backend_addr = Settings.WORKER_ADDR
         self.backend.bind(check_socket_addr(backend_addr))
@@ -572,20 +599,23 @@ class AMajordomo(_LoopBoundMixin):
         self.heartbeat = heartbeat
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, RemoteWorker] = dict()
+        self.clients: dict[bytes, bytes] = dict()
         self.remote_service_class = Service
         self.remote_worker_class = RemoteWorker
         self.ban_timer_handle: dict[bytes, asyncio.Task] = dict()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
         self.cache_request = dict()
+        self.max_process_tasks = Settings.MESSAGE_MAX
         self.running = False
         self._poller = z_aio.Poller()
         self._broker_task: Optional[asyncio.Task] = None
         # zap
         self.zap_mechanism: str = ""
         self.zap_socket: Union[z_aio.Socket, None] = None
+        # TODO: ZAP domain
         self.zap_domain = zap_domain
         self.zap_replies: BoundedDict[str, list] = BoundedDict(
-            None, 10*Settings.ZMQ_HWM, 1.5
+            10*Settings.MESSAGE_MAX, 1.5
         )
         if zap_mechanism:
             self.zap_mechanism = zap_mechanism
@@ -624,35 +654,33 @@ class AMajordomo(_LoopBoundMixin):
         """
         屏蔽掉指定 worker
         """
-        if not wait:
-            if worker.identity in self.ban_timer_handle:
-                self.ban_timer_handle[worker.identity].cancel()
-                self.ban_timer_handle.pop(worker.identity)
-        else:
-            await asyncio.sleep(wait)
-        if worker.is_alive():
-            request = [
-                to_bytes(worker.address),
-                b"",
-                Settings.MDP_WORKER,
-                Settings.MDP_COMMAND_DISCONNECT
-            ]
-            try:
-                await self.backend.send_multipart(request)
-            except Exception:
-                pass
-        worker.service.remove_worker(worker)
-        if worker.identity in self.workers:
-            self.workers.pop(worker.identity, None)
-        return True
+        try:
+            if wait:
+                await asyncio.sleep(wait)
+            elif worker.destroy_task:
+                worker.destroy_task.cancel()
+            if worker.is_alive():
+                request = [
+                    to_bytes(worker.address),
+                    b"",
+                    Settings.MDP_WORKER,
+                    Settings.MDP_COMMAND_DISCONNECT
+                ]
+                try:
+                    await self.backend.send_multipart(request)
+                except Exception:
+                    pass
+            worker.service.remove_worker(worker)
+            if worker.identity in self.workers:
+                self.workers.pop(worker.identity, None)
+            return True
+        except asyncio.CancelledError:
+            logger.debug(f"unban {worker.identity}")
 
     def ban_worker_after_expiration(self, worker: RemoteWorker):
         loop = self._get_loop()
-        self.ban_timer_handle[worker.identity] = t = loop.create_task(
+        worker.destroy_task = loop.create_task(
             self.ban_worker(worker, wait=worker.expiry)
-        )
-        t.add_done_callback(
-            lambda fut: self.ban_timer_handle.pop(worker.identity, None)
         )
 
     async def internal_service(
@@ -684,18 +712,18 @@ class AMajordomo(_LoopBoundMixin):
     async def request_zap(
         self, identity, address, request_id, mechanism, credentials
     ) -> bool:
-        # TODO: 提供服务的远程 worker 也需要身份验证。
         if mechanism != self.zap_mechanism:
             return False
         zap_frames = [
-                         b"",  # 空帧
-                         Settings.ZAP_VERSION,
-                         request_id,
-                         self.zap_domain,  # 域
-                         address,  # IP地址
-                         identity,  # 身份id
-                         mechanism,
-                     ] + credentials
+            b"",  # 空帧
+            Settings.ZAP_VERSION,
+            request_id,
+            self.zap_domain,  # 域
+            address,  # IP地址
+            identity,  # 身份id
+            mechanism,
+            *credentials
+        ]
         zap_frames = [to_bytes(s) for s in zap_frames]
         failed_reply = {
                 "user_id": identity,
@@ -704,13 +732,14 @@ class AMajordomo(_LoopBoundMixin):
                 "status_text": "ZAP Service Failed.",
             }
         try:
+            logger.debug(f"send zep frames: {zap_frames}")
             await self.zap_socket.send_multipart(zap_frames)
         except asyncio.TimeoutError:
             zap_reply = failed_reply
         else:
             try:
                 zap_reply = await self.zap_replies.aget(
-                    f"{identity}-{request_id}"
+                    f"{identity}-{request_id}", timeout=3
                 )
                 self.zap_replies.pop(f"{identity}-{request_id}")
             except KeyError:
@@ -726,6 +755,7 @@ class AMajordomo(_LoopBoundMixin):
         适合使用BoundedDict的超时获取机制。
         """
         try:
+            logger.debug(f"zap replies: {replies}")
             (
                 empty,
                 zap_version,
@@ -749,16 +779,16 @@ class AMajordomo(_LoopBoundMixin):
             }
         )
 
-    def release_frontend_task(self, task_name):
-        task: asyncio.Task = self.frontend_tasks.pop(task_name)
+    def release_frontend_task(self, task: asyncio.Task):
+        self.frontend_tasks.remove(task)
         if exception := task.exception():
             exception_info = ''.join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
             logger.debug(f"frontend task exception:\n{exception_info}")
 
-    def release_backend_task(self, task_name):
-        task: asyncio.Task = self.backend_tasks.pop(task_name)
+    def release_backend_task(self, task: asyncio.Task):
+        self.backend_tasks.remove(task)
         if exception := task.exception():
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
@@ -781,12 +811,31 @@ class AMajordomo(_LoopBoundMixin):
             return
         if mdp_worker_version != Settings.MDP_WORKER:
             return
+
+        if self.zap_socket:
+            try:
+                mechanism, *credentials, messages = messages
+            except ValueError:
+                logger.debug("ZAP frames invalid")
+                return False
+        else:
+            mechanism = credentials = None
+
         # MDP 定义的 Worker 命令
         if not (worker := self.workers.get(worker_id, None)):
             logger.debug(f"The worker({worker_id}) was not registered")
         if command == Settings.MDP_COMMAND_READY:
             if len(messages) > 1:
                 return
+            if mechanism:
+                request_id = b"worker ready"
+                zap_result = await self.request_zap(
+                    worker_id, worker_addr, request_id,
+                    mechanism, credentials
+                )
+                if not zap_result:
+                    return False
+
             try:
                 service_name, service_description = (
                     from_bytes(messages[0])
@@ -815,20 +864,45 @@ class AMajordomo(_LoopBoundMixin):
         elif command == Settings.MDP_COMMAND_HEARTBEAT:
             if len(messages) > 1:
                 return
+            if mechanism:
+                request_id = b"worker heartbeat"
+                zap_result = await self.request_zap(
+                    worker_id, worker_addr, request_id,
+                    mechanism, credentials
+                )
+                if not zap_result:
+                    if worker:
+                        await self.ban_worker(worker)
+                    return
+
             if not worker:
                 return
             elif not worker.ready:
                 return await self.ban_worker(worker)
             worker.expiry = 1e-3 * worker.heartbeat_liveness * worker.heartbeat + time()
-            if t := self.ban_timer_handle.get(worker.identity):
-                t.cancel()
+            if worker.destroy_task:
+                worker.destroy_task.cancel()
             self.ban_worker_after_expiration(worker)
 
         elif command == Settings.MDP_COMMAND_REPLY:
             try:
-                client, *body = messages
-                client_id, client_addr, request_id = client.split(b"@")
+                client_id, request_id, *body = messages
             except ValueError:
+                return
+            if mechanism:
+                zap_result = await self.request_zap(
+                    worker_id, worker_addr, request_id,
+                    mechanism, credentials
+                )
+                if not zap_result:
+                    logger.debug(
+                        f"ZAP verification of Worker({worker_id}:{worker_addr})"
+                        f" fails,'{mechanism}' mechanism is used, and the "
+                        f"credential is '{credentials}'"
+                    )
+                    return False
+
+            if not (client_addr := self.clients.get(client_id, None)):
                 return
             if not worker:
                 return
@@ -848,6 +922,8 @@ class AMajordomo(_LoopBoundMixin):
             await self.reply_frontend(reply)
 
         elif command == Settings.MDP_COMMAND_DISCONNECT:
+            if not worker:
+                return
             worker.ready = False
             worker.expiry = time()
             await self.ban_worker(worker)
@@ -877,6 +953,7 @@ class AMajordomo(_LoopBoundMixin):
         except ValueError:
             return False
 
+        self.clients[client_id] = client_addr
         if self.zap_socket:
             try:
                 mechanism, *credentials, request_id, body = messages
@@ -936,7 +1013,7 @@ class AMajordomo(_LoopBoundMixin):
                 b"",
                 Settings.MDP_WORKER,
                 Settings.MDP_COMMAND_REQUEST,
-                b"@".join((client_id, client_addr)),
+                client_id,
                 b"",
                 request_id,
                 body
@@ -951,24 +1028,14 @@ class AMajordomo(_LoopBoundMixin):
             except_reply[-1] = msg_pack(exception)
             await self.reply_frontend(except_reply)
 
-    async def send_heartbeat(self):
-        loop = self._get_loop()
-        for worker in self.workers.values():
-            messages = [
-                to_bytes(worker.address),
-                b"",
-                Settings.MDP_WORKER,
-                Settings.MDP_COMMAND_HEARTBEAT
-            ]
-            fut = self.backend.send_multipart(messages)
-            if fut.done():
-                continue
-            ht = loop.create_task(fut)
-            hn = f"heartbeat_task_{worker.identity}"
-            await self.backend_tasks.aset(hn, ht)
-            ht.add_done_callback(
-                lambda fut: self.release_backend_task(hn)
-            )
+    async def send_heartbeat(self, worker):
+        messages = [
+            to_bytes(worker.address),
+            b"",
+            Settings.MDP_WORKER,
+            Settings.MDP_COMMAND_HEARTBEAT
+        ]
+        await self.backend.send_multipart(messages)
 
     async def _broker_loop(self):
         loop = self._get_loop()
@@ -983,37 +1050,42 @@ class AMajordomo(_LoopBoundMixin):
                 socks = dict(await self._poller.poll(self.heartbeat))
                 if self.backend in socks:
                     replies = await self.backend.recv_multipart()
-                    # 后端异步任务，避免等待处理后端回复导致阻塞。
                     bt = loop.create_task(
-                        self.process_replies_from_backend(replies)
+                        self.process_replies_from_backend(replies),
+                        name=f"backend_task_{uuid4().hex}"
                     )
-                    bt_id = secrets.token_hex()
-                    btn = f"backend_task_{bt_id}"
-                    # bt_id += 1
-                    await self.backend_tasks.aset(btn, bt)
-                    bt.add_done_callback(
-                        lambda fut: self.release_backend_task(btn)
-                    )
+                    self.backend_tasks.append(bt)
+                    bt.add_done_callback(self.release_backend_task)
 
                 if self.frontend in socks:
+                    if len(self.frontend_tasks) >= self.max_process_tasks:
+                        logger.error(
+                            f"The number of pending requests from frontend has "
+                            f"exceeded the cache limit for the requesting task."
+                            f"The limit is {self.max_process_tasks} "
+                            f"requests."
+                        )
+                        await asyncio.sleep(1)
+                        continue
                     replies = await self.frontend.recv_multipart()
                     # 同后端任务处理。
                     ft = loop.create_task(
-                        self.process_request_from_frontend(replies)
+                        self.process_request_from_frontend(replies),
+                        name=f"frontend_task_{uuid4().hex}"
                     )
-                    ft_id = secrets.token_hex()
-                    ftn = f"frontend_task_{ft_id}"
-                    # ft_id += 1
-                    await self.frontend_tasks.aset(ftn, ft)
-                    ft.add_done_callback(
-                        lambda fut: self.release_frontend_task(ftn)
-                    )
+                    self.frontend_tasks.append(ft)
+                    ft.add_done_callback(self.release_frontend_task)
 
                 if self.zap_socket and self.zap_socket in socks:
                     replies = await self.zap_socket.recv_multipart()
                     await self.process_replies_from_zap(replies)
-
-                await self.send_heartbeat()
+                for worker in self.workers.values():
+                    ht = loop.create_task(
+                        self.send_heartbeat(worker),
+                        name=f"heartbeat_task_{worker.identity}"
+                        )
+                    self.backend_tasks.append(ht)
+                    ht.add_done_callback(self.release_backend_task)
             except Exception:
                 exception = "".join(format_exception(*sys.exc_info()))
                 logger.error(exception)
@@ -1056,7 +1128,7 @@ class Client(_LoopBoundMixin):
         reply_timeout: float = Settings.REPLY_TIMEOUT,
         msg_max: int = Settings.MESSAGE_MAX,
         zap_mechanism: str = None,
-        credential_frames: list = None,
+        zap_credentials: tuple = None,
     ):
         """
         客户端，
@@ -1068,13 +1140,20 @@ class Client(_LoopBoundMixin):
         :param reply_timeout: 等待回复的超时时间
         :param msg_max: 保存发送或接收到的消息的最大数量，默认为 MSSAGE_MAX。
         :param zap_mechanism: zap 的验证机制。
-        :param credential_frames: zap 的凭据帧列表，不填则为空列表。
+        :param zap_credentials: zap 的凭据帧列表，不填则为空列表。
         """
-        self._broker_addr = broker_addr
         if not identity:
             identity = uuid4().hex
         self.identity = f"gc-{identity}".encode("utf-8")
         self.ready = False
+        self._broker_addr = check_socket_addr(broker_addr)
+        zap_mechanism, zap_credentials = check_zap_args(
+            zap_mechanism, zap_credentials
+        )
+        if not zap_mechanism:
+            self.zap_frames = []
+        else:
+            self.zap_frames = [zap_mechanism, *zap_credentials]
 
         if not context:
             self.ctx = Context()
@@ -1087,46 +1166,13 @@ class Client(_LoopBoundMixin):
         self.heartbeat_expiry = heartbeat * Settings.MDP_HEARTBEAT_LIVENESS
         self.reply_timeout = reply_timeout
 
-        self.requests: BoundedDict[str, list] = BoundedDict(
-            None, msg_max, 1.5
-        )
-        self.stream_reply_maxsize = msg_max
+        self.requests: BoundedDict[str, list] = BoundedDict(msg_max, 1.5)
+        self.stream_reply_maxsize = Settings.STREAM_REPLY_MAXSIZE
         self._recv_task = None
 
         self.default_service = Settings.SERVICE_DEFAULT_NAME
         self._remote_service = self._remote_func = None
 
-        if credential_frames is None:
-            credential_frames = list()
-        if (zap_mechanism == Settings.ZAP_MECHANISM_NULL
-                and len(credential_frames) != 0):
-            AttributeError(
-                f'The "{Settings.ZAP_MECHANISM_NULL}" mechanism '
-                f'should not have credential frames.'
-            )
-        elif (zap_mechanism == Settings.ZAP_MECHANISM_PLAIN
-              and len(credential_frames) != 2):
-            AttributeError(
-                f'The "{Settings.ZAP_MECHANISM_PLAIN}" mechanism '
-                f'should have tow credential frames: '
-                f'a username and a password.'
-            )
-        elif zap_mechanism == Settings.ZAP_MECHANISM_CURVE:
-            raise RuntimeError(
-                f'The "{Settings.ZAP_MECHANISM_CURVE}"'
-                f' mechanism is not implemented yet.'
-            )
-        elif zap_mechanism:
-            raise ValueError(
-                f'mechanism can only be '
-                f'"{Settings.ZAP_MECHANISM_NULL}" or '
-                f'"{Settings.ZAP_MECHANISM_PLAIN}" or '
-                f'"{Settings.ZAP_MECHANISM_CURVE}"'
-            )
-        if not zap_mechanism:
-            self.zap_frames = []
-        else:
-            self.zap_frames = [self.identity, zap_mechanism] + credential_frames
         self.connect()
 
     def connect(self):
@@ -1186,6 +1232,12 @@ class Client(_LoopBoundMixin):
         :param args: 要调用的该函数要传递的位置参数
         :param kwargs: 要调用的该函数要传递的关键字参数
         """
+        if self.requests.full():
+            raise RuntimeError(
+                "The number of pending requests has exceeded the cache limit"
+                " for the requesting task. The limit is "
+                f"{self.requests.maxsize} requests."
+            )
         loop = self._get_loop()
         body = msg_pack(
             {
@@ -1253,64 +1305,64 @@ class Client(_LoopBoundMixin):
                     await self._send_heartbeat()
                     heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 socks = await self._poller.poll(self.heartbeat)
-                if socks:
-                    messages = await self.socket.recv_multipart()
-                    try:
-                        (
-                            empty,
-                            mdp_client_version,
-                            service_name,
-                            client_id,
-                            request_id,
-                            # steam tag
-                            *body
-                        ) = messages
-                        if empty:
-                            continue
-                    except ValueError:
+                if not socks:
+                    continue
+                messages = await self.socket.recv_multipart()
+                try:
+                    (
+                        empty,
+                        mdp_client_version,
+                        service_name,
+                        client_id,
+                        request_id,
+                        # steam tag
+                        *body
+                    ) = messages
+                    if empty:
                         continue
-                    if mdp_client_version != Settings.MDP_CLIENT:
-                        continue
-                    if client_id != self.identity:
-                        continue
-                    if service_name == b"gate.client_heartbeat":
-                        continue
-                    logger.debug(
-                        f"Reply: \n"
-                        f"frame 0: {empty},\n"
-                        f"frame 1: {mdp_client_version},\n"
-                        f"frame 2: {service_name},\n"
-                        f"frame 3: {client_id},\n"
-                        f"frame 4: {request_id},\n"
-                        f"frame 5+: {body}"
-                    )
-                    if len(body) == 1:
-                        body = msg_unpack(body[0])
-                        await self.requests.aset(request_id, body)
-                    else:
-                        *option, body = body
-                        if option[0] == Settings.STREAM_GENERATOR_TAG:
-                            # TODO: 接收处理流式数据
-                            stream_reply = self.requests.get(request_id, None)
-                            if not stream_reply:
-                                stream_reply = StreamReply(
-                                    maxsize=self.stream_reply_maxsize,
-                                    timeout=self.reply_timeout
-                                )
-                                await self.requests.aset(
-                                    request_id, stream_reply
-                                )
-                            if body != Settings.STREAM_END_MESSAGE:
-                                body = msg_unpack(body)
-                            await stream_reply.asend(body)
-                        elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
-                            huge_reply = self.requests.get(request_id, None)
-                            if not huge_reply:
-                                huge_reply = HugeData()
-                                await self.requests.aset(
-                                    request_id, huge_reply
-                                )
-                            huge_reply.data.put_nowait(body)
+                except ValueError:
+                    continue
+                if mdp_client_version != Settings.MDP_CLIENT:
+                    continue
+                if client_id != self.identity:
+                    continue
+                if service_name == b"gate.client_heartbeat":
+                    continue
+                logger.debug(
+                    f"Reply: \n"
+                    f"frame 0: {empty},\n"
+                    f"frame 1: {mdp_client_version},\n"
+                    f"frame 2: {service_name},\n"
+                    f"frame 3: {client_id},\n"
+                    f"frame 4: {request_id},\n"
+                    f"frame 5+: {body}"
+                )
+                if len(body) == 1:
+                    body = msg_unpack(body[0])
+                    await self.requests.aset(request_id, body)
+                else:
+                    *option, body = body
+                    if option[0] == Settings.STREAM_GENERATOR_TAG:
+                        stream_reply = self.requests.get(request_id, None)
+                        if not stream_reply:
+                            stream_reply = StreamReply(
+                                maxsize=self.stream_reply_maxsize,
+                                timeout=self.reply_timeout
+                            )
+                            await self.requests.aset(
+                                request_id, stream_reply
+                            )
+                        if body != Settings.STREAM_END_MESSAGE:
+                            body = msg_unpack(body)
+                        await stream_reply.asend(body)
+                    elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
+                        huge_reply = self.requests.get(request_id, None)
+                        if not huge_reply:
+                            huge_reply = HugeData()
+                            await self.requests.aset(
+                                request_id, huge_reply
+                            )
+                        huge_reply.data.put_nowait(body)
             except Exception:
                 exception = "".join(format_exception(*sys.exc_info()))
                 logger.error(exception)

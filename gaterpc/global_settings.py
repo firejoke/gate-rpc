@@ -18,15 +18,14 @@ class DefaultSettings(object):
     CLIENT_TIMEOUT: int = 2  # second
     WORKER_ADDR: str = f"ipc://{RUN_PATH}cpu_worker"
     ZMQ_HWM: int = 1000
-    MESSAGE_MAX: int = 1000  # 参考ZMQ HWM
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
     ZAP_DEFAULT_DOMAIN: bytes = b"gate"
     ZAP_MECHANISM_NULL: bytes = b"NULL"
     ZAP_MECHANISM_PLAIN: bytes = b"PLAIN"
     ZAP_MECHANISM_CURVE: bytes = b"CURVE"
-    ZAP_PLAIN_DEFAULT_USER: bytes = "堡垒".encode("utf-8")
-    ZAP_PLAIN_DEFAULT_PASSWORD: bytes = "哔哔哔哔哔".encode("utf-8")
+    ZAP_PLAIN_DEFAULT_USER: str = "堡垒"
+    ZAP_PLAIN_DEFAULT_PASSWORD: str = "哔哔哔哔哔"
     ZAP_INPROC_ADDR: str = "inproc://zeromq.zap.01"
     # MDP
     MDP_HEARTBEAT_INTERVAL: int = 1500
@@ -41,6 +40,8 @@ class DefaultSettings(object):
     MDP_COMMAND_HEARTBEAT: bytes = b"\x04"
     MDP_COMMAND_DISCONNECT: bytes = b"\x05"
     # RPC
+    MESSAGE_MAX: int = 1000  # 参考ZMQ HWM
+    STREAM_REPLY_MAXSIZE = 0
     STREAM_GENERATOR_TAG = b"GateStreamGenerator"
     STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
     STREAM_END_MESSAGE = b"GateStreamEnd"
@@ -137,12 +138,13 @@ class DefaultSettings(object):
             for logger in self.LOGGING["loggers"].values():
                 logger["level"] = "DEBUG"
                 logger["handlers"].append("console")
-        self.LOG_PATH.mkdir(exist_ok=True)
+        self.LOG_PATH.mkdir(parents=True, exist_ok=True)
         dictConfig(self.LOGGING)
         if self.EVENT_LOOP_POLICY:
             import asyncio
 
             asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
+        (run_path := Path(self.RUN_PATH)).mkdir(parents=True, exist_ok=True)
 
 
 Settings = DefaultSettings()

@@ -31,3 +31,10 @@ class BadGzip(OSError):
 
 class HugeDataException(OSError):
     pass
+
+
+class DictFull(Exception):
+    def __init__(self, maxsize):
+        message = (f"The number of keys in the dict reached the maximum of "
+                   f"{maxsize}.")
+        super().__init__(message)

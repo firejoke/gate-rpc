@@ -9,6 +9,8 @@ from logging import getLogger
 from time import time
 from traceback import format_exception
 
+from zmq.auth.asyncio import AsyncioAuthenticator
+
 from gaterpc.global_settings import Settings
 from gaterpc.core import Worker, Service, AMajordomo, Client
 from gaterpc.utils import interface
@@ -65,12 +67,17 @@ class GRWorker(Worker):
 async def test():
     Settings.DEBUG = True
     Settings.setup()
-    gr_majordomo = AMajordomo(backend_addr="tcp://127.0.0.1:5555")
+    gr_majordomo = AMajordomo()
     gr_majordomo.bind("tcp://127.0.0.1:777")
     gr_majordomo.run()
     gr = Service()
     gr_worker = gr.create_worker(
-       GRWorker, "tcp://127.0.0.1:5555"
+        GRWorker,
+        # zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        # zap_credentials=(
+        #     Settings.ZAP_PLAIN_DEFAULT_USER,
+        #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        # )
     )
     logger.info(gr_worker.service)
     if gr_worker.service is not gr:
@@ -78,7 +85,14 @@ async def test():
     logger.info(gr_worker.interfaces)
     gr_worker.run()
     await asyncio.sleep(5)
-    gr_cli = Client(broker_addr="tcp://127.0.0.1:777")
+    gr_cli = Client(
+        broker_addr="tcp://127.0.0.1:777",
+        # zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        # zap_credentials=(
+        #     Settings.ZAP_PLAIN_DEFAULT_USER,
+        #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        # )
+    )
     i = 100
     logger.info("start test")
     try:
@@ -96,10 +110,12 @@ async def test():
     except Exception as e:
         for line in format_exception(*sys.exc_info()):
             logger.error(line)
+        raise e
+    finally:
         gr_cli.close()
+        logger.debug(len(gr_worker.requests))
         await gr_worker.stop()
         gr_majordomo.stop()
-        raise e
 
 
 if __name__ == "__main__":
