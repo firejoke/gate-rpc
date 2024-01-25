@@ -27,7 +27,7 @@ class DefaultSettings(object):
     ZAP_PLAIN_DEFAULT_USER: str = "堡垒"
     ZAP_PLAIN_DEFAULT_PASSWORD: str = "哔哔哔哔哔"
     ZAP_ADDR: str = f"ipc://{RUN_PATH}zeromq.zap.01"
-    ZAP_REPLY_TIMEOUT: float = 10.0
+    ZAP_REPLY_TIMEOUT: float = 5.0
     # MDP
     MDP_HEARTBEAT_INTERVAL: int = 1500
     MDP_HEARTBEAT_LIVENESS: int = 3

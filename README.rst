@@ -31,15 +31,20 @@ gate-rpc
 ::
 
     # 可能会修改的几个主要配置
-    Settings.MESSAGE_MAX = Worker 和 Client 实例里等待处理的消息最大数量
-    Settings.HUGE_DATA_SIZEOF = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
-    Settings.HUGE_DATA_COMPRESS_MODULE = 使用的压缩模块的名称 [#f1]_
-    Settings.SERVICE_DEFAULT_NAME = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
-    Settings.MDP_INTERNAL_SERVICE_PREFIX = MDP 内部服务的前缀
-    Settings.MDP_HEARTBEAT_INTERVAL = 服务端和客户端相对于中间代理的心跳间隔时间
-    Settings.MDP_HEARTBEAT_LIVENESS = 判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线
-    Settings.REPLY_TIMEOUT = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
-    Settings.STREAM_REPLY_MAXSIZE = 流式数据的最大长度
+    Settings.MESSAGE_MAX: int = Worker 和 Client 实例里等待处理的消息最大数量
+    Settings.HUGE_DATA_SIZEOF: int = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
+    Settings.HUGE_DATA_COMPRESS_MODULE: str = 使用的压缩模块的名称 [#f1]_
+    Settings.SERVICE_DEFAULT_NAME: str = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
+    Settings.MDP_INTERNAL_SERVICE_PREFIX: bytes = MDP 内部服务的前缀
+    Settings.MDP_HEARTBEAT_INTERVAL: int = 服务端和客户端相对于中间代理的心跳间隔时间，默认1500毫秒
+    Settings.MDP_HEARTBEAT_LIVENESS: int = 判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线，默认3次
+    Settings.REPLY_TIMEOUT: float = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
+    Settings.STREAM_REPLY_MAXSIZE: int = 流式数据使用的缓存队列的最大长度（使用的 asyncio.Queue）
+    Settings.REPLY_TIMEOUT: float = 获取回复的超时时间，也是流式传输的每一个子回复的超时时间
+    Settings.ZAP_PLAIN_DEFAULT_USER: str = ZAP 的 PLAIN 机制的默认用户名
+    Settings.ZAP_PLAIN_DEFAULT_PASSWORD: str = ZAP 的 PLAIN 机制的默认密码
+    Settings.ZAP_ADDR: str = ZAP 服务绑定的地址
+    Settings.ZAP_REPLY_TIMEOUT: float = 等待 ZAP 服务的回复的超时时间
     Settings.setup()
 
     # 特殊返回值的序列化配置 [#f2]_
@@ -59,6 +64,20 @@ gate-rpc
 ********
 测试示范
 ********
+
+实例化 ZAP 服务后，需要配置校验策略
+
+::
+
+    zap = AsyncZAPService()
+    zap.configure_plain(
+        Settings.ZAP_DEFAULT_DOMAIN,
+        {
+            Settings.ZAP_PLAIN_DEFAULT_USER: Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        }
+    )
+    zap.start()
+
 
 继承Worker类，用interface装饰希望被远程调用的方法，然后实例化一个Server来创建Worker的实例，这个worker实例的描述信息由server实例提供。
 
@@ -102,7 +121,14 @@ gate-rpc
 
     Settings.setup()
     gr = Service(name="SRkv")
-    gr_worker = gr.create_worker(GRWorker, "tcp://127.0.0.1:5555")
+    gr_worker = gr.create_worker(
+        GRWorker, "tcp://127.0.0.1:5555",
+        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        zap_credentials=(
+            Settings.ZAP_PLAIN_DEFAULT_USER,
+            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        )
+    )
     gr_worker.run()
 
 当要执行 IO 密集或 CPU 密集型操作时，可以在方法内使用执行器来执行，可以使用自带的两个执行器，也可以使用自定义的；
@@ -122,13 +148,17 @@ gate-rpc
         result = await self.run_in_executor(self.process_executor, func, queue, *args, **kwargs)
         return result
 
-实例化代理时会绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来。
+实例化代理时会绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来，bind 方法是绑定的给客户端访问的地址也就是前端地址。
 
 ::
 
     # Majordomo
     Settings.setup()
-    gr_majordomo = AMajordomo(backend_addr="tcp://127.0.0.1:5555")
+    gr_majordomo = AMajordomo(
+        backend_addr="tcp://127.0.0.1:5555",
+        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        zap_addr=Settings.ZAP_ADDR
+    )
     gr_majordomo.bind("tcp://127.0.0.1:777")
     gr_majordomo.run()
 
@@ -138,8 +168,19 @@ gate-rpc
 
     # Client
     Settings.setup()
-    gr_cli = Client(broker_addr="tcp://127.0.0.1:777")
+    gr_cli = Client(
+        broker_addr="tcp://127.0.0.1:777"
+        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        zap_credentials=(
+            Settings.ZAP_PLAIN_DEFAULT_USER,
+            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        )
+    )
     await gr_cli.SRkv.test("a", "b", "c", time=time())
     await gr_cli.SRkv.atest("a", "b", "c", time=time())
     async for i in await gr_cli.SRkv.test_agenerator(10):
         print(i)
+
+
+客户端调用的远程方法后，会创建一个延迟回调用来删掉缓存的已经执行完毕的请求，包括超时没拿到回复的请求，
+而流式回复会每次回调时都检查一次该 StreamReply 实例是否已经结束，没结束就再创建一个延迟回调后续再检查
