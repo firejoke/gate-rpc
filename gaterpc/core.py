@@ -1613,12 +1613,7 @@ class Client(_LoopBoundMixin):
                             )
                         if body != Settings.STREAM_END_MESSAGE:
                             body = msg_unpack(body)
-                        logger.debug(f"STREAM GENERATOR body: {body}")
                         await stream_reply.asend(body)
-                        logger.debug(
-                            f"stream reply empty? "
-                            f"{stream_reply.replies.empty()}"
-                        )
                     elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
                         huge_reply = self.requests.get(request_id, None)
                         if not huge_reply:
