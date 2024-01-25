@@ -20,13 +20,14 @@ class DefaultSettings(object):
     ZMQ_HWM: int = 1000
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
-    ZAP_DEFAULT_DOMAIN: bytes = b"gate"
+    ZAP_DEFAULT_DOMAIN: str = "gate"
     ZAP_MECHANISM_NULL: bytes = b"NULL"
     ZAP_MECHANISM_PLAIN: bytes = b"PLAIN"
     ZAP_MECHANISM_CURVE: bytes = b"CURVE"
     ZAP_PLAIN_DEFAULT_USER: str = "堡垒"
     ZAP_PLAIN_DEFAULT_PASSWORD: str = "哔哔哔哔哔"
-    ZAP_INPROC_ADDR: str = "inproc://zeromq.zap.01"
+    ZAP_ADDR: str = f"ipc://{RUN_PATH}zeromq.zap.01"
+    ZAP_REPLY_TIMEOUT: float = 10.0
     # MDP
     MDP_HEARTBEAT_INTERVAL: int = 1500
     MDP_HEARTBEAT_LIVENESS: int = 3
@@ -50,7 +51,7 @@ class DefaultSettings(object):
     HUGE_DATA_COMPRESS_LEVEL: int = 9
     SERVICE_DEFAULT_NAME: str = "gate-rpc"
     REPLY_TIMEOUT: float = 60.0
-    TASK_TIMEOUT: int = 3  # second
+    TASK_TIMEOUT: float = 30.0  # second
     LOG_PATH = Path("/tmp/gate-rpc/")
     LOGGING = {
         "version": 1,
@@ -114,6 +115,11 @@ class DefaultSettings(object):
                 "propagate": False,
             },
             "gaterpc": {
+                "level": "INFO",
+                "handlers": ["gaterpc"],
+                "propagate": True,
+            },
+            "gaterpc.zap": {
                 "level": "INFO",
                 "handlers": ["gaterpc"],
                 "propagate": True,

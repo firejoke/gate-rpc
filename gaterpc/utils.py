@@ -6,12 +6,10 @@ import atexit
 import bz2
 import copy
 import functools
-import gzip
 import inspect
 import io
 import logging
 import lzma
-import os
 import platform
 import queue
 import struct
@@ -162,7 +160,8 @@ class BoundedDict(UserDict, _LoopBoundMixin):
 
     def _release_set(self):
         if self.usable_size >= self.maxsize:
-            raise ValueError('BoundedDict released too many times')
+            return
+            # raise ValueError('BoundedDict released too many times')
         self.usable_size += 1
         self._wake_up_next_set()
 
@@ -193,7 +192,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             return value
         except KeyError:
             if self.full():
-                if default is not Temp:
+                if default != Temp:
                     return default
                 raise
             fut = self._get_loop().create_future()
@@ -205,11 +204,11 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                 try:
                     return self.data.pop(key)
                 except KeyError:
-                    if default is not Temp:
+                    if default != Temp:
                         return default
                     raise
             except asyncio.TimeoutError:
-                if default is not Temp:
+                if default != Temp:
                     return default
                 raise KeyError
             finally:
@@ -235,7 +234,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             return value
         except KeyError:
             if self.full():
-                if default is not Temp:
+                if default != Temp:
                     return default
                 raise
             fut = self._get_loop().create_future()
@@ -247,11 +246,11 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                 try:
                     return self.data[key]
                 except KeyError:
-                    if default is not Temp:
+                    if default != Temp:
                         return default
                     raise
             except asyncio.TimeoutError:
-                if default is not Temp:
+                if default != Temp:
                     return default
                 raise KeyError
             finally:
@@ -277,8 +276,11 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         k, v = super().popitem()
         return k, v
 
-    def pop(self, key: KT, default=None) -> VT:
-        value = super().pop(key, default=default)
+    def pop(self, key: KT, default=Temp) -> VT:
+        if default == Temp:
+            value = super().pop(key)
+        else:
+            value = super().pop(key, default=default)
         return value
 
     @overload
@@ -559,9 +561,10 @@ def msg_unpack(data: ByteString) -> Any:
     return obj
 
 
-class StreamReply(AsyncGenerator):
+class StreamReply(AsyncGenerator, _LoopBoundMixin):
     def __init__(self, maxsize=0, timeout=0):
-        self.replies = asyncio.Queue(maxsize)
+        loop = self._get_loop()
+        self.replies = asyncio.Queue(maxsize, loop=loop)
         self.timeout = timeout
         self._exit = False
         self._pause = False
@@ -573,18 +576,15 @@ class StreamReply(AsyncGenerator):
         if self._exit:
             raise GeneratorExit
         if self.timeout:
-            try:
-                value = await asyncio.wait_for(self.replies.get(), self.timeout)
-            except asyncio.TimeoutError:
-                raise StopAsyncIteration
+            value = await asyncio.wait_for(
+                self.replies.get(), self.timeout, loop=self._get_loop()
+            )
         else:
-            try:
-                value = self.replies.get_nowait()
-            except asyncio.QueueEmpty:
-                raise StopAsyncIteration
+            value = self.replies.get_nowait()
         self.replies.task_done()
         if value == Settings.STREAM_END_MESSAGE:
             await asyncio.sleep(0.1)
+            self._exit = True
             raise StopAsyncIteration
         if self._pause and isinstance(value, BaseException):
             self._pause = False
@@ -592,8 +592,10 @@ class StreamReply(AsyncGenerator):
         return value
 
     async def asend(self, value):
-        if value:
+        print(f"prepare asend {value}")
+        if value is not None:
             await self.replies.put(value)
+            print(f"asend {value} success.")
         return
 
     async def athrow(self, __type, value=None, traceback=None):
@@ -991,7 +993,11 @@ def check_zap_args(mechanism: Optional[str], credentials: Optional[tuple]):
             f'The "{Settings.ZAP_MECHANISM_CURVE}"'
             f' mechanism is not implemented yet.'
         )
-    elif mechanism:
+    elif mechanism not in (
+            Settings.ZAP_MECHANISM_NULL,
+            Settings.ZAP_MECHANISM_PLAIN,
+            Settings.ZAP_MECHANISM_CURVE
+    ):
         raise ValueError(
             f'mechanism can only be '
             f'"{Settings.ZAP_MECHANISM_NULL}" or '
