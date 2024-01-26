@@ -184,3 +184,35 @@ gate-rpc
 
 客户端调用的远程方法后，会创建一个延迟回调用来删掉缓存的已经执行完毕的请求，包括超时没拿到回复的请求，
 而流式回复会每次回调时都检查一次该 StreamReply 实例是否已经结束，没结束就再创建一个延迟回调后续再检查
+
+
+********
+注意点
+********
+
+客户端和服务端对请求和回复的异步处理是使用的 utils.BoundedDict 异步字典来处理
+
+::
+
+    # 请求远程方法
+    request_id = await request(service_name, body)
+    response = await requests.aget(request_id, timeout=reply_timeout)
+    # 接收回复
+    response = await socket.recv_multipart()
+    await requests.aset(request_id, response)
+
+如果自定义方法的返回对象的大小无法使用 sys.getsizeof 准确获取，建议用 HugeData 包装后再返回
+
+::
+
+    # data 必须要是 bytes 或 bytearray，简言之能用 memoryview 包装的
+    hd = HugeData(data=data, compress_module="gzip", compress_level=9)
+    # 或者不提供 data ，HugeData 初始化时会创建一个 Queue 的跨进程代理对象，往这个跨进程队列里传输数据即可
+    hd = HugeData(compress_module="gzip", compress_level=9)
+    d = process_data()
+    hd.data.put(d)
+
+HugeData 的 compress 和 decompress 方法都会在进程池里执行增量压缩和增量解压缩，
+返回的生成器每次获取的字节数大小不会超过 Settings.HUGE_DATA_SIZEOF ，
+compress 方法对每一块返回的大小的限制是 HugeData 内部实现，
+decompress 方法对每一块返回的大小限制则是由压缩模块来实现，会在调用解压缩器实例的 decompress 方法时传递一个 max_length 位置参数。
