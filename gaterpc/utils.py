@@ -950,7 +950,7 @@ async def generate_reply(
         )
     if isinstance(result, Generator):
         result = generator_to_agenerator(result)
-    if isinstance(result, AsyncGenerator):
+    if isinstance(result, (AsyncGenerator, HugeData)):
         return result
     if sys.getsizeof(
             result, Settings.HUGE_DATA_SIZEOF
