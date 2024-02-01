@@ -153,8 +153,25 @@ gate-rpc
 ::
 
     # Majordomo
+    class GRMajordomo(AMajordomo):
+    # 可以新增内部处理程序，用于扩展分布式应用，所有内部处理程序只能接收kwargs关键词参数
+    # kwargs 的结构是固定的
+    # kwargs = {
+    #    "client_id": client_id,
+    #    "client_addr": client_addr,
+    #    "request_id": request_id,
+    #    "body": body
+    # }
+        @interface
+        def internal_x_process(**kwargs):
+            return stat_code
+
+        @interface
+        async def internal_y_process(**kwargs):
+            return stat_code
+
     Settings.setup()
-    gr_majordomo = AMajordomo(
+    gr_majordomo = GRMajordomo(
         backend_addr="tcp://127.0.0.1:5555",
         zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
         zap_addr=Settings.ZAP_ADDR

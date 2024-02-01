@@ -21,7 +21,7 @@ import zlib
 
 from asyncio import Future, Task
 from collections import UserDict, deque
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import wraps
 from importlib import import_module
@@ -102,7 +102,8 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         self.usable_size = maxsize
         self.timeout = timeout
         self._waiters: dict[KT, tuple[Future, deque[Future]]] = dict()
-        self._sync_task: set = set()
+        self._later_task: set = set()
+        self._sync_task = deque()
         data = kwargs
         if (len(data) + len(kwargs)) > maxsize:
             raise RuntimeError(
@@ -133,7 +134,8 @@ class BoundedDict(UserDict, _LoopBoundMixin):
             waiters: deque[Future] = deque()
             self._waiters[key] = (fut, waiters)
         try:
-            await asyncio.wait_for(fut, timeout)
+            if not fut.done():
+                await asyncio.wait_for(fut, timeout)
             self.data[key] = value
             for waiter in waiters:
                 if not waiter.done():
@@ -153,10 +155,10 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         return
 
     def set(self, key: KT, value: VT):
-        loop = self._get_loop()
-        t = loop.create_task(self.aset(key, value, timeout=None))
-        self._sync_task.add(t)
-        t.add_done_callback(self._sync_task.remove)
+        sync_task = self._get_loop().create_task(self.aset(key, value))
+        self._sync_task.append(sync_task)
+        sync_task.add_done_callback(self._sync_task.remove)
+        return sync_task
 
     def _release_set(self):
         if self.usable_size >= self.maxsize:
@@ -195,9 +197,12 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                 if default != Temp:
                     return default
                 raise
-            fut = self._get_loop().create_future()
+            if key in self._waiters and self._waiters[key][0].done():
+                raise RuntimeWarning('wait for the "set" lock to be released.')
             if key not in self._waiters:
                 self._waiters[key] = (self._get_loop().create_future(), deque())
+            fut = self._get_loop().create_future()
+            dq = self._waiters[key][1]
             self._waiters[key][1].append(fut)
             try:
                 await asyncio.wait_for(fut, timeout)
@@ -212,8 +217,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                     return default
                 raise KeyError
             finally:
-                if key in self._waiters:
-                    self._waiters[key][1].remove(fut)
+                dq.remove(fut)
 
     async def aget(
         self, key: KT,
@@ -237,10 +241,13 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                 if default != Temp:
                     return default
                 raise
-            fut = self._get_loop().create_future()
+            if key in self._waiters and self._waiters[key][0].done():
+                raise RuntimeWarning('wait for the "set" lock to be released.')
             if key not in self._waiters:
                 self._waiters[key] = (self._get_loop().create_future(), deque())
-            self._waiters[key][1].append(fut)
+            fut = self._get_loop().create_future()
+            dq = self._waiters[key][1]
+            dq.append(fut)
             try:
                 await asyncio.wait_for(fut, timeout)
                 try:
@@ -254,8 +261,7 @@ class BoundedDict(UserDict, _LoopBoundMixin):
                     return default
                 raise KeyError
             finally:
-                if key in self._waiters:
-                    self._waiters[key][1].remove(fut)
+                dq.remove(fut)
 
     def __getitem__(self, key) -> VT:
         return self.data[key]
@@ -292,7 +298,6 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         pass
 
     def update(self, m: None, **kwargs: VT) -> None:
-        loop = self._get_loop()
         if isinstance(m, MutableMapping):
             items = m.items()
         elif isinstance(m, Iterable):
@@ -300,13 +305,9 @@ class BoundedDict(UserDict, _LoopBoundMixin):
         else:
             items = []
         for k, v in items:
-            t = loop.create_task(self.aset(key=k, value=v))
-            self._sync_task.add(t)
-            t.add_done_callback(self._sync_task.remove)
+            self.set(key=k, value=v)
         for k, v in kwargs.items():
-            t = loop.create_task(self.aset(key=k, value=v))
-            self._sync_task.add(t)
-            t.add_done_callback(self._sync_task.remove)
+            self.set(key=k, value=v)
         return
 
 

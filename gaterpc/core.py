@@ -29,7 +29,7 @@ from .mixins import _LoopBoundMixin
 from .utils import (
     BoundedDict, HugeData, StreamReply, check_socket_addr, check_zap_args,
     generate_reply,
-    msg_pack, msg_unpack, from_bytes, to_bytes,
+    interface, msg_pack, msg_unpack, from_bytes, to_bytes,
 )
 
 __all__ = ["Worker", "Service", "AsyncZAPService", "AMajordomo", "Client"]
@@ -341,7 +341,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
                     "Function not found: {0}".format(func_name)
                 )
             func = getattr(self, func_name)
-            if asyncio.iscoroutinefunction(func):
+            if inspect.iscoroutinefunction(func):
                 coro = func(*args, **kwargs)
                 task = loop.create_task(coro)
             else:
@@ -807,6 +807,10 @@ class AMajordomo(_LoopBoundMixin):
         self.backend.bind(check_socket_addr(backend_addr))
         # majordomo
         self.heartbeat = heartbeat
+        # 内部程序应该只执行简单的资源消耗少的逻辑处理，并且只能返回状态码
+        self.internal_processes: dict[str, Callable] = dict()
+        # 不需要用到 ProcessPoolExecutor
+        self.internal_process_executor = ThreadPoolExecutor()
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, RemoteWorker] = dict()
         self.clients: dict[bytes, bytes] = dict()
@@ -843,6 +847,7 @@ class AMajordomo(_LoopBoundMixin):
                     "The ZAP mechanism is specified and "
                     "the ZAP server address must also be provided."
                 )
+        self.register_internal_process()
 
     def bind(self, addr: str) -> None:
         """
@@ -853,12 +858,44 @@ class AMajordomo(_LoopBoundMixin):
     def close(self):
         self.frontend.close()
         self.backend.close()
+        self.internal_process_executor.shutdown()
+
+    def register_internal_process(self):
+        """
+        注册内部的处理程序
+        """
+        for name, method in inspect.getmembers(self):
+            if (
+                    (
+                            inspect.ismethod(method)
+                            or inspect.iscoroutinefunction(method)
+                    )
+                    and not name.startswith("_")
+                    and getattr(method, "__interface__", False)
+            ):
+                self.internal_processes[name] = method
 
     def register_service(self, service: ABCService):
         """
         添加 service
         """
         self.services[service.name] = service
+
+    @interface
+    def service(self, **kwargs):
+        if from_bytes(kwargs["body"]) in self.services:
+            stat_code = b"200"
+        else:
+            stat_code = b"404"
+        return stat_code
+
+    @interface
+    def client_heartbeat(self, **kwargs):
+        if kwargs["body"] == b"heartbeat":
+            stat_code = b"200"
+        else:
+            stat_code = b"400"
+        return stat_code
 
     def register_worker(self, worker: RemoteWorker):
         self.workers[worker.identity] = worker
@@ -896,26 +933,31 @@ class AMajordomo(_LoopBoundMixin):
             self.ban_worker(worker, wait=worker.expiry)
         )
 
-    async def internal_service(
+    async def internal_process(
         self,
-        service_name: bytes, client_id: bytes, client_addr: bytes,
+        func_name: bytes, client_id: bytes, client_addr: bytes,
         request_id: bytes, body: bytes
     ):
-        service = service_name.lstrip(Settings.MDP_INTERNAL_SERVICE_PREFIX)
         stat_code = b"501"
-        if service == b"service":
-            if from_bytes(body) in self.services:
-                stat_code = b"200"
+        kwargs = {
+            "client_id": client_id,
+            "client_addr": client_addr,
+            "request_id": request_id,
+            "body": body
+        }
+        if func := self.internal_processes.get(from_bytes(func_name), None):
+            if inspect.iscoroutinefunction(func):
+                stat_code = await func(**kwargs)
             else:
-                stat_code = b"404"
-        elif service == b"client_heartbeat":
-            if body == b"heartbeat":
-                stat_code = b"200"
+                func = functools.partial(func, **kwargs)
+                stat_code = await self._get_loop().run_in_executor(
+                    self.internal_process_executor, func
+                )
         reply = [
             client_addr,
             b"",
             Settings.MDP_CLIENT,
-            service_name,
+            Settings.MDP_INTERNAL_SERVICE_PREFIX + func_name,
             client_id,
             request_id,
             stat_code,
@@ -1201,8 +1243,9 @@ class AMajordomo(_LoopBoundMixin):
             except ValueError:
                 return False
         if service_name.startswith(Settings.MDP_INTERNAL_SERVICE_PREFIX):
-            await self.internal_service(
-                service_name, client_id, client_addr,
+            func_name = service_name.lstrip(Settings.MDP_INTERNAL_SERVICE_PREFIX)
+            await self.internal_process(
+                func_name, client_id, client_addr,
                 request_id, body
             )
         else:

@@ -125,6 +125,8 @@ async def test():
         dd = await gr_cli.test_huge_data()
         logger.info(f"length of dd: {len(dd)}")
         logger.info(f"dd is bs: {dd == s}")
+        logger.info("check heartbeat")
+        await asyncio.sleep(5)
     except Exception as e:
         logger.info("*****************************************************")
         for line in format_exception(*sys.exc_info()):
