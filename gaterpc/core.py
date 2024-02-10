@@ -8,7 +8,7 @@ import inspect
 import sys
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Coroutine, Callable, AsyncGenerator, Generator
+from collections.abc import Coroutine, Callable, AsyncGenerator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from time import time
 from traceback import format_exception, format_tb
@@ -27,7 +27,8 @@ from .exceptions import (
 )
 from .mixins import _LoopBoundMixin
 from .utils import (
-    BoundedDict, HugeData, StreamReply, check_socket_addr, check_zap_args,
+    BoundedDict, HugeData, MsgUnpackError, StreamReply, check_socket_addr,
+    check_zap_args,
     generate_reply,
     interface, msg_pack, msg_unpack, from_bytes, to_bytes,
 )
@@ -186,9 +187,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self.heartbeat = heartbeat
         self.expiry = self.heartbeat_liveness * self.heartbeat
 
-        self.requests = BoundedDict(
-            Settings.MESSAGE_MAX, 0.1
-        )
+        self.requests = deque()
 
         if not thread_executor:
             thread_executor = ThreadPoolExecutor()
@@ -203,12 +202,13 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self._reconnect: bool = False
         self._recv_task: Optional[asyncio.Task] = None
 
+    @interface
     def get_interfaces(self):
         interfaces = {
-            "_get_interfaces": {
-                "doc": "get interfaces",
-                "signature": inspect.signature(self.get_interfaces)
-            }
+            # "_get_interfaces": {
+            #     "doc": "get interfaces",
+            #     "signature": inspect.signature(self.get_interfaces)
+            # }
         }
         for name, method in inspect.getmembers(self):
             if (
@@ -221,7 +221,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
             ):
                 interfaces[name] = {
                     "doc": inspect.getdoc(method),
-                    "signature": inspect.signature(method)
+                    "signature": str(inspect.signature(method))
                 }
         return interfaces
 
@@ -231,11 +231,13 @@ class Worker(ABCWorker, _LoopBoundMixin):
     async def connect(self):
         if not self.is_alive():
             logger.info(
-                f"Connecting to broker at {self._broker_addr} ..."
+                f"Worker is attempting to connect to the broker at "
+                f"{self._broker_addr}."
             )
             self._socket = self._ctx.socket(
                 z_const.DEALER, z_aio.Socket
             )
+            self._socket.set(z_const.IDENTITY, self.identity)
             self._socket.set_hwm(Settings.ZMQ_HWM)
             self._socket.connect(self._broker_addr)
             self._poller.register(self._socket, z_const.POLLIN)
@@ -273,12 +275,12 @@ class Worker(ABCWorker, _LoopBoundMixin):
             self.ready = False
 
     def release_request(self, task: asyncio.Task):
-        self.requests.pop(task.get_name())
+        self.requests.remove(task)
         if exception := task.exception():
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.debug(f"process request task exception:\n{exception_info}")
+            logger.error(f"process request task exception:\n{exception_info}")
 
     async def send_to_broker(
         self,
@@ -321,21 +323,14 @@ class Worker(ABCWorker, _LoopBoundMixin):
         return loop.run_in_executor(executor, func_call)
 
     async def process_request(
-        self, cli_id: bytes, request_id: bytes, func_details: dict
+        self, cli_id: bytes, request_id: bytes,
+        func_name: str, args: tuple, kwargs: dict
     ):
         """
         MDP的reply命令的命令帧后加上一个worker id帧，掉线重连，幂等
         """
         loop = self._get_loop()
         try:
-            try:
-                func_name, args, kwargs = (
-                    func_details["func"],
-                    func_details["args"],
-                    func_details["kwargs"]
-                )
-            except Exception:
-                raise AttributeError("Invalid function details")
             if not self.interfaces.get(func_name, None):
                 raise AttributeError(
                     "Function not found: {0}".format(func_name)
@@ -352,7 +347,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
             reply = await generate_reply(exception=e)
         else:
             reply = await generate_reply(task)
-        option = [cli_id, request_id]
+        option = [cli_id, b"", request_id]
         if isinstance(reply, HugeData):
             option.append(Settings.STREAM_HUGE_DATA_TAG)
             reply_except = False
@@ -425,30 +420,37 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         logger.debug(f"{self.identity} disconnected")
                         break
                     elif command == Settings.MDP_COMMAND_REQUEST:
-                        if self.requests.usable_size == 0:
+                        if len(self.requests) > Settings.MESSAGE_MAX:
                             continue
                         try:
-                            client_id, empty, request_id, body = messages
+                            (
+                                client_id,
+                                empty,
+                                request_id,
+                                func_name,
+                                *params
+                            ) = messages
                             if empty:
-                                raise ValueError
-                        except ValueError:
+                                continue
+                            if not params:
+                                args, kwargs = tuple(), dict()
+                            elif len(params) == 1:
+                                args, kwargs = msg_unpack(params[0]), dict()
+                            elif len(params) == 2:
+                                args, kwargs = (msg_unpack(p) for p in params)
+                            else:
+                                continue
+                            func_name = msg_unpack(func_name)
+                        except MsgUnpackError:
                             continue
-                        details = msg_unpack(body)
                         tn = request_id.decode("utf-8")
                         task = loop.create_task(
                             self.process_request(
-                                client_id, request_id, details
+                                client_id, request_id,
+                                func_name, args, kwargs
                             ), name=tn
                         )
-                        try:
-                            await self.requests.aset(tn, task)
-                        except asyncio.TimeoutError:
-                            logger.error(
-                                f"The number of pending requests has exceeded"
-                                f" the cache limit for the requesting task."
-                                f"The limit is {self.requests.maxsize} "
-                                f"requests."
-                            )
+                        self.requests.append(task)
                         task.add_done_callback(self.release_request)
                 else:
                     broker_liveness -= 1
@@ -647,12 +649,12 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
             )
             return
 
-        self.log.debug(
-            f"request address: {request_address}, "
-            f"version: {version}, request_id: {request_id}, "
-            f"domain: {domain}, address: {address}, "
-            f"identity: {identity}, mechanism: {mechanism}"
-        )
+        # self.log.debug(
+        #     f"request address: {request_address}, "
+        #     f"version: {version}, request_id: {request_id}, "
+        #     f"domain: {domain}, address: {address}, "
+        #     f"identity: {identity}, mechanism: {mechanism}"
+        # )
 
         # Is address is explicitly allowed or _denied?
         allowed = False
@@ -662,27 +664,27 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
         if self._allowed:
             if address in self._allowed:
                 allowed = True
-                self.log.debug("PASSED (allowed) address=%s", address)
+                # self.log.debug("PASSED (allowed) address=%s", address)
             else:
                 denied = True
                 reason = b"Address not allowed"
-                self.log.debug("DENIED (not allowed) address=%s", address)
+                # self.log.debug("DENIED (not allowed) address=%s", address)
 
         elif self._denied:
             if address in self._denied:
                 denied = True
                 reason = b"Address denied"
-                self.log.debug("DENIED (denied) address=%s", address)
+                # self.log.debug("DENIED (denied) address=%s", address)
             else:
                 allowed = True
-                self.log.debug("PASSED (not denied) address=%s", address)
+                # self.log.debug("PASSED (not denied) address=%s", address)
 
         # Perform authentication mechanism-specific checks if necessary
         username = "anonymous"
         if not denied:
             if mechanism == b'NULL' and not allowed:
                 # For NULL, we allow if the address wasn't denied
-                self.log.debug("ALLOWED (NULL)")
+                # self.log.debug("ALLOWED (NULL)")
                 allowed = True
 
             elif mechanism == b'PLAIN':
@@ -751,10 +753,10 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
         if isinstance(user_id, str):
             user_id = user_id.encode(self.encoding, 'replace')
         metadata = b''  # not currently used
-        self.log.debug(
-            f"ZAP reply user_id={user_id} request_id={request_id}"
-            f" code={status_code} text={status_text}"
-        )
+        # self.log.debug(
+        #     f"ZAP reply user_id={user_id} request_id={request_id}"
+        #     f" code={status_code} text={status_text}"
+        # )
         replies = (
             reply_address,
             b"",
@@ -800,6 +802,9 @@ class AMajordomo(_LoopBoundMixin):
         self.frontend.set_hwm(Settings.ZMQ_HWM)
         self.frontend_tasks = deque()
         self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
+        self.backend.set(
+            z_const.IDENTITY, f"gm-backend-{backend_addr}".encode("utf-8")
+        )
         self.backend.set_hwm(Settings.ZMQ_HWM)
         self.backend_tasks = deque()
         if not backend_addr:
@@ -810,7 +815,7 @@ class AMajordomo(_LoopBoundMixin):
         # 内部程序应该只执行简单的资源消耗少的逻辑处理，并且只能返回状态码
         self.internal_processes: dict[str, Callable] = dict()
         # 不需要用到 ProcessPoolExecutor
-        self.internal_process_executor = ThreadPoolExecutor()
+        self._executor = ThreadPoolExecutor()
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, RemoteWorker] = dict()
         self.clients: dict[bytes, bytes] = dict()
@@ -828,9 +833,7 @@ class AMajordomo(_LoopBoundMixin):
         self.zap_socket: Union[z_aio.Socket, None] = None
         # TODO: ZAP domain
         self.zap_domain = zap_domain.encode("utf-8")
-        self.zap_replies: BoundedDict[str, list] = BoundedDict(
-            10*Settings.MESSAGE_MAX, 1.5
-        )
+        self.zap_replies: dict[bytes, asyncio.Future] = dict()
         self.zap_tasks = deque()
         if zap_mechanism:
             self.zap_mechanism = zap_mechanism.encode("utf-8")
@@ -853,12 +856,15 @@ class AMajordomo(_LoopBoundMixin):
         """
         绑定到对外地址
         """
+        self.frontend.set(
+            z_const.IDENTITY, f"gm-frontend-{addr}".encode("utf-8")
+        )
         self.frontend.bind(check_socket_addr(addr))
 
     def close(self):
         self.frontend.close()
         self.backend.close()
-        self.internal_process_executor.shutdown()
+        self._executor.shutdown()
 
     def register_internal_process(self):
         """
@@ -880,22 +886,6 @@ class AMajordomo(_LoopBoundMixin):
         添加 service
         """
         self.services[service.name] = service
-
-    @interface
-    def service(self, **kwargs):
-        if from_bytes(kwargs["body"]) in self.services:
-            stat_code = b"200"
-        else:
-            stat_code = b"404"
-        return stat_code
-
-    @interface
-    def client_heartbeat(self, **kwargs):
-        if kwargs["body"] == b"heartbeat":
-            stat_code = b"200"
-        else:
-            stat_code = b"400"
-        return stat_code
 
     def register_worker(self, worker: RemoteWorker):
         self.workers[worker.identity] = worker
@@ -933,37 +923,6 @@ class AMajordomo(_LoopBoundMixin):
             self.ban_worker(worker, wait=worker.expiry)
         )
 
-    async def internal_process(
-        self,
-        func_name: bytes, client_id: bytes, client_addr: bytes,
-        request_id: bytes, body: bytes
-    ):
-        stat_code = b"501"
-        kwargs = {
-            "client_id": client_id,
-            "client_addr": client_addr,
-            "request_id": request_id,
-            "body": body
-        }
-        if func := self.internal_processes.get(from_bytes(func_name), None):
-            if inspect.iscoroutinefunction(func):
-                stat_code = await func(**kwargs)
-            else:
-                func = functools.partial(func, **kwargs)
-                stat_code = await self._get_loop().run_in_executor(
-                    self.internal_process_executor, func
-                )
-        reply = [
-            client_addr,
-            b"",
-            Settings.MDP_CLIENT,
-            Settings.MDP_INTERNAL_SERVICE_PREFIX + func_name,
-            client_id,
-            request_id,
-            stat_code,
-        ]
-        await self.reply_frontend(reply)
-
     async def request_zap(
         self, identity, address, request_id, mechanism, credentials
     ) -> bool:
@@ -981,6 +940,7 @@ class AMajordomo(_LoopBoundMixin):
         ]
         zap_frames = [to_bytes(s) for s in zap_frames]
         reply_key = zap_frames[5] + b"-" + zap_frames[2]
+        self.zap_replies[reply_key] = asyncio.Future()
         failed_reply = {
                 "user_id": zap_frames[2],
                 "request_id": zap_frames[5],
@@ -995,15 +955,15 @@ class AMajordomo(_LoopBoundMixin):
             zap_reply = failed_reply
         else:
             try:
-                zap_reply = await self.zap_replies.aget(
-                    reply_key,
-                    timeout=Settings.ZAP_REPLY_TIMEOUT
+                zap_reply = await asyncio.wait_for(
+                    self.zap_replies[reply_key],
+                    Settings.ZAP_REPLY_TIMEOUT
                 )
-                await self.zap_replies.apop(
-                    reply_key, timeout=Settings.ZAP_REPLY_TIMEOUT,
-                    default=None
-                )
-            except KeyError:
+                # await self.zap_replies.apop(
+                #     reply_key, timeout=Settings.ZAP_REPLY_TIMEOUT,
+                #     default=None
+                # )
+            except asyncio.TimeoutError:
                 logger.error(f"get ZAP replies failed: {reply_key}")
                 zap_reply = failed_reply
         if zap_reply["status_code"] != b"200":
@@ -1032,8 +992,7 @@ class AMajordomo(_LoopBoundMixin):
         except ValueError:
             logger.debug("ZAP replies frame invalid.")
             return
-        await self.zap_replies.aset(
-            user_id + b"-" + request_id,
+        self.zap_replies[user_id + b"-" + request_id].set_result(
             {
                 "user_id": user_id,
                 "request_id": request_id,
@@ -1049,7 +1008,7 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = ''.join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.debug(f"frontend task exception:\n{exception_info}")
+            logger.error(f"frontend task exception:\n{exception_info}")
 
     def release_backend_task(self, task: asyncio.Task):
         self.backend_tasks.remove(task)
@@ -1057,7 +1016,7 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception}"
                               f"\n{exception_info}")
-            logger.debug(f"backend task exception:\n{exception_info}")
+            logger.error(f"backend task exception:\n{exception_info}")
 
     async def process_replies_from_backend(self, replies: list):
         try:
@@ -1070,7 +1029,7 @@ class AMajordomo(_LoopBoundMixin):
                 *messages
             ) = replies
             if empty:
-                raise ValueError
+                return
         except ValueError:
             return
         if mdp_worker_version != Settings.MDP_WORKER:
@@ -1132,7 +1091,7 @@ class AMajordomo(_LoopBoundMixin):
             self.ban_worker_after_expiration(worker)
 
         elif command == Settings.MDP_COMMAND_HEARTBEAT:
-            if len(messages) > 1:
+            if messages:
                 return
             if mechanism:
                 request_id = f"worker_heartbeat{uuid4().hex}"
@@ -1149,14 +1108,18 @@ class AMajordomo(_LoopBoundMixin):
                 return
             elif not worker.ready:
                 return await self.ban_worker(worker)
-            worker.expiry = 1e-3 * worker.heartbeat_liveness * worker.heartbeat + time()
+            worker.expiry = (
+                    1e-3 * worker.heartbeat_liveness * worker.heartbeat + time()
+            )
             if worker.destroy_task:
                 worker.destroy_task.cancel()
             self.ban_worker_after_expiration(worker)
 
         elif command == Settings.MDP_COMMAND_REPLY:
             try:
-                client_id, request_id, *body = messages
+                client_id, empty, request_id, *body = messages
+                if empty:
+                    return
             except ValueError:
                 return
             if mechanism:
@@ -1227,9 +1190,19 @@ class AMajordomo(_LoopBoundMixin):
 
         self.clients[client_id] = client_addr
         if self.zap_socket:
-            try:
-                mechanism, *credentials, request_id, body = messages
-            except ValueError:
+            mechanism = messages.pop(0)
+            if mechanism == Settings.ZAP_MECHANISM_NULL:
+                credentials, (request_id, *body) = [], messages
+            elif mechanism == Settings.ZAP_MECHANISM_PLAIN:
+                credentials = messages[:2]
+                request_id, *body = messages[2:]
+            elif mechanism in (
+                    Settings.ZAP_MECHANISM_CURVE,
+                    Settings.ZAP_MECHANISM_GSSAPI
+            ):
+                credentials = messages.pop(0)
+                request_id, *body = messages
+            else:
                 logger.debug("ZAP frames invalid")
                 return False
             zap_result = await self.request_zap(
@@ -1239,32 +1212,79 @@ class AMajordomo(_LoopBoundMixin):
                 return False
         else:
             try:
-                request_id, body = messages
+                request_id, *body = messages
             except ValueError:
                 return False
-        if service_name.startswith(Settings.MDP_INTERNAL_SERVICE_PREFIX):
-            func_name = service_name.lstrip(Settings.MDP_INTERNAL_SERVICE_PREFIX)
+        service_name = from_bytes(service_name)
+        if service_name == Settings.MDP_INTERNAL_SERVICE:
+            func_name, *body = body
             await self.internal_process(
-                func_name, client_id, client_addr,
+                func_name, client_id,
                 request_id, body
             )
         else:
             await self.request_backend(
-                service_name,
-                client_id, client_addr,
-                request_id, body
+                service_name, client_id, request_id, body
             )
         return True
 
+    async def internal_process(
+        self,
+        func_name: bytes, client_id: bytes,
+        request_id: bytes, body: list[bytes]
+    ):
+        client_addr = self.clients[client_id]
+        stat_code, replies = b"501", b""
+        exception = None
+        kwargs = {
+            "client_id": client_id,
+            "client_addr": client_addr,
+            "request_id": request_id,
+        }
+        func_name = msg_unpack(func_name)
+        if (
+                func := self.internal_processes.get(func_name, None)
+        ) and len(body) <= 2:
+            if not body:
+                args = tuple()
+            elif len(body) == 1:
+                args = msg_unpack(body[0])
+            else:
+                args = msg_unpack(body[0])
+                kwargs.update(msg_unpack(body[1]))
+            try:
+                if inspect.iscoroutinefunction(func):
+                    stat_code, replies = await func(*args, **kwargs)
+                else:
+                    func = functools.partial(func, *args, **kwargs)
+                    stat_code, replies = await self._get_loop().run_in_executor(
+                        self._executor, func
+                        )
+            except Exception as error:
+                exception = error
+        replies = await generate_reply(
+            result=(func_name, stat_code, replies), exception=exception
+        )
+        reply = [
+            client_addr,
+            b"",
+            Settings.MDP_CLIENT,
+            Settings.MDP_INTERNAL_SERVICE,
+            client_id,
+            request_id,
+            msg_pack(replies)
+        ]
+        await self.reply_frontend(reply)
+
     async def request_backend(
         self,
-        service_name: bytes, client_id: bytes, client_addr: bytes,
-        request_id: bytes, body: bytes
+        service_name: str, client_id: bytes,
+        request_id: bytes, body: list[bytes]
     ):
-        service_name = from_bytes(service_name)
         for wid, worker in self.workers.items():
             if not worker.is_alive():
                 await self.ban_worker(worker)
+        client_addr = self.clients[client_id]
         service = self.services.get(service_name)
         exception = await generate_reply(
             exception=ServiceUnAvailableError(service_name)
@@ -1289,7 +1309,7 @@ class AMajordomo(_LoopBoundMixin):
                 client_id,
                 b"",
                 request_id,
-                body
+                *body
             ]
             request = [to_bytes(frame) for frame in request]
             try:
@@ -1319,18 +1339,20 @@ class AMajordomo(_LoopBoundMixin):
             self._poller.register(self.zap_socket, z_const.POLLIN)
         self.running = True
         heartbeat_at = 1e-3 * self.heartbeat + loop.time()
-        heartbeat_task = loop.create_task(self.send_heartbeat())
+        heartbeat_task: Optional[asyncio.Task] = None
 
         try:
             while 1:
                 socks = dict(await self._poller.poll(self.heartbeat))
-                if heartbeat_task.done() and loop.time() > heartbeat_at:
+                if (
+                        not heartbeat_task or heartbeat_task.done()
+                ) and loop.time() > heartbeat_at:
                     heartbeat_task = loop.create_task(self.send_heartbeat())
                 if self.backend in socks:
                     replies = await self.backend.recv_multipart()
                     bt = loop.create_task(
                         self.process_replies_from_backend(replies),
-                        name=f"backend_task_{uuid4().hex}"
+                        # name=f"backend_task_{uuid4().hex}"
                     )
                     self.backend_tasks.append(bt)
                     bt.add_done_callback(self.release_backend_task)
@@ -1349,7 +1371,7 @@ class AMajordomo(_LoopBoundMixin):
                     # 同后端任务处理。
                     ft = loop.create_task(
                         self.process_request_from_frontend(replies),
-                        name=f"frontend_task_{uuid4().hex}"
+                        # name=f"frontend_task_{uuid4().hex}"
                     )
                     self.frontend_tasks.append(ft)
                     ft.add_done_callback(self.release_frontend_task)
@@ -1358,7 +1380,7 @@ class AMajordomo(_LoopBoundMixin):
                     replies = await self.zap_socket.recv_multipart()
                     zt = loop.create_task(
                         self.process_replies_from_zap(replies),
-                        name=f"zap_task_{uuid4().hex}"
+                        # name=f"zap_task_{uuid4().hex}"
                     )
                     self.zap_tasks.append(zt)
                     zt.add_done_callback(self.zap_tasks.remove)
@@ -1394,6 +1416,28 @@ class AMajordomo(_LoopBoundMixin):
             self.close()
             self._broker_task = None
 
+    @interface
+    def query_service(self, service_name, **kwargs):
+        if service_name in self.services:
+            stat_code = b"200"
+        else:
+            stat_code = b"404"
+        return stat_code, b""
+
+    @interface
+    def get_services(self, **kwargs):
+        services = list(self.services.keys())
+        services.append(Settings.MDP_INTERNAL_SERVICE)
+        return b"200", services
+
+    @interface
+    def client_heartbeat(self, heartbeat, **kwargs):
+        if heartbeat == b"heartbeat":
+            stat_code = b"200"
+        else:
+            stat_code = b"400"
+        return stat_code, b""
+
 
 class Client(_LoopBoundMixin):
 
@@ -1404,7 +1448,6 @@ class Client(_LoopBoundMixin):
         context: Context = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
         reply_timeout: float = Settings.REPLY_TIMEOUT,
-        msg_max: int = Settings.MESSAGE_MAX,
         zap_mechanism: str = None,
         zap_credentials: tuple = None,
     ):
@@ -1423,7 +1466,7 @@ class Client(_LoopBoundMixin):
         if not identity:
             identity = uuid4().hex
         self.identity = f"gc-{identity}".encode("utf-8")
-        self.ready = False
+        self.ready: Optional[asyncio.Future] = None
         self._broker_addr = check_socket_addr(broker_addr)
         zap_mechanism, zap_credentials = check_zap_args(
             zap_mechanism, zap_credentials
@@ -1444,64 +1487,74 @@ class Client(_LoopBoundMixin):
         self.heartbeat_expiry = heartbeat * Settings.MDP_HEARTBEAT_LIVENESS
         self.reply_timeout = reply_timeout
 
-        self.requests: BoundedDict[str, list] = BoundedDict(msg_max, 1.5)
+        self._executor = ThreadPoolExecutor()
+        self.replies: dict[bytes, asyncio.Future] = dict()
+        self._clear_replies_tasks = deque()
         self.stream_reply_maxsize = Settings.STREAM_REPLY_MAXSIZE
         self._recv_task = None
 
         self.default_service = Settings.SERVICE_DEFAULT_NAME
+        self._remote_services: list[str] = []
         self._remote_service = self._remote_func = None
 
         self.connect()
 
     def connect(self):
-        if not self.ready:
+        if self.ready is None:
             loop = self._get_loop()
-            logger.info(f"Connecting to broker at {self._broker_addr} ...")
+            logger.info(
+                f"Client is attempting to connet to the broker at "
+                f"{self._broker_addr}."
+            )
             self.socket = self.ctx.socket(
                 z_const.DEALER, z_aio.Socket
             )
+            self.socket.set(z_const.IDENTITY, self.identity)
             self.socket.set_hwm(Settings.ZMQ_HWM)
             self.socket.connect(self._broker_addr)
             self._poller.register(self.socket, z_const.POLLIN)
-            self.ready = True
+            self.ready = loop.create_future()
             self._recv_task = loop.create_task(self._recv())
 
     def disconnect(self):
-        if self.ready:
+        if self.ready is not None:
             self._poller.unregister(self.socket)
             self.socket.disconnect(self._broker_addr)
             self.socket.close()
             self.socket = None
 
     def close(self):
-        if self.ready:
+        if self.ready is not None:
             self.disconnect()
             if not self._recv_task.cancelled:
                 self._recv_task.cancel()
             self._recv_task = None
-            self.ready = False
+            self.ready = None
 
-    def _clear_reply_later(self, request_id, delay):
-        if request_id in self.requests:
-            if isinstance(reply := self.requests[request_id], StreamReply):
+    async def _clear_reply(self, request_id):
+        if request_id in self.replies:
+            reply = self.replies[request_id].result()
+            if isinstance(reply, StreamReply):
                 if reply._exit:
-                    self.requests.pop(request_id)
+                    self.replies.pop(request_id)
                 else:
-                    self._get_loop().call_later(
-                        delay,
-                        self._clear_reply_later,
-                        request_id, delay
+                    t = self._get_loop().create_task(
+                        self._clear_reply(request_id)
                     )
+                    self._clear_replies_tasks.append(t)
+                    t.add_done_callback(self._clear_replies_tasks.remove)
             else:
-                self.requests.pop(request_id)
+                self.replies.pop(request_id)
 
-    async def _request(self, service_name: str, body: Union[str, bytes]) -> bytes:
+    async def _request(
+        self, service_name: Union[str, bytes], body: list[Union[str, bytes]]
+    ) -> bytes:
         """
         客户端使用 DEALER 类型 socket，每个请求都有一个id，
         worker 每个回复都会带上这个请求id。 客户端需要将回复和请求对应上。
         :param service_name: 要访问的服务的名字
         """
-        request_id = uuid4().hex
+        request_id = to_bytes(uuid4().hex)
         request = [
             b"",
             Settings.MDP_CLIENT,
@@ -1509,11 +1562,11 @@ class Client(_LoopBoundMixin):
             self.identity,
             *self.zap_frames,
             request_id,
-            body
+            *body
         ]
         request = [to_bytes(frame) for frame in request]
         await self.socket.send_multipart(request)
-        return request[-2]
+        return request_id
 
     async def knock(
         self, service_name: str, func_name: str, *args, **kwargs
@@ -1525,24 +1578,32 @@ class Client(_LoopBoundMixin):
         :param args: 要调用的该函数要传递的位置参数
         :param kwargs: 要调用的该函数要传递的关键字参数
         """
-        if self.requests.full():
+        await self.ready
+        if not service_name:
+            service_name = self.default_service
+        if service_name not in self._remote_services:
+            raise AttributeError(
+                f"The remote service named \"{service_name}\" was not "
+                f"found."
+            )
+        if len(self.replies) > Settings.MESSAGE_MAX:
             raise RuntimeError(
                 "The number of pending requests has exceeded the cache limit"
                 " for the requesting task. The limit is "
-                f"{self.requests.maxsize} requests."
+                f"{Settings.MESSAGE_MAX} requests."
             )
         loop = self._get_loop()
-        body = msg_pack(
-            {
-                "func": func_name,
-                "args": args,
-                "kwargs": kwargs
-            }
-        )
+        body = [msg_pack(func_name)]
+        if args:
+            body.append(msg_pack(args))
+        if kwargs:
+            body.append(msg_pack(kwargs))
         request_id = await self._request(service_name, body)
+        self.replies[request_id] = asyncio.Future()
         try:
-            response = await self.requests.aget(
-                request_id, timeout=self.reply_timeout
+            response = await asyncio.wait_for(
+                self.replies[request_id],
+                self.reply_timeout
             )
             if isinstance(response, StreamReply):
                 return response
@@ -1569,40 +1630,45 @@ class Client(_LoopBoundMixin):
                 if exception := response.get("exception"):
                     raise RemoteException(*exception)
                 return response.get("result")
-        except KeyError:
+        except asyncio.TimeoutError:
             raise TimeoutError(
                 "Timeout while requesting the Majordomo service."
             )
         finally:
-            loop.call_later(
-                1,
-                self._clear_reply_later,
-                request_id, 1
-            )
+            t = loop.create_task(self._clear_reply(request_id))
+            self._clear_replies_tasks.append(t)
+            t.add_done_callback(self._clear_replies_tasks.remove)
 
-    async def _majordomo_service(self, service_name: bytes, body: bytes):
-        service_name = Settings.MDP_INTERNAL_SERVICE_PREFIX + service_name
-        return await self._request(service_name, body)
-
-    async def _send_heartbeat(self):
-        body = b"heartbeat"
-        return await self._majordomo_service(
-            b"client_heartbeat", body
+    async def _majordomo_service(
+        self, func_name: str, *args, **kwargs
+    ):
+        body = [msg_pack(func_name)]
+        if args:
+            body.append(msg_pack(args))
+        if kwargs:
+            body.append(msg_pack(kwargs))
+        return await self._request(
+            Settings.MDP_INTERNAL_SERVICE, body
         )
 
-    def _query_service(self, service_name: bytes):
-        loop = self._get_loop()
-        return loop.run_until_complete(
-            self._majordomo_service(b"service", service_name)
+    async def _send_heartbeat(self):
+        return await self._majordomo_service(
+            "client_heartbeat", b"heartbeat"
+        )
+
+    async def _query_service(self, service_name: bytes):
+        return await self._majordomo_service(
+            "query_service", service_name
         )
 
     async def _recv(self):
         loop = self._get_loop()
         heartbeat_at = 1e-3 * self.heartbeat + loop.time()
         try:
+            await self._majordomo_service("get_services")
             while 1:
-                if not self.ready:
-                    break
+                if self.ready is None:
+                    return
                 if loop.time() > heartbeat_at:
                     await self._send_heartbeat()
                     heartbeat_at = 1e-3 * self.heartbeat + loop.time()
@@ -1628,43 +1694,64 @@ class Client(_LoopBoundMixin):
                     continue
                 if client_id != self.identity:
                     continue
-                if service_name == b"gate.client_heartbeat":
+                try:
+                    # logger.debug(
+                    #     f"Reply: \n"
+                    #     f"frame 0: {empty},\n"
+                    #     f"frame 1: {mdp_client_version},\n"
+                    #     f"frame 2: {service_name},\n"
+                    #     f"frame 3: {client_id},\n"
+                    #     f"frame 4: {request_id},\n"
+                    #     f"frame 5+: {body}"
+                    # )
+
+                    if len(body) == 1:
+                        body = msg_unpack(body[0])
+                        if (
+                                service_name := from_bytes(service_name)
+                        ) == Settings.MDP_INTERNAL_SERVICE:
+                            func_name, stat_code, *replies = body["result"]
+                            if func_name == "client_heartbeat":
+                                continue
+                            if func_name == "get_services":
+                                services = replies[0]
+                                self._remote_services = services
+                                if not self.ready.done():
+                                    self.ready.set_result(True)
+                                if request_id not in self.replies:
+                                    continue
+                        self.replies[request_id].set_result(body)
+                    else:
+                        *option, body = body
+                        if option[0] == Settings.STREAM_GENERATOR_TAG:
+                            if not (reply := self.replies[request_id]).done():
+                                stream_reply = StreamReply(
+                                    maxsize=self.stream_reply_maxsize,
+                                    timeout=self.reply_timeout
+                                )
+                                self.replies[request_id].set_result(
+                                    stream_reply
+                                )
+                            else:
+                                stream_reply = reply.result()
+                            if body != Settings.STREAM_END_MESSAGE:
+                                body = msg_unpack(body)
+                            await stream_reply.asend(body)
+                        elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
+                            if not (reply := self.replies[request_id]).done():
+                                huge_reply = HugeData()
+                                self.replies[request_id].set_result(huge_reply)
+                            else:
+                                huge_reply = reply.result()
+                            huge_reply.data.put_nowait(body)
+                except MsgUnpackError:
                     continue
-                logger.debug(
-                    f"Reply: \n"
-                    f"frame 0: {empty},\n"
-                    f"frame 1: {mdp_client_version},\n"
-                    f"frame 2: {service_name},\n"
-                    f"frame 3: {client_id},\n"
-                    f"frame 4: {request_id},\n"
-                    f"frame 5+: {body}"
-                )
-                if len(body) == 1:
-                    body = msg_unpack(body[0])
-                    await self.requests.aset(request_id, body)
-                else:
-                    *option, body = body
-                    if option[0] == Settings.STREAM_GENERATOR_TAG:
-                        stream_reply = self.requests.get(request_id, None)
-                        if not stream_reply:
-                            stream_reply = StreamReply(
-                                maxsize=self.stream_reply_maxsize,
-                                timeout=self.reply_timeout
-                            )
-                            await self.requests.aset(
-                                request_id, stream_reply
-                            )
-                        if body != Settings.STREAM_END_MESSAGE:
-                            body = msg_unpack(body)
-                        await stream_reply.asend(body)
-                    elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
-                        huge_reply = self.requests.get(request_id, None)
-                        if not huge_reply:
-                            huge_reply = HugeData()
-                            await self.requests.aset(
-                                request_id, huge_reply
-                            )
-                        huge_reply.data.put_nowait(body)
+                # except asyncio.TimeoutError:
+                #     logger.error(
+                #         f"The number of pending replies has reached"
+                #         f" the limit."
+                #         f" The limit is {self.replies.maxsize} replies."
+                #     )
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1673,15 +1760,12 @@ class Client(_LoopBoundMixin):
             raise
 
     def __getattr__(self, item):
-        if not self._remote_func:
-            self._remote_service = self.default_service
+        if not self._remote_service:
+            self._remote_service = self._remote_func
         else:
-            if self._remote_service == self.default_service:
-                self._remote_service = self._remote_func
-            else:
-                self._remote_service = ".".join(
-                    (self._remote_service, self._remote_func)
-                )
+            self._remote_service = ".".join(
+                (self._remote_service, self._remote_func)
+            )
         self._remote_func = item
         return self
 
@@ -1689,8 +1773,10 @@ class Client(_LoopBoundMixin):
         """
         返回一个执行rpc调用的协程
         """
-        waiting = self.knock(
-                self._remote_service, self._remote_func, *args, **kwargs
-            )
-        self._remote_service = self._remote_func = None
+        try:
+            waiting = self.knock(
+                    self._remote_service, self._remote_func, *args, **kwargs
+                )
+        finally:
+            self._remote_service = self._remote_func = None
         return waiting
