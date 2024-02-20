@@ -2,6 +2,7 @@
 # Author      : ShiFan
 # Created Date: 2023/12/29 9:12
 import asyncio
+# import uvloop
 import secrets
 import sys
 from logging import getLogger
@@ -22,6 +23,10 @@ while i:
 
 
 class GRWorker(Worker):
+    @interface
+    async def aconcurrency(self, *args, **kwargs):
+        return b""
+
     @interface
     async def atest(self, *args, **kwargs):
         loop = self._get_loop()
@@ -62,7 +67,10 @@ class GRWorker(Worker):
 
 
 async def test():
+    loop = asyncio.get_event_loop()
+    loop.slow_callback_duration = 0.01
     Settings.DEBUG = True
+    # Settings.EVENT_LOOP_POLICY = uvloop.EventLoopPolicy()
     Settings.setup()
     zap = AsyncZAPService()
     zap.configure_plain(
@@ -101,6 +109,10 @@ async def test():
             Settings.ZAP_PLAIN_DEFAULT_PASSWORD
         )
     )
+    await asyncio.sleep(5)
+    logger.info(await gr_cli.GateRPC.get_interfaces())
+    logger.info(gr_cli._remote_services)
+    logger.info(await gr_cli.Gate.query_service("GateRPC"))
     i = 100
     logger.info("start test")
     try:
@@ -123,10 +135,13 @@ async def test():
                 raise RuntimeError
             rw_i += 1
         dd = await gr_cli.test_huge_data()
+        logger.info("=====================================================")
         logger.info(f"length of dd: {len(dd)}")
         logger.info(f"dd is bs: {dd == s}")
+        logger.info("=====================================================")
         logger.info("check heartbeat")
         await asyncio.sleep(5)
+        # await gr_majordomo._broker_task
     except Exception as e:
         logger.info("*****************************************************")
         for line in format_exception(*sys.exc_info()):
@@ -138,19 +153,19 @@ async def test():
             f"the length of worker's requests: {len(gr_worker.requests)}"
         )
         logger.debug(
-            f"the length of client's requests: {len(gr_cli.requests)}"
+            f"the length of client's replies: {len(gr_cli.replies)}"
         )
         await asyncio.sleep(1)
         logger.debug(
             f"the length of worker's requests: {len(gr_worker.requests)}"
         )
         logger.debug(
-            f"the length of client's requests: {len(gr_cli.requests)}"
+            f"the length of client's replies: {len(gr_cli.replies)}"
         )
         gr_cli.close()
         await gr_worker.stop()
         gr_majordomo.stop()
-        # zap.stop()
+        zap.stop()
 
 
 if __name__ == "__main__":

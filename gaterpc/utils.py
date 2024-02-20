@@ -529,7 +529,7 @@ class MessagePack(object):
             setattr(self, item, None)
         super().__delattr__(item)
 
-    def loads(self, data: bytes):
+    def loads(self, data: bytes) -> Any:
         obj = msgpack.unpackb(
             data,
             object_hook=self.unpack_object_hook,
@@ -538,9 +538,17 @@ class MessagePack(object):
         )
         return obj
 
-    def dumps(self, obj):
+    def dumps(self, obj) -> ByteString:
         data = msgpack.packb(obj, default=self.prepare_pack)
         return data
+
+
+class MsgPackError(ValueError):
+    pass
+
+
+class MsgUnpackError(ValueError):
+    pass
 
 
 message_pack = MessagePack()
@@ -553,12 +561,22 @@ def msg_pack(obj: Any) -> ByteString:
         obj = obj.tolist()
     elif isinstance(obj, (DictProxy, ListProxy)):
         obj = obj._getvalue()
-    data = message_pack.dumps(obj)
+    try:
+        data = message_pack.dumps(obj)
+    except Exception as e:
+        raise MsgPackError(f"{obj} pack failed.").with_traceback(
+            e.__traceback__
+        )
     return data
 
 
 def msg_unpack(data: ByteString) -> Any:
-    obj = message_pack.loads(data)
+    try:
+        obj = message_pack.loads(data)
+    except Exception as e:
+        raise MsgUnpackError(f"{data} unpack failed.").with_traceback(
+            e.__traceback__
+        )
     return obj
 
 
@@ -593,10 +611,8 @@ class StreamReply(AsyncGenerator, _LoopBoundMixin):
         return value
 
     async def asend(self, value):
-        print(f"prepare asend {value}")
         if value is not None:
             await self.replies.put(value)
-            print(f"asend {value} success.")
         return
 
     async def athrow(self, __type, value=None, traceback=None):
