@@ -1257,15 +1257,18 @@ class AMajordomo(_LoopBoundMixin):
                 if inspect.iscoroutinefunction(func):
                     stat_code, replies = await func(*args, **kwargs)
                 else:
-                    func = functools.partial(func, *args, **kwargs)
+                    ctx = contextvars.copy_context()
+                    func = functools.partial(
+                        ctx.run, func, *args, **kwargs
+                    )
                     stat_code, replies = await self._get_loop().run_in_executor(
                         self._executor, func
                         )
             except Exception as error:
                 exception = error
-        replies = await generate_reply(
-            result=(func_name, stat_code, replies), exception=exception
-        )
+        if stat_code.startswith(b"1"):
+            return
+        replies = await generate_reply(result=replies, exception=exception)
         reply = [
             client_addr,
             b"",
@@ -1273,6 +1276,8 @@ class AMajordomo(_LoopBoundMixin):
             Settings.MDP_INTERNAL_SERVICE,
             client_id,
             request_id,
+            func_name,
+            stat_code,
             msg_pack(replies)
         ]
         await self.reply_frontend(reply)
@@ -1460,7 +1465,6 @@ class Client(_LoopBoundMixin):
         :param context: zmq 的上下文实例，为空则创建。
         :param heartbeat: 维持连接的心跳消息间隔，默认为 MDP_HEARTBEAT，单位是毫秒。
         :param reply_timeout: 等待回复的超时时间
-        :param msg_max: 保存发送或接收到的消息的最大数量，默认为 MSSAGE_MAX。
         :param zap_mechanism: zap 的验证机制。
         :param zap_credentials: zap 的凭据帧列表，不填则为空列表。
         """
@@ -1705,24 +1709,27 @@ class Client(_LoopBoundMixin):
                     #     f"frame 4: {request_id},\n"
                     #     f"frame 5+: {body}"
                     # )
-
-                    if len(body) == 1:
-                        body = msg_unpack(body[0])
-                        if (
-                                service_name := from_bytes(service_name)
-                        ) == Settings.MDP_INTERNAL_SERVICE:
-                            func_name, stat_code, *replies = body["result"]
-                            if func_name == "client_heartbeat":
+                    if (
+                            service_name := from_bytes(service_name)
+                    ) == Settings.MDP_INTERNAL_SERVICE:
+                        func_name, stat_code, body = body
+                        func_name = from_bytes(func_name)
+                        body = msg_unpack(body)
+                        if func_name == "client_heartbeat":
+                            continue
+                        if func_name == "get_services":
+                            services = body["result"]
+                            self._remote_services = services
+                            if not self.ready.done():
+                                self.ready.set_result(True)
+                            if request_id not in self.replies:
                                 continue
-                            if func_name == "get_services":
-                                services = replies[0]
-                                self._remote_services = services
-                                if not self.ready.done():
-                                    self.ready.set_result(True)
-                                if request_id not in self.replies:
-                                    continue
                         self.replies[request_id].set_result(body)
-                    else:
+
+                    elif len(body) == 1:
+                        body = msg_unpack(body[0])
+                        self.replies[request_id].set_result(body)
+                    elif len(body) > 1:
                         *option, body = body
                         if option[0] == Settings.STREAM_GENERATOR_TAG:
                             if not (reply := self.replies[request_id]).done():
