@@ -929,18 +929,19 @@ class HugeData(object):
 
 
 def interface(methode):
+    if inspect.iscoroutinefunction(methode):
+        @wraps(methode)
+        async def awrapper(*args, **kwargs):
+            return await methode(*args, **kwargs)
+
+        awrapper.__interface__ = True
+        return awrapper
+
     @wraps(methode)
     def wrapper(*args, **kwargs):
         return methode(*args, **kwargs)
 
-    @wraps(methode)
-    async def awrapper(*args, **kwargs):
-        return await methode(*args, **kwargs)
-
     wrapper.__interface__ = True
-    awrapper.__interface__ = True
-    if inspect.iscoroutinefunction(methode):
-        return awrapper
     return wrapper
 
 

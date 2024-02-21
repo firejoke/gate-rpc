@@ -69,8 +69,8 @@ class ABCWorker(ABC):
     identity: bytes
     service: "ABCService"
     address: Union[str, bytes]
-    heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
-    heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL
+    heartbeat_liveness: int
+    heartbeat: int
     expiry: float
     max_allowed_request_queue: int = 0
 
@@ -122,10 +122,14 @@ class RemoteWorker(ABCWorker):
         :param heartbeat: 和远程 worker 的心跳间隔
         :param service: 该 worker 提供的服务的名字
         """
+        self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
         self.identity = identity
         self.ready = False
         self.service = service
-        self.heartbeat = heartbeat
+        if heartbeat:
+            self.heartbeat = heartbeat
+        else:
+            self.heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
         self.expiry = 1e-3 * self.heartbeat_liveness * self.heartbeat + time()
         self.address = address
         self.destroy_task: Optional[asyncio.Task] = None
@@ -146,7 +150,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
         broker_addr: str,
         service: "Service",
         identity: str = None,
-        heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
+        heartbeat: int = None,
         context: Context = None,
         zap_mechanism: str = None,
         zap_credentials: tuple = None,
@@ -184,7 +188,11 @@ class Worker(ABCWorker, _LoopBoundMixin):
             self._ctx = context
         self._socket = None
         self._poller = z_aio.Poller()
-        self.heartbeat = heartbeat
+        if heartbeat:
+            self.heartbeat = heartbeat
+        else:
+            self.heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
+        self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
         self.expiry = self.heartbeat_liveness * self.heartbeat
 
         self.requests = deque()
@@ -266,7 +274,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self.thread_executor.shutdown()
         self.process_executor.shutdown()
 
-    async def stop(self):
+    def stop(self):
         if self.is_alive():
             if not self._recv_task.cancelled():
                 self._recv_task.cancel()
@@ -566,8 +574,12 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
     zap_socket: Optional[z_aio.Socket]
     encoding = "utf-8"
 
-    def __init__(self, addr: str = Settings.ZAP_ADDR):
-        super().__init__(context=Context(), log=getLogger("gaterpc.zap"))
+    def __init__(self, addr: str = None, context=None):
+        if not context:
+            context = Context()
+        super().__init__(context=context, log=getLogger("gaterpc.zap"))
+        if not addr:
+            addr = Settings.ZAP_ADDR
         self.addr = addr
         self.zap_socket = self.context.socket(z_const.ROUTER, z_aio.Socket)
         # self.zap_socket.linger = 1
@@ -780,16 +792,14 @@ class AMajordomo(_LoopBoundMixin):
     多偏好服务集群，连接多个提供不同服务的 Service（远程的 Service 也可能是一个代理，进行负载均衡）
     """
 
-    ctx = Context()
+    ctx: Context
 
     def __init__(
         self,
         *,
+        context: Context = None,
         backend_addr: str = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
-        zap_mechanism: str = None,
-        zap_addr: str = None,
-        zap_domain: str = Settings.ZAP_DEFAULT_DOMAIN
     ):
         """
         :param backend_addr: 要绑定后端服务的地址，为空则使用默认的本地服务地址。
@@ -798,6 +808,9 @@ class AMajordomo(_LoopBoundMixin):
         :param zap_addr: zap 身份验证服务的地址。
         :param zap_domain: 需要告诉 zap 服务在哪个域验证。
         """
+        if not context:
+            context = Context()
+        self.ctx = context
         # frontend backend
         self.frontend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         self.frontend.set_hwm(Settings.ZMQ_HWM)
@@ -833,24 +846,9 @@ class AMajordomo(_LoopBoundMixin):
         self.zap_mechanism: str = ""
         self.zap_socket: Union[z_aio.Socket, None] = None
         # TODO: ZAP domain
-        self.zap_domain = zap_domain.encode("utf-8")
+        self.zap_domain: bytes = b""
         self.zap_replies: dict[bytes, asyncio.Future] = dict()
         self.zap_tasks = deque()
-        if zap_mechanism:
-            self.zap_mechanism = zap_mechanism.encode("utf-8")
-            if not zap_addr:
-                zap_addr = Settings.ZAP_ADDR
-            if zap_addr := check_socket_addr(zap_addr):
-                self.zap_socket = self.ctx.socket(z_const.DEALER, z_aio.Socket)
-                self.zap_socket.set_hwm(Settings.ZMQ_HWM)
-                logger.debug(f"Connecting to zap at {zap_addr}")
-                self.zap_socket.connect(zap_addr)
-                self.zap_request_id = 1
-            else:
-                raise ValueError(
-                    "The ZAP mechanism is specified and "
-                    "the ZAP server address must also be provided."
-                )
         self.register_internal_process()
 
     def bind(self, addr: str) -> None:
@@ -861,6 +859,25 @@ class AMajordomo(_LoopBoundMixin):
             z_const.IDENTITY, f"gm-frontend-{addr}".encode("utf-8")
         )
         self.frontend.bind(check_socket_addr(addr))
+
+    def connect_zap(
+        self,
+        zap_mechanism: str,
+        zap_addr: str = Settings.ZAP_ADDR,
+        zap_domain: str = Settings.ZAP_DEFAULT_DOMAIN
+    ):
+        self.zap_mechanism = zap_mechanism.encode("utf-8")
+        self.zap_domain = zap_domain.encode("utf-8")
+        if zap_addr := check_socket_addr(zap_addr):
+            self.zap_socket = self.ctx.socket(z_const.DEALER, z_aio.Socket)
+            self.zap_socket.set_hwm(Settings.ZMQ_HWM)
+            logger.debug(f"Connecting to zap at {zap_addr}")
+            self.zap_socket.connect(zap_addr)
+        else:
+            raise ValueError(
+                "The ZAP mechanism is specified and "
+                "the ZAP server address must also be provided."
+            )
 
     def close(self):
         self.frontend.close()
@@ -993,15 +1010,23 @@ class AMajordomo(_LoopBoundMixin):
         except ValueError:
             logger.debug("ZAP replies frame invalid.")
             return
-        self.zap_replies[user_id + b"-" + request_id].set_result(
-            {
-                "user_id": user_id,
-                "request_id": request_id,
-                "metadata": metadata,
-                "status_code": status_code,
-                "status_text": status_text,
-            }
-        )
+        key = user_id + b"-" + request_id
+        future = self.zap_replies[key]
+        try:
+            future.set_result(
+                {
+                    "user_id": user_id,
+                    "request_id": request_id,
+                    "metadata": metadata,
+                    "status_code": status_code,
+                    "status_text": status_text,
+                }
+            )
+        except asyncio.InvalidStateError as e:
+            logger.error(
+                f"zap_replies({key}) set result failed: {e}, "
+                f"done: {future.done()}, cancelled: {future.cancelled()}"
+            )
 
     def release_frontend_task(self, task: asyncio.Task):
         self.frontend_tasks.remove(task)
@@ -1449,7 +1474,7 @@ class Client(_LoopBoundMixin):
 
     def __init__(
         self,
-        broker_addr: str,
+        broker_addr: str = None,
         identity: str = None,
         context: Context = None,
         heartbeat: int = Settings.MDP_HEARTBEAT_INTERVAL,
@@ -1472,7 +1497,7 @@ class Client(_LoopBoundMixin):
             identity = uuid4().hex
         self.identity = f"gc-{identity}".encode("utf-8")
         self.ready: Optional[asyncio.Future] = None
-        self._broker_addr = check_socket_addr(broker_addr)
+        self._broker_addr = broker_addr
         zap_mechanism, zap_credentials = check_zap_args(
             zap_mechanism, zap_credentials
         )
@@ -1502,10 +1527,13 @@ class Client(_LoopBoundMixin):
         self._remote_services: list[str] = []
         self._remote_service = self._remote_func = None
 
-        self.connect()
-
-    def connect(self):
+    def connect(self, broker_addr=None):
+        if self.ready is not None:
+            raise RuntimeError("Broker is connected.")
         if self.ready is None:
+            if broker_addr:
+                self._broker_addr = broker_addr
+            self._broker_addr = check_socket_addr(self._broker_addr)
             loop = self._get_loop()
             logger.info(
                 f"Client is attempting to connet to the broker at "
