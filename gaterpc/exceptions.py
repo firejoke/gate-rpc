@@ -17,11 +17,17 @@ class BuysWorkersError(Exception):
 
 
 class RemoteException(Exception):
-    def __init__(self, except_class, except_value, except_traceback: list):
-        message = (f"\n"
-                   f"  RemoteTraceback ({except_class}):\n"
-                   f"  {except_value}\n"
-                   f"  {except_traceback}")
+    def __init__(self, except_info):
+        if isinstance(except_info, str):
+            message = except_info
+        elif isinstance(except_info, (tuple, list)):
+            except_class, except_value, except_traceback = except_info
+            message = (f"\n"
+                       f"  RemoteTraceback ({except_class}):\n"
+                       f"  {except_value}\n"
+                       f"  {except_traceback}")
+        else:
+            raise TypeError("except_info must be str or tuple.")
         super().__init__(message)
 
 

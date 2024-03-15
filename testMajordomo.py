@@ -3,10 +3,13 @@
 # Created Date: 2023/12/29 9:12
 import asyncio
 import concurrent.futures
+import hashlib
 # import uvloop
 import secrets
 import sys
+from copy import copy
 from logging import getLogger
+from random import randint
 from threading import Thread
 from time import time
 from traceback import format_exception
@@ -25,6 +28,8 @@ i = 10000
 while i:
     s += secrets.token_hex()
     i -= 1
+
+s_256 = hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 class GRWorker(Worker):
@@ -68,6 +73,7 @@ class GRWorker(Worker):
 
     @interface
     def test_huge_data(self):
+        logger.info(f"s sha256: {s_256}")
         return s
 
 
@@ -92,80 +98,21 @@ def start_zap(ctx):
     loop.run_until_complete(zap_server(ctx))
 
 
-async def client():
-    gr_cli = Client(
-        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
-        zap_credentials=(
-            Settings.ZAP_PLAIN_DEFAULT_USER,
-            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
-        )
-    )
-
-    gr_cli.connect("tcp://127.0.0.1:777")
-    await asyncio.sleep(5)
-    logger.info(await gr_cli.GateRPC.get_interfaces())
-    logger.info(gr_cli._remote_services)
-    logger.info(await gr_cli.Gate.query_service("GateRPC"))
-    i = 100
-    try:
-        while i:
-            result = await gr_cli.test("a", "b", "c", time=time())
-            logger.info("=====================================================")
-            logger.info(f"result of test: {result}")
-            logger.info("=====================================================")
-            result = await gr_cli.atest("d", "e", "f", time=time())
-            logger.info("=====================================================")
-            logger.info(f"result of atest: {result}")
-            logger.info("=====================================================")
-            i -= 1
-        rw_i = 0
-        async for i in await gr_cli.test_agenerator(10):
-            logger.info("=====================================================")
-            logger.info(f"get i for agen: {i}")
-            logger.info("=====================================================")
-            if i != rw_i:
-                raise RuntimeError
-            rw_i += 1
-        dd = await gr_cli.test_huge_data()
-        logger.info("=====================================================")
-        logger.info(f"length of dd: {len(dd)}")
-        logger.info(f"dd is bs: {dd == s}")
-        logger.info("=====================================================")
-        logger.info("check heartbeat")
-        await asyncio.sleep(5)
-        # await gr_majordomo._broker_task
-    except Exception as e:
-        logger.info("*****************************************************")
-        for line in format_exception(*sys.exc_info()):
-            logger.error(line)
-        logger.info("*****************************************************")
-        raise e
-    finally:
-        logger.info(
-            f"the length of client's replies: {len(gr_cli.replies)}"
-        )
-        logger.info(
-            f"the length of client's replies: {len(gr_cli.replies)}"
-        )
-        gr_cli.close()
-
-
-def start_client():
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(client())
-
-
-async def test():
+async def test(frontend=None, backend=None, bind_gate=None, connect_gate=None):
     loop = asyncio.get_event_loop()
     # loop.slow_callback_duration = 0.01
     Settings.DEBUG = True
-    Settings.ZAP_ADDR = "inproc://zeromq.zap.01"
+    Settings.WORKER_ADDR = backend
+    Settings.ZAP_ADDR = f"{backend}.zap"
     Settings.ZAP_REPLY_TIMEOUT = 10.0
     # Settings.EVENT_LOOP_POLICY = uvloop.EventLoopPolicy()
     Settings.setup()
     ctx = Context()
     # zap_thread = Thread(target=start_zap, args=(ctx,))
-    zap = AsyncZAPService(context=ctx)
+    zipc = Settings.ZAP_ADDR
+    # zipc = f"ipc://{zipc.as_posix()}"
+    logger.info(f"zap ipc addr: {zipc}")
+    zap = AsyncZAPService(addr=zipc)
     zap.configure_plain(
         Settings.ZAP_DEFAULT_DOMAIN,
         {
@@ -173,15 +120,25 @@ async def test():
         }
     )
 
-    gr_majordomo = AMajordomo(context=ctx)
-    gr_majordomo.bind("tcp://127.0.0.1:777")
+    gr_majordomo = AMajordomo(
+        context=ctx,
+        gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
+        gate_zap_credentials=(
+            Settings.ZAP_PLAIN_DEFAULT_USER,
+            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        )
+    )
+    gr_majordomo.bind_backend()
+    gr_majordomo.bind_frontend(frontend)
+    if bind_gate:
+        gr_majordomo.bind_gate(bind_gate)
     await asyncio.sleep(5)
     logger.info("start test")
     gr = Service()
     gr_worker = gr.create_worker(
         GRWorker,
         context=ctx,
-        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
+        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
         zap_credentials=(
             Settings.ZAP_PLAIN_DEFAULT_USER,
             Settings.ZAP_PLAIN_DEFAULT_PASSWORD
@@ -193,15 +150,20 @@ async def test():
     logger.info(gr_worker.interfaces)
     try:
         zap.start()
-        gr_majordomo.connect_zap(
-            zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
-            zap_addr=Settings.ZAP_ADDR
-        )
+        await gr_majordomo.connect_zap(zap_addr=zipc)
         gr_majordomo.run()
+        gr_worker._reconnect = True
         gr_worker.run()
-        await asyncio.sleep(3)
-        await client()
-        # await asyncio.sleep(120)
+        await asyncio.sleep(2)
+        if connect_gate:
+            try:
+                await gr_majordomo.connect_gate(connect_gate)
+            except Exception as e:
+                logger.error(e)
+                raise e
+        await asyncio.sleep(5)
+        # gr_worker._recv_task.cancel()
+        await gr_majordomo._broker_task
     finally:
         logger.info(
             f"the length of worker's requests: {len(gr_worker.requests)}"
@@ -212,10 +174,21 @@ async def test():
         )
         gr_worker.stop()
         gr_majordomo.stop()
+        logger.info(f"request_zap.cache_info: {gr_majordomo.zap_cache}")
         zap.stop()
 
 
 if __name__ == "__main__":
     # client_thread = Thread(target=start_client)
     # client_thread.start()
-    asyncio.run(test(), debug=True)
+    argv = sys.argv[1:]
+    if not argv:
+        argv = ["ipc:///tmp/gate-rpc/run/c1", Settings.WORKER_ADDR, None, None]
+    if len(argv) == 1:
+        argv.extend([Settings.WORKER_ADDR, None, None])
+    elif len(argv) == 2:
+        argv.extend([None, None])
+    elif len(argv) == 3:
+        argv.append(None)
+    print(argv)
+    asyncio.run(test(*argv), debug=True)

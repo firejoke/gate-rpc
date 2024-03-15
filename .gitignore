@@ -134,3 +134,6 @@ dmypy.json
 /testIncremental.py
 /testMultipartRouteSocket.py
 /门（gate）rpc.xmind
+/testACache.py
+/testREQSocket.py
+/testStreamAG.py

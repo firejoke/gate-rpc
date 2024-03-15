@@ -5,42 +5,42 @@ import asyncio
 import atexit
 import bz2
 import copy
-import functools
 import inspect
 import io
 import logging
 import lzma
+import operator
 import platform
 import queue
 import struct
-import sys
 import threading
 import time
 import warnings
+
+import math
 import zlib
 
 from asyncio import Future, Task
-from collections import UserDict, deque
-from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from functools import wraps
+from collections import UserDict, deque, namedtuple
+from collections.abc import AsyncGenerator, Callable, Generator
+from concurrent.futures import ProcessPoolExecutor
+from functools import _make_key, partial, update_wrapper, wraps, lru_cache
 from importlib import import_module
-from logging import Handler, getLogger
+from logging import Handler
 from multiprocessing import Manager
 from multiprocessing.managers import (
     ArrayProxy, DictProxy, ListProxy, ValueProxy,
 )
 from multiprocessing.shared_memory import SharedMemory
-from traceback import format_exception, format_tb
+from traceback import format_tb
 from typing import (
-    Any, Dict, Iterable, MutableMapping, Optional, TypeVar,
+    Any, Iterable, MutableMapping, Optional, TypeVar,
     Union, overload, ByteString,
 )
 
 import msgpack
 
 from .exceptions import BadGzip, DictFull, RemoteException
-from .global_settings import Settings
 from .mixins import _LoopBoundMixin
 
 
@@ -76,8 +76,741 @@ def resolve_module_attr(s: str):
         raise v from e
 
 
+def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
+    if socket_addr is None:
+        return socket_addr
+    system = platform.system().lower()
+    proto = socket_addr.split("://")[0]
+    if proto == "ipc" and system == "windows":
+        raise SystemError("ipc protocol does not work on Windows.")
+    if proto not in ("inproc", "ipc", "tcp", "pgm", "epgm"):
+        raise SystemError(f"The protocol \"{proto}\" is not supported.")
+    return socket_addr
+
+
+def to_bytes(s: Union[str, bytes, float, int]):
+    if isinstance(s, bytes):
+        return s
+    if isinstance(s, str):
+        return s.encode("utf-8")
+    fmt = "!d"
+    if isinstance(s, int):
+        if -128 <= s <= 127:
+            fmt = "!b"
+        elif -32768 <= s <= 32767:
+            fmt = "!h"
+        elif -2147483648 <= s <= 2147483647:
+            fmt = "!i"
+    return struct.pack(fmt, s)
+
+
+def from_bytes(b: bytes) -> Union[str, float, int]:
+    fmt = {
+        1: "!b",
+        2: "!h",
+        4: "!i",
+        8: "!d"
+    }
+    if b_len := len(b) in fmt:
+        try:
+            return struct.unpack(fmt[b_len], b)[0]
+        except struct.error:
+            pass
+    return b.decode("utf-8")
+
+
+def encrypt(data):
+    # 在进程池执行器中执行
+    hash_str = data
+    return hash_str
+
+
+def decrypt(hash_str):
+    # 在进程池执行器中执行
+    data = hash_str
+    return data
+
+
+async def generator_to_agenerator(generator: Generator) -> AsyncGenerator:
+    for element in generator:
+        yield element
+
+
+async def throw_exception_agenerator(ag: AsyncGenerator, exc: BaseException):
+    try:
+        await ag.athrow(exc)
+    except StopAsyncIteration:
+        pass
+
+
 class Temp:
-    pass
+
+    def __bool__(self):
+        return False
+
+
+_CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+
+
+class LRUCache(object):
+    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self.hits = self.misses = 0
+        self.full = False
+        self.root = []
+        self.root[:] = [self.root, self.root, None, None]
+        self.cache = {}
+
+    def __contains__(self, item):
+        if item in self.cache:
+            self.hits += 1
+            return True
+        self.misses += 1
+        return False
+
+    def __setitem__(self, key, value):
+        if key in self.cache:
+            return
+        if self.full:
+            # Use the old root to store the new key and result.
+            oldroot = self.root
+            oldroot[self.KEY] = key
+            oldroot[self.RESULT] = value
+            # Empty the oldest link and make it the new root.
+            # Keep a reference to the old key and old result to
+            # prevent their ref counts from going to zero during the
+            # update. That will prevent potentially arbitrary object
+            # clean-up code (i.e. __del__) from running while we're
+            # still adjusting the links.
+            self.root = oldroot[self.NEXT]
+            oldkey = self.root[self.KEY]
+            oldresult = self.root[self.RESULT]
+            self.root[self.KEY] = self.root[self.RESULT] = None
+            # Now update the cache dictionary.
+            del self.cache[oldkey]
+            # Save the potentially reentrant cache[key] assignment
+            # for last, after the root and links have been put in
+            # a consistent state.
+            self.cache[key] = oldroot
+        else:
+            # Put result in a new link at the front of the queue.
+            last = self.root[self.PREV]
+            link = [last, self.root, key, value]
+            last[self.NEXT] = self.root[self.PREV] = self.cache[key] = link
+            # Use the cache_len bound method instead of the len() function
+            # which could potentially be wrapped in an lru_cache itself.
+            self.full = len(self.cache) >= self.maxsize
+
+    def __getitem__(self, item):
+        if (link := self.cache.get(item, None)) is not None:
+            link_prev, link_next, _key, result = link
+            link_prev[self.NEXT] = link_next
+            link_next[self.PREV] = link_prev
+            last = self.root[self.PREV]
+            last[self.NEXT] = self.root[self.PREV] = link
+            link[self.PREV] = last
+            link[self.NEXT] = self.root
+            self.hits += 1
+            return result
+        self.misses += 1
+        raise KeyError
+
+    def __repr__(self):
+        return (f"hits: {self.hits}, misses: {self.misses},"
+                f" maxsize: {self.maxsize}, cache size: {len(self.cache)}")
+
+
+def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
+    loop = asyncio.get_event_loop()
+    # Constants shared by all lru cache instances:
+    sentinel = object()          # unique object used to signal cache misses
+    make_key = _make_key         # build a key from the function arguments
+    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3   # names for the link fields
+
+    cache = {}
+    hits = misses = 0
+    full = False
+    cache_get = cache.get    # bound method to lookup a key or return None
+    cache_len = cache.__len__  # get cache size without calling len()
+    lock = threading.RLock()           # because linkedlist updates aren't threadsafe
+    root = []                # root of the circular doubly linked list
+    root[:] = [root, root, None, None]     # initialize by pointing to self
+
+    if maxsize == 0:
+
+        async def wrapper(*args, **kwds):
+            # No caching -- just a statistics update
+            nonlocal misses
+            misses += 1
+            result = await user_function(*args, **kwds)
+            return result
+
+    elif maxsize is None:
+
+        async def wrapper(*args, **kwds):
+            # Simple caching without ordering or size limit
+            nonlocal hits, misses
+            key = make_key(args, kwds, typed)
+            result = cache_get(key, sentinel)
+            if result is not sentinel:
+                hits += 1
+                return await result
+            cache[key] = f = loop.create_future()
+            misses += 1
+            result = await user_function(*args, **kwds)
+            f.set_result(result)
+            return result
+
+    else:
+
+        async def wrapper(*args, **kwds):
+            # Size limited caching that tracks accesses by recency
+            nonlocal root, hits, misses, full
+            key = make_key(args, kwds, typed)
+            with lock:
+                link = cache_get(key)
+                if link is not None:
+                    # Move the link to the front of the circular queue
+                    link_prev, link_next, _key, result = link
+                    link_prev[NEXT] = link_next
+                    link_next[PREV] = link_prev
+                    last = root[PREV]
+                    last[NEXT] = root[PREV] = link
+                    link[PREV] = last
+                    link[NEXT] = root
+                    hits += 1
+                    return result
+                misses += 1
+            f = loop.create_future()
+            with lock:
+                if key in cache:
+                    # Getting here means that this same key was added to the
+                    # cache while the lock was released.  Since the link
+                    # update is already done, we need only return the
+                    # computed result and update the count of misses.
+                    pass
+                elif full:
+                    # Use the old root to store the new key and result.
+                    oldroot = root
+                    oldroot[KEY] = key
+                    oldroot[RESULT] = f
+                    # Empty the oldest link and make it the new root.
+                    # Keep a reference to the old key and old result to
+                    # prevent their ref counts from going to zero during the
+                    # update. That will prevent potentially arbitrary object
+                    # clean-up code (i.e. __del__) from running while we're
+                    # still adjusting the links.
+                    root = oldroot[NEXT]
+                    oldkey = root[KEY]
+                    oldresult = root[RESULT]
+                    root[KEY] = root[RESULT] = None
+                    # Now update the cache dictionary.
+                    del cache[oldkey]
+                    # Save the potentially reentrant cache[key] assignment
+                    # for last, after the root and links have been put in
+                    # a consistent state.
+                    cache[key] = oldroot
+                else:
+                    # Put result in a new link at the front of the queue.
+                    last = root[PREV]
+                    link = [last, root, key, f]
+                    last[NEXT] = root[PREV] = cache[key] = link
+                    # Use the cache_len bound method instead of the len() function
+                    # which could potentially be wrapped in an lru_cache itself.
+                    full = (cache_len() >= maxsize)
+
+            f.set_result(await user_function(*args, **kwds))
+            return await f
+
+    def cache_info():
+        """Report cache statistics"""
+        with lock:
+            return _CacheInfo(hits, misses, maxsize, cache_len())
+
+    def cache_clear():
+        """Clear the cache and cache statistics"""
+        nonlocal hits, misses, full
+        with lock:
+            cache.clear()
+            root[:] = [root, root, None, None]
+            hits = misses = 0
+            full = False
+
+    wrapper.cache_info = cache_info
+    wrapper.cache_clear = cache_clear
+    return wrapper
+
+
+def coroutine_lru_cache(maxsize=128, typed=False):
+    if isinstance(maxsize, int):
+        # Negative maxsize is treated as 0
+        if maxsize < 0:
+            maxsize = 0
+    elif asyncio.iscoroutinefunction(maxsize) and isinstance(typed, bool):
+        # The user_function was passed in directly via the maxsize argument
+        user_function, maxsize = maxsize, 128
+        wrapper = _coroutine_lru_cache_wrapper(
+            user_function, maxsize, typed, _CacheInfo
+        )
+        wrapper.cache_parameters = lambda: {'maxsize': maxsize, 'typed': typed}
+        return update_wrapper(wrapper, user_function)
+    elif maxsize is not None:
+        raise TypeError(
+            'Expected first argument to be an integer, a callable, or None'
+        )
+
+    def decorating_function(user_function):
+        wrapper = _coroutine_lru_cache_wrapper(
+            user_function, maxsize, typed, _CacheInfo
+        )
+        wrapper.cache_parameters = lambda: {'maxsize': maxsize, 'typed': typed}
+        return update_wrapper(wrapper, user_function)
+
+    return decorating_function
+
+
+class _LazyProperty:
+    def __init__(self, _property, ins: Any = None):
+        """
+        延时计算的属性
+        """
+        self._property = _property
+        self._ins = ins
+
+    def __call__(self, ins: Any = None):
+        if not ins:
+            ins = self._ins
+        if not ins:
+            raise RuntimeError
+        if callable(self._property):
+            return self._property(ins)
+        return getattr(ins, self._property)
+
+    def __add__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.add(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.add(self(ins), other),
+            self._ins
+        )
+
+    def __radd__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.add(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.add(other, self(ins)),
+            self._ins
+        )
+
+    def __sub__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.sub(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.sub(self(ins), other),
+            self._ins
+        )
+
+    def __rsub__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.sub(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.sub(other, self(ins)),
+            self._ins
+        )
+
+    def __mul__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.mul(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.mul(self(ins), other),
+            self._ins
+        )
+
+    def __rmul__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.mul(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.mul(other, self(ins)),
+            self._ins
+        )
+
+    def __matmul__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.matmul(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.matmul(self(ins), other),
+            self._ins
+        )
+
+    def __rmatmul__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.matmul(other(ins), self(ins)),
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.matmul(other, self(ins)),
+            self._ins
+        )
+
+    def __truediv__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.truediv(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.truediv(self(ins), other),
+            self._ins
+        )
+
+    def __rtruediv__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.truediv(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.truediv(other, self(ins)),
+            self._ins
+        )
+
+    def __floordiv__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.floordiv(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.floordiv(self(ins), other),
+            self._ins
+        )
+
+    def __rfloordiv__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.floordiv(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.floordiv(other, self(ins)),
+            self._ins
+        )
+
+    def __mod__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.mod(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.mod(self(ins), other),
+            self._ins
+        )
+
+    def __rmod__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.mod(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.mod(other, self(ins)),
+            self._ins
+        )
+
+    def __divmod__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: divmod(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: divmod(self(ins), other),
+            self._ins
+        )
+
+    def __rdivmod__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: divmod(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: divmod(other, self(ins)),
+            self._ins
+        )
+
+    def __pow__(self, other, modulo=None):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: pow(self(ins), other(ins), modulo),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: pow(self(ins), other, modulo),
+            self._ins
+        )
+
+    def __rpow__(self, other, modulo=None):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: pow(other(ins), self(ins), modulo),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: pow(other, self(ins), modulo),
+            self._ins
+        )
+
+    def __lshift__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.lshift(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.lshift(self(ins), other),
+        )
+
+    def __rlshift__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.lshift(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.lshift(other, self(ins)),
+        )
+
+    def __rshift__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.rshift(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.rshift(self(ins), other),
+            self._ins
+        )
+
+    def __rrshift__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.rshift(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.rshift(other, self(ins)),
+            self._ins
+        )
+
+    def __and__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.and_(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.and_(self(ins), other),
+            self._ins
+        )
+
+    def __rand__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.and_(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.and_(other, self(ins)),
+            self._ins
+        )
+
+    def __xor__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.xor(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.xor(self(ins), other),
+            self._ins
+        )
+
+    def __rxor__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.xor(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.xor(other, self(ins)),
+            self._ins
+        )
+
+    def __or__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.or_(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.or_(self(ins), other),
+            self._ins
+        )
+
+    def __ror__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.or_(other(ins), self(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.or_(other, self(ins)),
+            self._ins
+        )
+
+    def __lt__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.lt(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.lt(self(ins), other),
+            self._ins
+        )
+
+    def __le__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.le(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.le(self(ins), other),
+            self._ins
+        )
+
+    def __eq__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.eq(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.eq(self(ins), other),
+            self._ins
+        )
+
+    def __ne__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.ne(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.ne(self(ins), other),
+            self._ins
+        )
+
+    def __ge__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.ge(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.ge(self(ins), other),
+            self._ins
+        )
+
+    def __gt__(self, other):
+        if isinstance(other, _LazyProperty):
+            return _LazyProperty(
+                lambda ins=None: operator.gt(self(ins), other(ins)),
+                self._ins
+            )
+        return _LazyProperty(
+            lambda ins=None: operator.gt(self(ins), other),
+            self._ins
+        )
+
+    def __neg__(self):
+        return _LazyProperty(
+            lambda ins=None: operator.neg(self(ins)),
+            self._ins
+        )
+
+    def __pos__(self):
+        return _LazyProperty(
+            lambda ins=None: operator.pos(self(ins)),
+            self._ins
+        )
+
+    def __abs__(self):
+        return _LazyProperty(
+            lambda ins=None: operator.abs(self(ins)),
+            self._ins
+        )
+
+    def __invert__(self):
+        return _LazyProperty(
+            lambda ins=None: operator.invert(self(ins)),
+            self._ins
+        )
+
+    def __int__(self):
+        return int(self())
+
+    def __float__(self):
+        return float(self())
+
+    def __floor__(self):
+        return _LazyProperty(
+            lambda ins=None: math.floor(self(ins)),
+            self._ins
+        )
+
+    def __ceil__(self):
+        return _LazyProperty(
+            lambda ins=None: math.ceil(self(ins)),
+            self._ins
+        )
+
+    def __trunc__(self):
+        return _LazyProperty(
+            lambda ins=None: math.trunc(self(ins)),
+            self._ins
+        )
+
+    def __str__(self):
+        return (
+            f"Lazy retrieval of the value for instance \"{self._property}\"."
+        )
 
 
 class BoundedDict(UserDict, _LoopBoundMixin):
@@ -444,61 +1177,6 @@ class AQueueHandler(QueueHandler):
 singleton_aqueue_listener = singleton(AQueueListener)
 
 
-def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
-    if socket_addr is None:
-        return socket_addr
-    system = platform.system().lower()
-    proto = socket_addr.split("://")[0]
-    if proto == "ipc" and system == "windows":
-        raise SystemError("ipc protocol does not work on Windows.")
-    if proto not in ("inproc", "ipc", "tcp", "pgm", "epgm"):
-        raise SystemError(f"The protocol \"{proto}\" is not supported.")
-    return socket_addr
-
-
-def to_bytes(s: Union[str, bytes, float, int]):
-    if isinstance(s, bytes):
-        return s
-    if isinstance(s, str):
-        return s.encode("utf-8")
-    fmt = "!d"
-    if isinstance(s, int):
-        if -128 <= s <= 127:
-            fmt = "!b"
-        elif -32768 <= s <= 32767:
-            fmt = "!h"
-        elif -2147483648 <= s <= 2147483647:
-            fmt = "!i"
-    return struct.pack(fmt, s)
-
-
-def from_bytes(b: bytes) -> Union[str, float, int]:
-    fmt = {
-        1: "!b",
-        2: "!h",
-        4: "!i",
-        8: "!d"
-    }
-    if b_len := len(b) in fmt:
-        try:
-            return struct.unpack(fmt[b_len], b)[0]
-        except struct.error:
-            pass
-    return b.decode("utf-8")
-
-
-def encrypt(data):
-    # 在进程池执行器中执行
-    hash_str = data
-    return hash_str
-
-
-def decrypt(hash_str):
-    # 在进程池执行器中执行
-    data = hash_str
-    return data
-
-
 class MessagePack(object):
     """
     用于配置全局的msgpack
@@ -581,8 +1259,9 @@ def msg_unpack(data: ByteString) -> Any:
 
 
 class StreamReply(AsyncGenerator, _LoopBoundMixin):
-    def __init__(self, maxsize=0, timeout=0):
+    def __init__(self, end_message, maxsize=0, timeout=0):
         loop = self._get_loop()
+        self.end_message = end_message
         self.replies = asyncio.Queue(maxsize, loop=loop)
         self.timeout = timeout
         self._exit = False
@@ -601,7 +1280,7 @@ class StreamReply(AsyncGenerator, _LoopBoundMixin):
         else:
             value = self.replies.get_nowait()
         self.replies.task_done()
-        if value == Settings.STREAM_END_MESSAGE:
+        if value == self.end_message:
             await asyncio.sleep(0.1)
             self._exit = True
             raise StopAsyncIteration
@@ -623,10 +1302,8 @@ class StreamReply(AsyncGenerator, _LoopBoundMixin):
             await self.replies.put(value)
         else:
             if value:
-                value = __type(value)
-            else:
-                value = __type()
-            await self.replies.put(__type(value))
+                __type = __type(value)
+            await self.replies.put(__type)
 
     async def aclose(self):
         if not self._exit:
@@ -758,25 +1435,32 @@ class GzipDecompressor(object):
 
 
 class HugeData(object):
-    end_tag = b"HugeDataEND"
-    except_tag = b"HugeDataException"
 
     def __init__(
-        self, *,
+        self,
+        end_tag,
+        except_tag,
+        *,
         data: Optional[bytes] = None,
         get_timeout: int = 0,
-        compress_module: str = Settings.HUGE_DATA_COMPRESS_MODULE,
-        compress_level: int = Settings.HUGE_DATA_COMPRESS_LEVEL
+        compress_module: str = "gzip",
+        compress_level: int = 9,
+        frame_size_limit: int = 1000
     ):
+        self.end_tag = end_tag
+        self.except_tag = except_tag
+        self.exception: Optional[tuple[str, str, list]] = None
+        self.data: Union[SharedMemory, queue.Queue]
         if data:
-            self.data: SharedMemory = SharedMemory(create=True, size=len(data))
+            self.data = SharedMemory(create=True, size=len(data))
             self.data.buf[:len(data)] = data
         else:
-            self.data: queue.Queue = SyncManager.Queue()
+            self.data = SyncManager.Queue()
         self.get_timeout = get_timeout
         self._queue: queue.Queue = SyncManager.Queue()
         self.compress_module = compress_module
         self.compress_level = compress_level
+        self.frame_size_limit = frame_size_limit
 
         atexit.register(self.destroy)
 
@@ -832,28 +1516,28 @@ class HugeData(object):
                         buffer += data
                 elif buffer:
                     data, buffer = (
-                        buffer[:Settings.HUGE_DATA_SIZEOF],
-                        buffer[Settings.HUGE_DATA_SIZEOF:]
+                        buffer[:self.frame_size_limit],
+                        buffer[self.frame_size_limit:]
                     )
-                    self._queue.put(data)
+                    self._queue.put_nowait(data)
             buffer = compressor.flush()
             while buffer:
                 data, buffer = (
-                    buffer[:Settings.HUGE_DATA_SIZEOF],
-                    buffer[Settings.HUGE_DATA_SIZEOF:]
+                    buffer[:self.frame_size_limit],
+                    buffer[self.frame_size_limit:]
                 )
-                self._queue.put(data)
-        except Exception as error:
-            except_info = (
-                    str(error.__class__),
-                    str(error),
-                    "".join(format_tb(error.__traceback__))
-                )
-            logging.error("\n".join(except_info))
-            self._queue.put(HugeData.except_tag)
-            self._queue.put(except_info)
+                self._queue.put_nowait(data)
+        # except Exception as error:
+        #     except_info = (
+        #             str(error.__class__),
+        #             str(error),
+        #             "".join(format_tb(error.__traceback__))
+        #         )
+        #     logging.error("\n".join(except_info))
+        #     self._queue.put(HugeData.except_tag)
+        #     self._queue.put(except_info)
         finally:
-            self._queue.put(self.end_tag)
+            self._queue.put_nowait(self.end_tag)
 
     def _incremental_decompress(self, max_length=-1):
         try:
@@ -874,50 +1558,42 @@ class HugeData(object):
                 elif isinstance(self.data, SharedMemory):
                     data = self.data.buf[
                            shm_index:
-                           (shm_index := shm_index + Settings.HUGE_DATA_SIZEOF)
+                           (shm_index := shm_index + self.frame_size_limit)
                            ]
                 else:
                     data = self.data.get()
                     self.data.task_done()
                 if throw:
                     exception = msg_unpack(data)
-                    raise RemoteException(*exception)
+                    raise RemoteException(exception)
                 if data == self.end_tag:
                     raise OSError("The compressed data is incomplete")
                 if data == self.except_tag:
                     throw = True
                     continue
                 data = decompressor.decompress(data, max_length)
-                self._queue.put(data)
-        except Exception as error:
-            except_info = (
-                str(error.__class__),
-                str(error),
-                "".join(format_tb(error.__traceback__))
-            )
-            self._queue.put(HugeData.except_tag)
-            self._queue.put(except_info)
+                self._queue.put_nowait(data)
         finally:
-            self._queue.put(self.end_tag)
+            self._queue.put_nowait(self.end_tag)
 
     async def _data_agenerator(
         self,
         func, *args, **kwargs
     ) -> AsyncGenerator[Union[bytes, tuple]]:
         loop = asyncio.get_event_loop()
-        func = functools.partial(func, *args, **kwargs)
+        func = partial(func, *args, **kwargs)
         with ProcessPoolExecutor() as executor:
             f = loop.run_in_executor(executor, func)
             while 1:
                 if self._queue.empty():
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     continue
                 data = self._queue.get()
                 self._queue.task_done()
                 if data == self.end_tag:
                     break
                 yield data
-            await f
+        await f
         if exc := f.exception():
             raise exc
 
@@ -943,83 +1619,3 @@ def interface(methode):
 
     wrapper.__interface__ = True
     return wrapper
-
-
-async def generator_to_agenerator(generator: Generator) -> AsyncGenerator:
-    for element in generator:
-        yield element
-
-
-async def generate_reply(
-    task: Task = None, result: Any = None, exception: Exception = None
-):
-    if task:
-        try:
-            await task
-            result = task.result()
-        except Exception as error:
-            result = None
-            exception = error
-    if exception:
-        exception = (
-            str(exception.__class__),
-            str(exception),
-            "".join(format_tb(exception.__traceback__))
-        )
-    if isinstance(result, Generator):
-        result = generator_to_agenerator(result)
-    if isinstance(result, (AsyncGenerator, HugeData)):
-        return result
-    if sys.getsizeof(
-            result, Settings.HUGE_DATA_SIZEOF
-    ) > Settings.HUGE_DATA_SIZEOF:
-        loop = asyncio.get_event_loop()
-        with ProcessPoolExecutor() as executor:
-            _msg_pack = functools.partial(
-                msg_pack, result
-            )
-            data = await loop.run_in_executor(executor, _msg_pack)
-        return HugeData(data=data)
-    else:
-        return {
-            "result": result,
-            "exception": exception
-        }
-
-
-def check_zap_args(mechanism: Optional[str], credentials: Optional[tuple]):
-    if not mechanism:
-        return mechanism, credentials
-    mechanism = mechanism.encode("utf-8")
-    if credentials is None:
-        credentials = tuple()
-    if (mechanism == Settings.ZAP_MECHANISM_NULL
-            and len(credentials) != 0):
-        AttributeError(
-            f'The "{Settings.ZAP_MECHANISM_NULL}" mechanism '
-            f'should not have credential frames.'
-        )
-    elif (mechanism == Settings.ZAP_MECHANISM_PLAIN
-          and len(credentials) != 2):
-        AttributeError(
-            f'The "{Settings.ZAP_MECHANISM_PLAIN}" mechanism '
-            f'should have tow credential frames: '
-            f'a username and a password.'
-        )
-    elif mechanism == Settings.ZAP_MECHANISM_CURVE:
-        raise RuntimeError(
-            f'The "{Settings.ZAP_MECHANISM_CURVE}"'
-            f' mechanism is not implemented yet.'
-        )
-    elif mechanism not in (
-            Settings.ZAP_MECHANISM_NULL,
-            Settings.ZAP_MECHANISM_PLAIN,
-            Settings.ZAP_MECHANISM_CURVE
-    ):
-        raise ValueError(
-            f'mechanism can only be '
-            f'"{Settings.ZAP_MECHANISM_NULL}" or '
-            f'"{Settings.ZAP_MECHANISM_PLAIN}" or '
-            f'"{Settings.ZAP_MECHANISM_CURVE}"'
-        )
-    return mechanism, credentials
