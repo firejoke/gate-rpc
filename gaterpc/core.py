@@ -74,7 +74,10 @@ async def generate_reply(
         return HugeData(
             Settings.HUGE_DATA_END_TAG,
             Settings.HUGE_DATA_EXCEPT_TAG,
-            data=data
+            data=data,
+            compress_module=Settings.HUGE_DATA_COMPRESS_MODULE,
+            compress_level=Settings.HUGE_DATA_COMPRESS_LEVEL,
+            frame_size_limit=Settings.HUGE_DATA_SIZEOF
         )
     else:
         return {
@@ -1690,7 +1693,12 @@ class AMajordomo(_LoopBoundMixin):
                         if not (reply := self.gate_replies[request_id]).done():
                             huge_reply = HugeData(
                                 Settings.HUGE_DATA_END_TAG,
-                                Settings.HUGE_DATA_EXCEPT_TAG
+                                Settings.HUGE_DATA_EXCEPT_TAG,
+                                compress_module=
+                                Settings.HUGE_DATA_COMPRESS_MODULE,
+                                compress_level=
+                                Settings.HUGE_DATA_COMPRESS_LEVEL,
+                                frame_size_limit=Settings.HUGE_DATA_SIZEOF
                             )
                             self.gate_replies[request_id].set_result(huge_reply)
                         else:
@@ -2496,7 +2504,13 @@ class Client(_LoopBoundMixin):
                             if not (reply := self.replies[request_id]).done():
                                 huge_reply = HugeData(
                                     Settings.HUGE_DATA_END_TAG,
-                                    Settings.HUGE_DATA_EXCEPT_TAG
+                                    Settings.HUGE_DATA_EXCEPT_TAG,
+                                    compress_module=
+                                    Settings.HUGE_DATA_COMPRESS_MODULE,
+                                    compress_level=
+                                    Settings.HUGE_DATA_COMPRESS_LEVEL,
+                                    frame_size_limit=
+                                    Settings.HUGE_DATA_SIZEOF
                                 )
                                 self.replies[request_id].set_result(huge_reply)
                             else:

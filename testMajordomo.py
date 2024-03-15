@@ -103,7 +103,7 @@ async def test(frontend=None, backend=None, bind_gate=None, connect_gate=None):
     # loop.slow_callback_duration = 0.01
     Settings.DEBUG = True
     Settings.WORKER_ADDR = backend
-    Settings.ZAP_ADDR = f"{backend}.zap"
+    # Settings.ZAP_ADDR = f"{backend}.zap"
     Settings.ZAP_REPLY_TIMEOUT = 10.0
     # Settings.EVENT_LOOP_POLICY = uvloop.EventLoopPolicy()
     Settings.setup()
