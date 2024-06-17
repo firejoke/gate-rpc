@@ -1047,6 +1047,7 @@ class RemoteGateRPC(RemoteWorker):
             socket, mdp_version, service
         )
         self.work_services = work_services
+        self.addr = None
 
 
 class GateClusterService(ABCService):
@@ -1055,12 +1056,12 @@ class GateClusterService(ABCService):
         self.description = Settings.GATE_CLUSTER_DESCRIPTION
         self.services: dict[str, deque[bytes]] = dict()
         self.workers: dict[bytes, RemoteGateRPC] = dict()
-        self.idle_workers = deque()
-        self.unready_gates = deque()
+        self.idle_workers: deque[bytes] = deque()
+        self.unready_gates: dict[bytes, str] = dict()
 
     def add_worker(self, gate: Optional[RemoteGateRPC]) -> None:
         if gate.identity in self.unready_gates:
-            self.unready_gates.remove(gate.identity)
+            gate.addr = self.unready_gates.pop(gate.identity, None)
         self.workers[gate.identity] = gate
         for service in gate.work_services:
             if service not in self.services:
@@ -1248,7 +1249,6 @@ class AMajordomo(_LoopBoundMixin):
                     Settings.GATE_COMMAND_DISCONNECT,
                 )
             self.gate_cluster.remove_worker(gate)
-            # self.gates.pop(gate.identity, None)
         except asyncio.CancelledError:
             return
 
@@ -1299,7 +1299,11 @@ class AMajordomo(_LoopBoundMixin):
                     Settings.GATE_COMMAND_READY,
                     (msg_pack(list(self.services.keys())),)
                 )
-                self.gate_cluster.unready_gates.append(gate_id)
+                self.gate_cluster.unready_gates[gate_id] = addr
+
+    async def disconnect_gate(self, gate: RemoteGateRPC):
+        if gate.addr:
+            self.gate.disconnect(gate.addr)
 
     async def connect_zap(
         self,
