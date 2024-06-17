@@ -48,6 +48,9 @@ gate-rpc
     Settings.ZAP_PLAIN_DEFAULT_PASSWORD: str = ZAP 的 PLAIN 机制的默认密码
     Settings.ZAP_ADDR: str = ZAP 服务绑定的地址，如果是和代理服务一起使用，最好使用 ipc 类型，且不要和代理使用同一个 Context
     Settings.ZAP_REPLY_TIMEOUT: float = 等待 ZAP 服务的回复的超时时间，单位是秒，远比普通的REPLY_TIMEOUT短，因为zap服务处理每一个zap请求必须很快
+    Settings.GATE_CLUSTER_NAME: str = gate集群的集群名
+    Settings.GATE_CLUSTER_DESCRIPTION: str = gate集群的描述
+    Settings.MEMBER: str = gate集群的成员版本
     Settings.setup()
 
     # 特殊返回值的序列化配置 [#f2]_
@@ -232,7 +235,30 @@ gate-rpc
 
 
 ********
-注意点
+Gate cluster
+********
+
+在 Gate 集群内各个节点可以转发当前节点的前端请求到其他节点，
+也可以请求其他节点的内部方法（比如分布式算法的集群节点选举）,
+内部方法必须返回一个由状态码和结果组成的元组。
+
+内部服务创建：
+
+::
+
+    from util import interface
+
+
+    class Gate(AMajordomo):
+        @interface
+        def internal_service(self, *args, **kwargs):
+            status_code = b"200" # response code
+            result = Any
+            return status_code, result
+
+
+********
+笔记
 ********
 
 客户端的请求和回复的异步处理是使用的 asyncio.Future ，然后使用 asyncio.wait_for 来超时等待。
@@ -276,4 +302,5 @@ gate-rpc
 HugeData 的 compress 和 decompress 方法都会在进程池里执行增量压缩和增量解压缩，
 返回的异步生成器每次获取的字节数大小不会超过 Settings.HUGE_DATA_SIZEOF ，
 compress 方法对每一块返回的大小的限制是 HugeData 内部实现，
-decompress 方法对每一块返回的大小限制则是由压缩模块来实现，会在调用解压缩器实例的 decompress 方法时传递一个 max_length 位置参数。
+decompress 方法对每一块返回的大小限制则是由压缩模块来实现，
+会在调用解压缩器实例的 decompress 方法时传递一个 max_length 位置参数。

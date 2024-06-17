@@ -23,7 +23,8 @@ from zmq.auth import Authenticator
 
 from .global_settings import Settings
 from .exceptions import (
-    BuysWorkersError, HugeDataException, RemoteException,
+    BusyGateError, BusyWorkerError, GateUnAvailableError, HugeDataException,
+    RemoteException,
     ServiceUnAvailableError,
 )
 from .mixins import _LoopBoundMixin
@@ -1091,7 +1092,11 @@ class GateClusterService(ABCService):
     def acquire_service_idle_worker(
         self, service: str
     ) -> Optional[RemoteGateRPC]:
-        while idle_gates := self.services[service]:
+        if service == self.name:
+            service = self.idle_workers
+        else:
+            service = self.services[service]
+        while idle_gates := service:
             gate = self.workers[(g_id := idle_gates.pop())]
             self.idle_workers.remove(g_id)
             if gate.is_alive() and gate.max_allowed_request != 0:
@@ -1215,6 +1220,38 @@ class AMajordomo(_LoopBoundMixin):
     def unbind_gate(self, addr: str) -> None:
         self.gate.unbind(check_socket_addr(addr))
 
+    def register_gate(
+        self, gate_id, socket, mdp_version, work_services
+    ):
+        gate = RemoteGateRPC(
+            gate_id, self.heartbeat,
+            socket, mdp_version, self.gate_cluster,
+            work_services
+        )
+        gate.ready = True
+        self.gate_cluster.add_worker(gate)
+        self.ban_at_expiration(gate)
+
+    async def ban_gate(self, gate: RemoteGateRPC, wait: float = 0):
+        """
+        和 ban_worker 分开，方便以后加逻辑
+        """
+        try:
+            if wait:
+                await asyncio.sleep(wait)
+            elif gate.destroy_task:
+                gate.destroy_task.cancel()
+            logger.warning(f"ban gate({gate.identity}).")
+            if gate.is_alive():
+                await self.send_to_gate(
+                    gate.identity,
+                    Settings.GATE_COMMAND_DISCONNECT,
+                )
+            self.gate_cluster.remove_worker(gate)
+            # self.gates.pop(gate.identity, None)
+        except asyncio.CancelledError:
+            return
+
     async def connect_gate(self, addr: str) -> None:
         gate_c = self.ctx.socket(z_const.REQ, z_aio.Socket)
         gate_c.set(z_const.SNDTIMEO, Settings.HEARTBEAT)
@@ -1253,6 +1290,8 @@ class AMajordomo(_LoopBoundMixin):
             except ValueError:
                 return
             else:
+                if gate_id in self.gate_cluster.get_workers():
+                    return
                 self.gate.connect(addr)
                 await asyncio.sleep(1)
                 await self.send_to_gate(
@@ -1367,38 +1406,6 @@ class AMajordomo(_LoopBoundMixin):
             worker.destroy_task.cancel()
         self.ban_at_expiration(worker)
 
-    def register_gate(
-        self, gate_id, socket, mdp_version, work_services
-    ):
-        gate = RemoteGateRPC(
-            gate_id, self.heartbeat,
-            socket, mdp_version, self.gate_cluster,
-            work_services
-        )
-        gate.ready = True
-        self.gate_cluster.add_worker(gate)
-        self.ban_at_expiration(gate)
-
-    async def ban_gate(self, gate: RemoteGateRPC, wait: float = 0):
-        """
-        和 ban_worker 分开，方便以后加逻辑
-        """
-        try:
-            if wait:
-                await asyncio.sleep(wait)
-            elif gate.destroy_task:
-                gate.destroy_task.cancel()
-            logger.warning(f"ban gate({gate.identity}).")
-            if gate.is_alive():
-                await self.send_to_gate(
-                    gate.identity,
-                    Settings.GATE_COMMAND_DISCONNECT,
-                )
-            self.gate_cluster.remove_worker(gate)
-            # self.gates.pop(gate.identity, None)
-        except asyncio.CancelledError:
-            return
-
     def cleanup_frontend_task(self, task: asyncio.Task):
         self.frontend_tasks.remove(task)
         if exception := task.exception():
@@ -1463,7 +1470,7 @@ class AMajordomo(_LoopBoundMixin):
                     self.zap_replies[reply_key],
                     Settings.ZAP_REPLY_TIMEOUT
                 )
-                self.zap_replies.pop(reply_key)
+                self.zap_replies.pop(reply_key).cancel()
             except asyncio.TimeoutError:
                 logger.error(f"get ZAP replies failed: {reply_key}")
                 zap_reply = failed_reply
@@ -1719,6 +1726,42 @@ class AMajordomo(_LoopBoundMixin):
                 gate.expiry = time()
                 await self.ban_gate(gate)
 
+    async def request_gate(
+        self,
+        request_id: bytes,
+        service: str,
+        body: tuple[Union[bytes, str], ...]
+    ):
+        for gid, gate in self.gate_cluster.workers.items():
+            if not gate.is_alive():
+                await self.ban_gate(gate)
+        if not self.gate_cluster.running:
+            raise GateUnAvailableError()
+        elif gate := self.gate_cluster.acquire_service_idle_worker(service):
+            option = (service, request_id)
+            await self.send_to_gate(
+                gate.identity,
+                Settings.GATE_COMMAND_REQUEST,
+                option,
+                body
+            )
+        else:
+            raise BusyGateError()
+
+    async def reply_gate(
+        self,
+        gate_id: bytes,
+        service: str,
+        request_id: bytes,
+        *body,
+    ):
+        await self.send_to_gate(
+            gate_id,
+            Settings.GATE_COMMAND_REPLY,
+            (service, request_id),
+            body
+        )
+
     async def send_to_gate(
         self,
         gate_id,
@@ -1875,28 +1918,69 @@ class AMajordomo(_LoopBoundMixin):
                 )
                 await self.ban_worker(worker)
 
-    async def reply_frontend(
-        self, client_id: bytes,
-        service_name: Union[str, bytes],
-        request_id: Union[str, bytes],
-        *body
+    async def request_backend(
+        self,
+        service_name: str,
+        client_id: bytes,
+        request_id: bytes,
+        body: tuple[Union[bytes, str], ...]
     ):
-        if client_id in self.clients:
-            reply = (
-                client_id,
-                b"",
-                Settings.MDP_CLIENT,
-                service_name,
-                request_id,
-                *body
+        for wid, worker in self.workers.items():
+            if not worker.is_alive():
+                await self.ban_worker(worker)
+        service = self.services.get(service_name)
+        try:
+            if not service or not service.running:
+                raise ServiceUnAvailableError(service_name)
+            elif worker := service.acquire_idle_worker():
+                option = (client_id, b"", request_id)
+                await self.send_to_backend(
+                    worker.identity, Settings.MDP_COMMAND_REQUEST,
+                    option, body
+                )
+            elif self.gate_cluster.running:
+                # 转发请求其他代理。
+                self.request_map[request_id] = client_id
+                await self.request_gate(
+                    request_id,
+                    service_name,
+                    body
+                )
+            else:
+                raise BusyWorkerError()
+        except (
+                ServiceUnAvailableError, GateUnAvailableError,
+                BusyGateError, BusyWorkerError
+        ) as exception:
+            exception = await generate_reply(exception=exception)
+            except_reply = msg_pack(exception)
+            await self.reply_frontend(
+                client_id, service_name, request_id,
+                except_reply
             )
-            reply = tuple(to_bytes(frame) for frame in reply)
-            await self.frontend.send_multipart(reply)
-        elif client_id in self.gate_cluster.workers:
-            await self.send_to_gate(
-                client_id, Settings.MDP_COMMAND_REPLY,
-                (service_name, request_id), body
-            )
+
+    async def send_to_backend(
+        self,
+        worker_id,
+        command: bytes,
+        option: tuple[Union[bytes, str], ...] = None,
+        messages: tuple[Union[bytes, str], ...] = None
+    ):
+        if not option:
+            option = tuple()
+        if not messages:
+            messages = tuple()
+        request = (
+            worker_id,
+            b"",
+            Settings.MDP_WORKER,
+            command,
+            *option,
+            *messages
+        )
+        request = tuple(to_bytes(frame) for frame in request)
+        await self.backend.send_multipart(request)
+        return
 
     async def process_request_from_frontend(self, request: list):
         try:
@@ -1983,71 +2067,27 @@ class AMajordomo(_LoopBoundMixin):
             request_id, func_name, stat_code, msg_pack(replies)
         )
 
-    async def send_to_backend(
-        self,
-        worker_id,
-        command: bytes,
-        option: tuple[Union[bytes, str], ...] = None,
-        messages: tuple[Union[bytes, str], ...] = None
+    async def reply_frontend(
+        self, client_id: bytes,
+        service_name: Union[str, bytes],
+        request_id: Union[str, bytes],
+        *body
     ):
-        if not option:
-            option = tuple()
-        if not messages:
-            messages = tuple()
-        request = (
-            worker_id,
-            b"",
-            Settings.MDP_WORKER,
-            command,
-            *option,
-            *messages
-        )
-        request = tuple(to_bytes(frame) for frame in request)
-        await self.backend.send_multipart(request)
-        return
-
-    async def request_backend(
-        self,
-        service_name: str, client_id: bytes,
-        request_id: bytes, body: tuple[Union[bytes, str], ...]
-    ):
-        for wid, worker in self.workers.items():
-            if not worker.is_alive():
-                await self.ban_worker(worker)
-        service = self.services.get(service_name)
-        exception = await generate_reply(
-            exception=ServiceUnAvailableError(service_name)
-        )
-        except_reply = msg_pack(exception)
-        if not service or not service.running:
-            await self.reply_frontend(
-                client_id, service_name, request_id,
-                except_reply
+        if client_id in self.clients:
+            reply = (
+                client_id,
+                b"",
+                Settings.MDP_CLIENT,
+                service_name,
+                request_id,
+                *body
             )
-        elif worker := service.acquire_idle_worker():
-            option = (client_id, b"", request_id)
-            await self.send_to_backend(
-                worker.identity, Settings.MDP_COMMAND_REQUEST,
-                option, body
-            )
-        elif gate := self.gate_cluster.acquire_service_idle_worker(
-                service_name
-        ):
-            # 转发请求其他代理。
-            self.request_map[request_id] = client_id
-            option = (service_name, request_id)
-            await self.send_to_gate(
-                gate.identity,
-                Settings.GATE_COMMAND_REQUEST,
-                option,
-                body
-            )
-        else:
-            exception = await generate_reply(exception=BuysWorkersError())
-            except_reply = msg_pack(exception)
-            await self.reply_frontend(
-                client_id, service_name, request_id,
-                except_reply
+            reply = tuple(to_bytes(frame) for frame in reply)
+            await self.frontend.send_multipart(reply)
+        elif client_id in self.gate_cluster.workers:
+            await self.reply_gate(
+                client_id, service_name,
+                request_id, body
             )
 
     async def send_heartbeat(self):
@@ -2290,7 +2330,7 @@ class Client(_LoopBoundMixin):
             reply = self.replies[request_id].result()
             if isinstance(reply, StreamReply):
                 if reply._exit:
-                    self.replies.pop(request_id)
+                    self.replies.pop(request_id).cancel()
                 else:
                     t = self._get_loop().create_task(
                         self._clear_reply(request_id)
@@ -2298,7 +2338,7 @@ class Client(_LoopBoundMixin):
                     self._clear_replies_tasks.append(t)
                     t.add_done_callback(self._clear_replies_tasks.remove)
             else:
-                self.replies.pop(request_id)
+                self.replies.pop(request_id).cancel()
 
     async def _request(
         self, service_name: Union[str, bytes],
