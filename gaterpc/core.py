@@ -1302,6 +1302,7 @@ class AMajordomo(_LoopBoundMixin):
                 self.gate_cluster.unready_gates[gate_id] = addr
 
     async def disconnect_gate(self, gate: RemoteGateRPC):
+        await self.ban_gate(gate)
         if gate.addr:
             self.gate.disconnect(gate.addr)
 
@@ -2190,6 +2191,8 @@ class AMajordomo(_LoopBoundMixin):
     async def disconnect_all(self):
         # TODO: 需要通知客户端吗？
         logger.warning("Disconnected and all the workers.")
+        for gate in self.gate_cluster.workers.values():
+            await self.disconnect_gate(gate)
         for work in list(self.workers.values()):
             await self.ban_worker(work)
 
