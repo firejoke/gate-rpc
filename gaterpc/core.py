@@ -23,9 +23,9 @@ from zmq.auth import Authenticator
 
 from .global_settings import Settings
 from .exceptions import (
-    BusyGateError, BusyWorkerError, GateUnAvailableError, HugeDataException,
+    BusyGateError, BusyWorkerError,
+    GateUnAvailableError, ServiceUnAvailableError,
     RemoteException,
-    ServiceUnAvailableError,
 )
 from .mixins import _LoopBoundMixin
 from .utils import (
@@ -172,6 +172,7 @@ class ABCService(ABC):
     description: str
     workers: dict[bytes, ABCWorker]
     idle_workers: deque[bytes]
+    RemoteWorkerClass: ABCWorker
 
     @abstractmethod
     def add_worker(self, worker: Optional[ABCWorker]) -> None:
@@ -620,6 +621,7 @@ class Service(ABCService):
     管理本地和远程提供该服务的 worker。
     TODO: 如何避免有同名但接口不一样的服务连上来，会导致客户端调用本该有却没有的接口而出错。
     """
+    RemoteWorkerClass = RemoteWorker
 
     def __init__(
         self, name: str = None,
@@ -1051,6 +1053,8 @@ class RemoteGateRPC(RemoteWorker):
 
 
 class GateClusterService(ABCService):
+    RemoteWorkerClass = RemoteGateRPC
+
     def __init__(self):
         self.name = Settings.GATE_CLUSTER_NAME
         self.description = Settings.GATE_CLUSTER_DESCRIPTION
@@ -1120,7 +1124,9 @@ class AMajordomo(_LoopBoundMixin):
     多偏好服务集群，连接多个提供不同服务的 Service（远程的 Service 也可能是一个代理，进行负载均衡）
     """
 
-    ctx: Context
+    ClusterServiceClass = GateClusterService
+    RemoteServiceClass = Service
+    RemoteWorkerClass = RemoteWorker
 
     def __init__(
         self,
@@ -1165,8 +1171,7 @@ class AMajordomo(_LoopBoundMixin):
         self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         set_sock(self.gate)
         self.gate.set(z_const.IDENTITY, self.identity)
-        self.gate_cluster = GateClusterService()
-        self.gates: dict[bytes, RemoteGateRPC] = dict()
+        self.gate_cluster = self.ClusterServiceClass()
         self.gate_replies: dict[bytes, asyncio.Future] = dict()
         self.gate_tasks = deque()
         # 被转发的客户端请求和其他代理的请求和客户端id或其他地理的id的映射
@@ -1187,8 +1192,6 @@ class AMajordomo(_LoopBoundMixin):
         # 内部程序应该只执行简单的资源消耗少的逻辑处理
         # 不需要用到 ProcessPoolExecutor
         self._executor = ThreadPoolExecutor()
-        self.remote_service_class = Service
-        self.remote_worker_class = RemoteWorker
         self.ban_timer_handle: dict[bytes, asyncio.Task] = dict()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
         self.cache_request = dict()
@@ -1224,9 +1227,10 @@ class AMajordomo(_LoopBoundMixin):
     def register_gate(
         self, gate_id, socket, mdp_version, work_services
     ):
-        gate = RemoteGateRPC(
+        gate = self.gate_cluster.RemoteWorkerClass(
             gate_id, self.heartbeat,
-            socket, mdp_version, self.gate_cluster,
+            socket, mdp_version,
+            self.gate_cluster,
             work_services
         )
         gate.ready = True
@@ -1354,7 +1358,7 @@ class AMajordomo(_LoopBoundMixin):
         """
         添加 service
         """
-        service = self.remote_service_class(
+        service = self.RemoteServiceClass(
             name, description
         )
         self.services[service.name] = service
@@ -1362,7 +1366,7 @@ class AMajordomo(_LoopBoundMixin):
     def register_worker(
         self, worker_id, socket, mdp_version, service
     ):
-        worker = self.remote_worker_class(
+        worker = self.RemoteWorkerClass(
             worker_id, self.heartbeat,
             socket, mdp_version, service
         )
@@ -1396,11 +1400,11 @@ class AMajordomo(_LoopBoundMixin):
     ):
         loop = self._get_loop()
         wait = 1e-3 * worker.heartbeat * worker.heartbeat_liveness
-        if isinstance(worker, RemoteGateRPC):
+        if isinstance(worker, self.ClusterServiceClass.RemoteWorkerClass):
             worker.destroy_task = loop.create_task(
                 self.ban_gate(worker, wait=wait)
             )
-        elif isinstance(worker, self.remote_worker_class):
+        elif isinstance(worker, self.RemoteWorkerClass):
             worker.destroy_task = loop.create_task(
                 self.ban_worker(worker, wait=wait)
             )

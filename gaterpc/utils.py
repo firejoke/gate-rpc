@@ -40,7 +40,7 @@ from typing import (
 
 import msgpack
 
-from .exceptions import BadGzip, DictFull, RemoteException
+from .exceptions import BadGzip, DictFull, HugeDataException, RemoteException
 from .mixins import _LoopBoundMixin
 
 
@@ -1527,15 +1527,8 @@ class HugeData(object):
                     buffer[self.frame_size_limit:]
                 )
                 self._queue.put_nowait(data)
-        # except Exception as error:
-        #     except_info = (
-        #             str(error.__class__),
-        #             str(error),
-        #             "".join(format_tb(error.__traceback__))
-        #         )
-        #     logging.error("\n".join(except_info))
-        #     self._queue.put(HugeData.except_tag)
-        #     self._queue.put(except_info)
+        except Exception as error:
+            raise HugeDataException(error)
         finally:
             self._queue.put_nowait(self.end_tag)
 
@@ -1573,6 +1566,8 @@ class HugeData(object):
                     continue
                 data = decompressor.decompress(data, max_length)
                 self._queue.put_nowait(data)
+        except Exception as error:
+            raise HugeDataException(error)
         finally:
             self._queue.put_nowait(self.end_tag)
 

@@ -45,11 +45,11 @@ class RemoteException(Exception):
 
 
 class BadGzip(OSError):
-    pass
+    """"""
 
 
 class HugeDataException(OSError):
-    pass
+    """"""
 
 
 class DictFull(Exception):
