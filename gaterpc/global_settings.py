@@ -2,6 +2,7 @@
 # Author      : ShiFan
 # Created Date: 2023/5/10 16:47
 """Gate rpc constants"""
+import asyncio
 from collections import deque
 from logging.config import dictConfig
 from pathlib import Path
@@ -18,6 +19,7 @@ class DefaultSettings(object):
     # Base
     DEBUG = False
     BASE_PATH = Path("/tmp/gate-rpc/")
+    GLOBAL_LOOP: asyncio.AbstractEventLoop = None
     HEARTBEAT: int = 3000  # millisecond
     TIMEOUT: float = 30.0
     EVENT_LOOP_POLICY = None
@@ -124,9 +126,7 @@ class DefaultSettings(object):
             },
             "console": {
                 "level": "DEBUG",
-                "class": "gaterpc.utils.AQueueHandler",
-                "handler_class": "logging.StreamHandler",
-                "loop": "asyncio.get_running_loop",
+                "class": "logging.StreamHandler",
                 "formatter": "simple",
             },
         },
@@ -153,7 +153,7 @@ class DefaultSettings(object):
             },
             "commands": {
                 "level": "INFO",
-                "handlers": ["gaterpc", "console"],
+                "handlers": ["console"],
                 "propagate": False,
             },
         },
@@ -180,6 +180,12 @@ class DefaultSettings(object):
         return item in self._options
 
     def setup(self, **options):
+        if self.EVENT_LOOP_POLICY:
+            asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
+
+        if not self.GLOBAL_LOOP:
+            self.GLOBAL_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.GLOBAL_LOOP)
         for name, value in options.items():
             if not name.isupper():
                 Warning(f"Settings {name} must be uppercase.")
@@ -204,10 +210,6 @@ class DefaultSettings(object):
         #     f"gate.zap.{randint(1, 10)}"
         # ).as_posix()
         # self.ZAP_ADDR = f"ipc://{self.ZAP_ADDR}"
-        if self.EVENT_LOOP_POLICY:
-            import asyncio
-
-            asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
 
 
 Settings = DefaultSettings()

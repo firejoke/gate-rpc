@@ -1057,9 +1057,9 @@ class AQueueListener(object):
         if isinstance(loop, Callable):
             loop = loop()
         self._loop: asyncio.AbstractEventLoop = loop
-        self.queue = queue.Queue()
+        self.queue = asyncio.Queue()
         self.handlers = dict()
-        self._task = None
+        self._task: Optional[asyncio.Task] = None
         self._thread = None
         if handlers:
             self.add_handlers(handlers)
@@ -1071,13 +1071,13 @@ class AQueueListener(object):
         for handler in handlers:
             self.handlers[handler.get_name()] = handler
 
-    def dequeue(self, block=True):
-        return self.queue.get(block=block)
+    async def dequeue(self):
+        return await self.queue.get()
 
     def prepare(self, record):
         return record
 
-    def handle(self, record):
+    async def handle(self, record):
         record = self.prepare(record)
         handler = self.handlers.get(record.h_name)
         if handler:
@@ -1086,23 +1086,25 @@ class AQueueListener(object):
             else:
                 process = record.levelno >= handler.level
             if process:
-
-                handler.handle(record)
+                if asyncio.iscoroutinefunction(handler.handle):
+                    await handler.handle(record)
+                else:
+                    handler.handle(record)
 
     def enqueue_sentinel(self):
         self.queue.put_nowait(self._sentinel)
 
-    def _monitor(self):
+    async def _monitor(self):
         q = self.queue
         has_task_done = hasattr(q, 'task_done')
         while True:
             try:
-                record = self.dequeue(True)
+                record = await self.dequeue()
                 if record is self._sentinel:
                     if has_task_done:
                         q.task_done()
                     break
-                self.handle(record)
+                await self.handle(record)
                 if has_task_done:
                     q.task_done()
             except queue.Empty:
@@ -1111,15 +1113,18 @@ class AQueueListener(object):
                 warnings.warn(e.__repr__())
 
     def start(self):
-        self._thread = t = threading.Thread(target=self._monitor)
-        t.daemon = True
-        t.start()
+        self._task = asyncio.create_task(self._monitor())
+        # self._thread = t = threading.Thread(target=self._monitor)
+        # t.daemon = True
+        # t.start()
 
     def stop(self):
-        if self._thread:
-            self.enqueue_sentinel()
-            self._thread.join()
-            self._thread = None
+        if self._task:
+            self._task.cancel()
+        # if self._thread:
+        #     self.enqueue_sentinel()
+        #     self._thread.join()
+        #     self._thread = None
 
 
 class QueueHandler(Handler):

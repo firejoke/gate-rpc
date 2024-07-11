@@ -295,3 +295,8 @@ HugeData 的 compress 和 decompress 方法都会在进程池里执行增量压�
 compress 方法对每一块返回的大小的限制是 HugeData 内部实现，
 decompress 方法对每一块返回的大小限制则是由压缩模块来实现，
 会在调用解压缩器实例的 decompress 方法时传递一个 max_length 位置参数。
+
+
+在使用由"gaterpc.utils.AQueueHandler"做为处理器的日志处理器时，
+要避免跨越线程和跨事件循环实例来记录日志，
+在将StreamHandler作为AQueueHandler的handler_class参数时会就遇到跨事件循环调用的错误
