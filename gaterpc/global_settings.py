@@ -3,22 +3,22 @@
 # Created Date: 2023/5/10 16:47
 """Gate rpc constants"""
 import asyncio
-from collections import deque
 from logging.config import dictConfig
 from pathlib import Path
 from random import randint
-from typing import Union
 
-from gaterpc.utils import _LazyProperty
+from .utils import _LazyProperty
 
 
-class DefaultSettings(object):
+class DefaultSettings:
     """
     全局配置，运行Worker、AMajorodomo、Client之前都需要先执行该配置类的setup函数
     """
     # Base
     DEBUG = False
     BASE_PATH = Path("/tmp/gate-rpc/")
+    RUN_PATH: Path = None
+    LOG_PATH: Path = None
     GLOBAL_LOOP: asyncio.AbstractEventLoop = None
     HEARTBEAT: int = 3000  # millisecond
     TIMEOUT: float = 30.0
@@ -159,17 +159,29 @@ class DefaultSettings(object):
         },
     }
 
+
+class GlobalSettings(object):
     def __init__(self):
-        self._options = deque()
-        for k in DefaultSettings.__dict__:
-            if k.isupper():
-                self._options.append(k)
-        self.RUN_PATH = self.BASE_PATH.joinpath("run/")
-        self.LOG_PATH = self.BASE_PATH.joinpath("log/")
+        self._options = list()
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name.isupper():
+            self._options.append(name)
+
+    def __getattr__(self, item):
+        if not self._options:
+            raise RuntimeError(
+                "Global settings have not been configured,"
+                " please run Settings.setup first."
+            )
+        raise AttributeError
 
     def __getattribute__(self, item):
         attr = super().__getattribute__(item)
-        if isinstance(attr, _LazyProperty):
+        if item.isupper() and item in self._options and isinstance(
+                attr, _LazyProperty
+        ):
             return attr(self)
         return attr
 
@@ -180,20 +192,31 @@ class DefaultSettings(object):
         return item in self._options
 
     def setup(self, **options):
-        if self.EVENT_LOOP_POLICY:
+        for k, v in DefaultSettings.__dict__.items():
+            if k.isupper():
+                setattr(self, k, v)
+
+        if hasattr(self, "EVENT_LOOP_POLICY"):
             asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
 
-        if not self.GLOBAL_LOOP:
-            self.GLOBAL_LOOP = asyncio.new_event_loop()
+        if not hasattr(self, "GLOBAL_LOOP"):
+            setattr(self, "GLOBAL_LOOP", asyncio.new_event_loop())
         asyncio.set_event_loop(self.GLOBAL_LOOP)
+
         for name, value in options.items():
             if not name.isupper():
                 Warning(f"Settings {name} must be uppercase.")
                 continue
-            if name in ("RUN_PATH", "LOG_PATH") and not isinstance(value, Path):
-                value = Path(value)
+            if name in ("RUN_PATH", "LOG_PATH"):
+                assert isinstance(value, Path), ValueError(
+                    "%s must be a Path." % name
+                )
             setattr(self, name, value)
-            self._options.append(name)
+        if "RUN_PATH" not in options:
+            setattr(self, "RUN_PATH", self.BASE_PATH.joinpath("run/"))
+        if "LOG_PATH" not in options:
+            setattr(self, "LOG_PATH", self.BASE_PATH.joinpath("log/"))
+
         if self.DEBUG:
             for handler in self.LOGGING["handlers"].values():
                 handler["formatter"] = "debug"
@@ -212,4 +235,4 @@ class DefaultSettings(object):
         # self.ZAP_ADDR = f"ipc://{self.ZAP_ADDR}"
 
 
-Settings = DefaultSettings()
+Settings = GlobalSettings()
