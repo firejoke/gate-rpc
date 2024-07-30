@@ -3,35 +3,161 @@
 # Created Date: 2023/5/10 16:47
 """Gate rpc constants"""
 import asyncio
+from importlib import import_module
 from logging.config import dictConfig
 from pathlib import Path
-from random import randint
+import zmq.constants as z_const
 
-from .utils import _LazyProperty
+from .utils import TypeValidator, LazyAttribute, empty, ensure_mkdir
 
 
-class DefaultSettings:
+def user_settings_render(settings: "GlobalSettings", user_settings):
+    if isinstance(user_settings, str):
+        return import_module(user_settings)
+    elif user_settings is empty:
+        return None
+    return user_settings
+
+
+def logging_render(settings: "GlobalSettings", logging: dict):
+    if logging is empty:
+        return dict()
+    if settings.DEBUG:
+        for logger in logging["loggers"].values():
+            logger["level"] = "DEBUG"
+            logger["handlers"].append("console")
+    for name, handler in logging["handlers"].items():
+        if settings.DEBUG:
+            handler["formatter"] = "debug"
+        if handler.get("filename") is empty:
+            handler["filename"] = settings.LOG_PATH.joinpath(f"{name}.log")
+    return logging
+
+
+def logging_process(settings: "GlobalSettings", logging: dict):
+    logging = TypeValidator(dict)(logging)
+    return logging
+
+
+_DEFAULT_LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "debug": {
+            "format": "%(asctime)s %(levelname)s %(name)s "
+                      "[%(processName)s(%(process)d):"
+                      "%(threadName)s(%(thread)d)]\n"
+                      "%(pathname)s[%(funcName)s:%(lineno)d] "
+                      "-\n%(message)s",
+        },
+        "verbose": {
+            "format": "%(asctime)s %(levelname)s %(name)s "
+                      "%(module)s.[%(funcName)s:%(lineno)d] "
+                      "-\n%(message)s",
+        },
+        "simple": {
+            "format": "%(asctime)s %(levelname)s  %(name)s %(module)s "
+                      "- %(message)s"
+        },
+    },
+    "handlers": {
+        "asyncio": {
+            "level": "DEBUG",
+            "class": "gaterpc.utils.AQueueHandler",
+            "handler_class": "logging.handlers.TimedRotatingFileHandler",
+            "filename": empty,
+            "formatter": "debug",
+            "when": "midnight",
+            "backupCount": 10
+        },
+        "gaterpc": {
+            "level": "DEBUG",
+            "class": "gaterpc.utils.AQueueHandler",
+            "handler_class": "logging.handlers.TimedRotatingFileHandler",
+            "filename": empty,
+            "formatter": "verbose",
+            "when": "midnight",
+            "backupCount": 10
+        },
+        "console": {
+            "level": "DEBUG",
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "loggers": {
+        "multiprocessing": {
+            "handlers": ["gaterpc", "console"],
+            "propagate": False,
+            "level": "DEBUG"
+        },
+        "asyncio": {
+            "level": "INFO",
+            "handlers": ["asyncio"],
+            "propagate": False,
+        },
+        "gaterpc": {
+            "level": "INFO",
+            "handlers": ["gaterpc"],
+            "propagate": True,
+        },
+        "gaterpc.zap": {
+            "level": "INFO",
+            "handlers": ["gaterpc"],
+            "propagate": True,
+        },
+        "commands": {
+            "level": "INFO",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+    },
+}
+
+
+class GlobalSettings(object):
     """
     全局配置，运行Worker、AMajorodomo、Client之前都需要先执行该配置类的setup函数
     """
-    # Base
+    # system
     DEBUG = False
-    BASE_PATH = Path("/tmp/gate-rpc/")
-    RUN_PATH: Path = None
-    LOG_PATH: Path = None
+    EVENT_LOOP_POLICY: asyncio.AbstractEventLoopPolicy = None
     GLOBAL_LOOP: asyncio.AbstractEventLoop = None
+
+    # Base
+    BASE_PATH: Path = LazyAttribute(
+        Path("/tmp/gate-rpc/"),
+        render=lambda instance, p: ensure_mkdir(p),
+        process=lambda instance, p: TypeValidator(Path)(p)
+    )
+    RUN_PATH: Path = LazyAttribute(
+        render=lambda instance, p: ensure_mkdir(
+            instance.BASE_PATH.joinpath("run/")
+        ) if p is empty else ensure_mkdir(p),
+        process=lambda instance, p: TypeValidator(Path)(p)
+    )
+    LOG_PATH: Path = LazyAttribute(
+        render=lambda instance, p: ensure_mkdir(
+            instance.BASE_PATH.joinpath("log/")
+        ) if p is empty else ensure_mkdir(p),
+        process=lambda instance, p: TypeValidator(Path)(p)
+    )
     HEARTBEAT: int = 3000  # millisecond
     TIMEOUT: float = 30.0
-    EVENT_LOOP_POLICY = None
     WINDOWS_MAX_WORKERS: int = 63 - 2
     WORKER_ADDR: str = f"inproc://gate.worker.01"
-    GATE_CLUSTER_NAME: str = "GateCluster"
-    GATE_CLUSTER_DESCRIPTION: str = "GateRPC cluster service"
+    USER_SETTINGS = LazyAttribute(render=user_settings_render)
     # ZMQ
-    ZMQ_CONTEXT_IPV6: int = 1
-    ZMQ_SOCK_HWM: int = 3000
-    # ZMQ_SOCK_SNDTIMEO: int = 10 * 1000  # millisecond
-    # ZMQ_SOCK_RCVTIMEO: int = 10 * 1000  # millisecond
+    ZMQ_CONTEXT = {
+        z_const.IPV6: 1
+    }
+    ZMQ_SOCK = {
+        z_const.HWM: 3000,
+        # millisecond
+        # z_const.SNDTIMEO: 10 * 1000,
+        # millisecond
+        # z_const.RCVTIMEO: 10 * 1000
+    }
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
     ZAP_DEFAULT_DOMAIN: str = "gate"
@@ -41,26 +167,39 @@ class DefaultSettings:
     ZAP_MECHANISM_GSSAPI: bytes = b"GSSAPI"
     ZAP_PLAIN_DEFAULT_USER: str = "堡垒"
     ZAP_PLAIN_DEFAULT_PASSWORD: str = "哔哔哔哔哔"
-    ZAP_ADDR: str = _LazyProperty(
-        lambda ins:
-        f"ipc://{_LazyProperty('RUN_PATH')(ins)}gate.zap.{randint(1, 10)}"
+    ZAP_ADDR: str = LazyAttribute(
+        render=lambda instance, p:
+        f"ipc://{instance.RUN_PATH.joinpath('gate.zap').as_posix()}"
+        if p is empty else p
     )
     ZAP_REPLY_TIMEOUT: float = 5.0
     # MDP
-    MDP_HEARTBEAT_INTERVAL: int = _LazyProperty("HEARTBEAT")  # millisecond
+    MDP_HEARTBEAT_INTERVAL: int = LazyAttribute(
+        render=lambda instance, p: instance.HEARTBEAT if p is empty else p
+    )  # # millisecond
     MDP_HEARTBEAT_LIVENESS: int = 3
     MDP_INTERNAL_SERVICE: str = "Gate"
     MDP_VERSION: str = "01"
-    MDP_CLIENT: bytes = f"MDPC{MDP_VERSION}".encode("utf-8")
-    MDP_WORKER: bytes = f"MDPW{MDP_VERSION}".encode("utf-8")
+    MDP_CLIENT: bytes = LazyAttribute(
+        render=lambda instance, p: f"MDPC{instance.MDP_VERSION}".encode("utf-8")
+    )
+    MDP_WORKER: bytes = LazyAttribute(
+        render=lambda instance, p: f"MDPW{instance.MDP_VERSION}".encode("utf-8")
+    )
     MDP_COMMAND_READY: bytes = b"\x01"
     MDP_COMMAND_REQUEST: bytes = b"\x02"
     MDP_COMMAND_REPLY: bytes = b"\x03"
     MDP_COMMAND_HEARTBEAT: bytes = b"\x04"
     MDP_COMMAND_DISCONNECT: bytes = b"\x05"
     # Gate
+    GATE_CLUSTER_NAME: str = "GateCluster"
+    GATE_CLUSTER_DESCRIPTION: str = "GateRPC cluster service"
+
     GATE_VERSION: str = "01"
-    GATE_MEMBER: bytes = f"GATEM{GATE_VERSION}".encode("utf-8")
+    GATE_MEMBER: bytes = LazyAttribute(
+        render=lambda instance, p:
+        f"GATEM{instance.GATE_VERSION}".encode("utf-8")
+    )
     GATE_COMMAND_RING: bytes = b"\x00"
     GATE_COMMAND_READY: bytes = b"\x01"
     GATE_COMMAND_REQUEST: bytes = b"\x02"
@@ -80,159 +219,42 @@ class DefaultSettings:
     HUGE_DATA_END_TAG = b"HugeDataEND"
     HUGE_DATA_EXCEPT_TAG = b"HugeDataException"
     SERVICE_DEFAULT_NAME: str = "GateRPC"
-    REPLY_TIMEOUT: float = 2 * _LazyProperty("TIMEOUT")
+    REPLY_TIMEOUT: float = LazyAttribute(
+        render=lambda instance, p: 2 * instance.TIMEOUT if p is empty else p
+    )
     # log
-    LOGGING = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "debug": {
-                "format": "%(asctime)s %(levelname)s %(name)s "
-                          "[%(processName)s(%(process)d):"
-                          "%(threadName)s(%(thread)d)]\n"
-                          "%(pathname)s[%(funcName)s:%(lineno)d] "
-                          "-\n%(message)s",
-            },
-            "verbose": {
-                "format": "%(asctime)s %(levelname)s %(name)s "
-                          "%(module)s.[%(funcName)s:%(lineno)d] "
-                          "-\n%(message)s",
-            },
-            "simple": {
-                "format": "%(asctime)s %(levelname)s  %(name)s %(module)s "
-                          "- %(message)s"
-            },
-        },
-        "handlers": {
-            "asyncio": {
-                "level": "DEBUG",
-                "class": "gaterpc.utils.AQueueHandler",
-                "handler_class": "logging.handlers.TimedRotatingFileHandler",
-                "loop": "asyncio.get_running_loop",
-                "filename": "asyncio.log",
-                "formatter": "debug",
-                "when": "midnight",
-                "backupCount": 10
-            },
-            "gaterpc": {
-                "level": "DEBUG",
-                "class": "gaterpc.utils.AQueueHandler",
-                "handler_class": "logging.handlers.TimedRotatingFileHandler",
-                "loop": "asyncio.get_running_loop",
-                "filename": "gaterpc.log",
-                "formatter": "verbose",
-                "when": "midnight",
-                "backupCount": 10
-            },
-            "console": {
-                "level": "DEBUG",
-                "class": "logging.StreamHandler",
-                "formatter": "simple",
-            },
-        },
-        "loggers": {
-            "multiprocessing": {
-                "handlers": ["gaterpc", "console"],
-                "propagate": False,
-                "level": "DEBUG"
-            },
-            "asyncio": {
-                "level": "INFO",
-                "handlers": ["asyncio"],
-                "propagate": False,
-            },
-            "gaterpc": {
-                "level": "INFO",
-                "handlers": ["gaterpc"],
-                "propagate": True,
-            },
-            "gaterpc.zap": {
-                "level": "INFO",
-                "handlers": ["gaterpc"],
-                "propagate": True,
-            },
-            "commands": {
-                "level": "INFO",
-                "handlers": ["console"],
-                "propagate": False,
-            },
-        },
-    }
+    DEFAULT_LOGGING = LazyAttribute(
+        _DEFAULT_LOGGING,
+        render=logging_render, process=logging_process
+    )
+    LOGGING = LazyAttribute(render=logging_render, process=logging_process)
 
-
-class GlobalSettings(object):
-    def __init__(self):
-        self._options = list()
-
-    def __setattr__(self, name, value):
-        super().__setattr__(name, value)
-        if name.isupper():
-            self._options.append(name)
-
-    def __getattr__(self, item):
-        if not self._options:
-            raise RuntimeError(
-                "Global settings have not been configured,"
-                " please run Settings.setup first."
-            )
-        raise AttributeError
-
-    def __getattribute__(self, item):
-        attr = super().__getattribute__(item)
-        if item.isupper() and item in self._options and isinstance(
-                attr, _LazyProperty
-        ):
-            return attr(self)
-        return attr
-
-    def __iter__(self):
-        return iter(self._options)
-
-    def __contains__(self, item):
-        return item in self._options
+    def configure(self, name, value):
+        if isinstance(value, LazyAttribute):
+            setattr(GlobalSettings, name, value)
+        else:
+            setattr(self, name, value)
 
     def setup(self, **options):
-        for k, v in DefaultSettings.__dict__.items():
-            if k.isupper():
-                setattr(self, k, v)
-
-        if hasattr(self, "EVENT_LOOP_POLICY"):
-            asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
-
-        if not hasattr(self, "GLOBAL_LOOP"):
-            setattr(self, "GLOBAL_LOOP", asyncio.new_event_loop())
-        asyncio.set_event_loop(self.GLOBAL_LOOP)
-
+        if self.USER_SETTINGS:
+            for name in dir(self.USER_SETTINGS):
+                if name.isupper() and not name.startswith("_"):
+                    value = getattr(self.USER_SETTINGS, name)
+                    self.configure(name, value)
         for name, value in options.items():
             if not name.isupper():
                 Warning(f"Settings {name} must be uppercase.")
                 continue
-            if name in ("RUN_PATH", "LOG_PATH"):
-                assert isinstance(value, Path), ValueError(
-                    "%s must be a Path." % name
-                )
-            setattr(self, name, value)
-        if "RUN_PATH" not in options:
-            setattr(self, "RUN_PATH", self.BASE_PATH.joinpath("run/"))
-        if "LOG_PATH" not in options:
-            setattr(self, "LOG_PATH", self.BASE_PATH.joinpath("log/"))
+            self.configure(name, value)
 
-        if self.DEBUG:
-            for handler in self.LOGGING["handlers"].values():
-                handler["formatter"] = "debug"
-            for logger in self.LOGGING["loggers"].values():
-                logger["level"] = "DEBUG"
-                logger["handlers"].append("console")
-        self.LOG_PATH.mkdir(parents=True, exist_ok=True)
-        for name, handler in self.LOGGING["handlers"].items():
-            if "filename" in handler:
-                handler["filename"] = self.LOG_PATH / handler["filename"]
-        dictConfig(self.LOGGING)
-        self.RUN_PATH.mkdir(parents=True, exist_ok=True)
-        # self.ZAP_ADDR = self.RUN_PATH.joinpath(
-        #     f"gate.zap.{randint(1, 10)}"
-        # ).as_posix()
-        # self.ZAP_ADDR = f"ipc://{self.ZAP_ADDR}"
+        if getattr(self, "EVENT_LOOP_POLICY", None):
+            asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
+
+        if not self.GLOBAL_LOOP:
+            self.GLOBAL_LOOP = asyncio.new_event_loop()
+        dictConfig(self.DEFAULT_LOGGING)
+        if self.LOGGING:
+            dictConfig(self.LOGGING)
 
 
 Settings = GlobalSettings()

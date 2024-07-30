@@ -14,7 +14,7 @@ from threading import Thread
 from time import time
 from traceback import format_exception
 
-from gaterpc.global_settings import DefaultSettings, Settings
+from gaterpc.global_settings import Settings
 from gaterpc.core import (
     AsyncZAPService, Context, Worker, Service, AMajordomo,
     Client,
@@ -185,10 +185,10 @@ if __name__ == "__main__":
     if not argv:
         argv = [
             "ipc:///tmp/gate-rpc/run/c1",
-            DefaultSettings.WORKER_ADDR, None, None
+            Settings.WORKER_ADDR, None, None
         ]
     if len(argv) == 1:
-        argv.extend([DefaultSettings.WORKER_ADDR, None, None])
+        argv.extend([Settings.WORKER_ADDR, None, None])
     elif len(argv) == 2:
         argv.extend([None, None])
     elif len(argv) == 3:

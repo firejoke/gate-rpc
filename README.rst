@@ -23,35 +23,97 @@ gate-rpc
 配置
 ******
 
-在实例化 Worker、Service、AMajordomo、Client 各类之前，需要运行 Settings.setup 函数来配置全局配置 [#f1]_ ，
-特殊返回值的序列化通过 MessagePack 的全局实例来定制 [#f2]_ 。
+在实例化 Worker、Service、AMajordomo、Client 各类之前，
+需要运行 Settings.setup 函数来初始化全局配置 [#f1]_ 。
 
 ::
 
-    # 可能会修改的几个主要配置
-    Settings.HEARTBEAT: int = 全局的默认的心跳间隔，单位是毫秒
-    Settings.TIMEOUT: float = 全局的默认超时时间，单位是秒
-    Settings.MESSAGE_MAX: int = Worker 和 Client 实例里等待处理的消息最大数量
-    Settings.HUGE_DATA_SIZEOF: int = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
-    Settings.HUGE_DATA_COMPRESS_MODULE: str = 使用的压缩模块的名称 [#f1]_
-    Settings.SERVICE_DEFAULT_NAME: str = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
-    Settings.WORKER_ADDR: str = Majordomo 用于绑定给 Worker 连接的地址，一般是 inproc 类型，当使用 inproc 地址时，需要和 Majordomo 使用同一个 Context
-    Settings.MDP_INTERNAL_SERVICE_PREFIX: bytes = MDP 内部服务的前缀
-    Settings.MDP_HEARTBEAT_INTERVAL: int = 服务端和客户端相对于中间代理的心跳间隔时间，单位是毫秒，默认是使用上面的Settings.HEARTBEAT
-    Settings.MDP_HEARTBEAT_LIVENESS: int = 心跳活跃度，用于判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线，默认3次
-    Settings.REPLY_TIMEOUT: float = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
-    Settings.STREAM_REPLY_MAXSIZE: int = 流式数据使用的缓存队列的最大长度（使用的 asyncio.Queue）
-    Settings.REPLY_TIMEOUT: float = 获取回复的超时时间，也是流式传输的每一个子回复的超时时间，单位是秒，默认使用的全局的Settings.TIMEOUT
-    Settings.ZAP_PLAIN_DEFAULT_USER: str = ZAP 的 PLAIN 机制的默认用户名
-    Settings.ZAP_PLAIN_DEFAULT_PASSWORD: str = ZAP 的 PLAIN 机制的默认密码
-    Settings.ZAP_ADDR: str = ZAP 服务绑定的地址，如果是和代理服务一起使用，最好使用 ipc 类型，且不要和代理使用同一个 Context
-    Settings.ZAP_REPLY_TIMEOUT: float = 等待 ZAP 服务的回复的超时时间，单位是秒，远比普通的REPLY_TIMEOUT短，因为zap服务处理每一个zap请求必须很快
-    Settings.GATE_CLUSTER_NAME: str = gate集群的集群名
-    Settings.GATE_CLUSTER_DESCRIPTION: str = gate集群的描述
-    Settings.MEMBER: str = gate集群的成员版本
+    # 除了直接配置 Settings的属性以外，也可以创建一个包含配置项的python文件
+    # 然后在程序入口配置 Settings.USER_SETTINGS
+    project/
+    ├── __init__.py
+    ├── package
+    │   ├── __init__..py
+    │   ├── settings.py
+    ├── settings.py
+    ├── run.py
+    # 在 run.py 里
+    Settings.xxxx = yyyy
+    Settings.USER_SETTINGS = "package.settings or settings"
     Settings.setup()
 
-    # 特殊返回值的序列化配置 [#f2]_
+
+全局配置里有些是使用 utils.LazyAttribute 构建的描述器，在设置和获取时可能会触发校验或被修改。
+
+例如像是 RUN_PATH 和 LOG_PATH 这类路径的配置，如果只配置了BASE_PATH，
+那么在调用这类属性时，会直接拼接在 BASE_PATH 下，并创建出真实目录，
+而在配置该类属性时，则会触发类型检查，保证配置的是 pathlib.Path 类的实例。
+
+自定义配置也可以使用 utils.LazyAttribute 包装成描述器，以便不用立即配置，而是在调用时才配置。
+
+LazyAttribute 初始化时接受三个可选参数：
+
+- raw: 原始值，默认是 empty
+- render: 一个 Callable 对象，必须接受两个位置参数，在实例调用该描述器所表示的属性时，会传递调用实例和原始值，并将返回值返回给调用实例
+- process: 一个 Callable 对象，必须接受两个位置参数，在实例设置该描述器所表示的属性时，会传递调用实例和原始值，并将返回值保存为该描述器的原始值
+
+
+::
+
+    import os
+    from pathlib import Path
+    from gaterpc.utils import LazyAttribute, empty, TypeValidator, ensure_mkdir
+
+
+    BASE_PATH = Path("xxx")
+    NAME = os.getenv("NAME", "MyGATE")
+    # 使用实例已经有的值来配置
+    ZAP_PLAIN_DEFAULT_USER = LazyAttribute(
+        render=lambda instance, p: instance.NAME if p is empty else p
+    )
+    # 在实例设置属性时对值进行校验
+    A_PATH = LazyAttribute(
+        render=lambda instance, p: ensure_mkdir(
+            instance.BASE_PATH.joinpath("a")
+        ) if p is empty else ensure_mkdir(p),
+        process=lambda instance, p: TypeValidator(Path)(p)
+    )
+    # 通过在实例设置属性时抛出异常来阻止设置该属性
+    B_PATH = LazyAttribute(
+        render=lambda instance, p: ensure_mkdir(
+            instance.A_PATH.joinpath("b")
+        ),
+        process=lambda instance, p: (_ for _ in ()).throw(AttributeError)
+    )
+
+
+以下是可能修改的一些主要配置的解释
+
+- HEARTBEAT: int = 全局的默认的心跳间隔，单位是毫秒
+- TIMEOUT: float = 全局的默认超时时间，单位是秒
+- MESSAGE_MAX: int = Worker 和 Client 实例里等待处理的消息最大数量
+- HUGE_DATA_SIZEOF: int = 每次传输的结果值的最大大小，超过该值的将会被压缩并分片传输
+- HUGE_DATA_COMPRESS_MODULE: str = 使用的压缩模块的名称 [#f1]_
+- SERVICE_DEFAULT_NAME: str = 默认的服务名，当在实例化 Service 时如果不提供 name 参数则会以这个为服务名
+- WORKER_ADDR: str = Majordomo 用于绑定给 Worker 连接的地址，一般是 inproc 类型，当使用 inproc 地址时，需要和 Majordomo 使用同一个 Context
+- MDP_INTERNAL_SERVICE_PREFIX: bytes = MDP 内部服务的前缀
+- MDP_HEARTBEAT_INTERVAL: int = 服务端和客户端相对于中间代理的心跳间隔时间，单位是毫秒，默认是使用上面的HEARTBEAT
+- MDP_HEARTBEAT_LIVENESS: int = 心跳活跃度，用于判定掉线的丢失心跳次数，即当超过该次数*心跳时间没有收到心跳则认为已经掉线，默认3次
+- REPLY_TIMEOUT: float = 客户端调用远程方法时，等待回复的超时时间，应设置的远远大于心跳时间，默认是一分钟
+- STREAM_REPLY_MAXSIZE: int = 流式数据使用的缓存队列的最大长度（使用的 asyncio.Queue）
+- REPLY_TIMEOUT: float = 获取回复的超时时间，也是流式传输的每一个子回复的超时时间，单位是秒，默认使用的全局的TIMEOUT
+- ZAP_PLAIN_DEFAULT_USER: str = ZAP 的 PLAIN 机制的默认用户名
+- ZAP_PLAIN_DEFAULT_PASSWORD: str = ZAP 的 PLAIN 机制的默认密码
+- ZAP_ADDR: str = ZAP 服务绑定的地址，如果是和代理服务一起使用，最好使用 ipc 类型，且不要和代理使用同一个 Context
+- ZAP_REPLY_TIMEOUT: float = 等待 ZAP 服务的回复的超时时间，单位是秒，远比普通的REPLY_TIMEOUT短，因为zap服务处理每一个zap请求必须很快
+- GATE_CLUSTER_NAME: str = gate集群的集群名
+- GATE_CLUSTER_DESCRIPTION: str = gate集群的描述
+- MEMBER: str = gate集群的成员版本
+
+特殊返回值的序列化通过 MessagePack 的全局实例（gaterpc.utils.message_pack）来定制 [#f2]_ 。
+
+::
+
     from gaterpc.utils import message_pack
     message_pack.prepare_pack = 在使用 msgpack.packb 时，传递给 default 参数的可执行对象
     message_pack.unpack_object_hook = 在使用 msgpack.unpackb 时，传递给 object_hook 的可执行对象
@@ -138,8 +200,10 @@ gate-rpc
     )
     gr_worker.run()
 
-当要执行 IO 密集或 CPU 密集型操作时，可以在方法内使用执行器来执行，可以使用自带的两个执行器，也可以使用自定义的；
+当要执行 IO 密集或 CPU 密集型操作时，可以在方法内使用执行器来执行，可以使用自带的两个执行器，也可以使用自定义的。
+
 另外，所有同步的函数都会使用默认执行器执行，默认执行器是 ThreadPoolExecutor 实例，可以修改。
+
 如果连接地址使用的 inproc 类型，一定要和 Majordomo 使用同一个 Context。
 
 ::
@@ -156,35 +220,17 @@ gate-rpc
         result = await self.run_in_executor(self.process_executor, func, queue, *args, **kwargs)
         return result
 
-实例化代理时会绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来，bind 方法是绑定的给客户端访问的地址也就是前端地址。
+实例化代理时需要绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来。
 
 ::
 
     from gaterpc.core import AMajordomo, Context
     from gaterpc.utils import interface
 
-    # Majordomo
-    class GRMajordomo(AMajordomo):
-        # 可以新增内部处理程序，用于扩展分布式应用，所有内部处理程序都必须能接收关键词参数
-        # 位置参数可以自定义，也可以没有，关键词参数会被更新加入固定参数
-        # kwargs 的结构是固定的
-        # kwargs = {
-        #    "client_id": client_id,
-        #    "client_addr": client_addr,
-        #    "request_id": request_id,
-        #    "body": body
-        # }
-        @interface
-        def internal_x_process(self, **kwargs):
-            return stat_code
-
-        @interface
-        async def internal_y_process(self, a, b, c, **kwargs):
-            return stat_code
 
     Settings.setup()
     ctx = Context()
-    gr_majordomo = GRMajordomo(
+    majordomo = Majordomo(
         context=ctx,
         gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
         gate_zap_credentials=(
@@ -193,17 +239,13 @@ gate-rpc
         )
     )
     # 绑定后端地址，为空则使用 Settings.WORKER_ADDR
-    gr_majordomo.bind_backend()
-    gr_majordomo.bind_frontend("ipc:///tmp/gate-rpc/run/c1")
-    # 如果需要为其他代理提供服务
-    gr_majordomo.bind_gate(bind_gate)
+    majordomo.bind_backend()
+    majordomo.bind_frontend("ipc:///tmp/gate-rpc/run/c1")
     # 如果启用了 zap 服务
-    await gr_majordomo.connect_zap(zap_addr=zipc)
+    await majordomo.connect_zap(zap_addr=zipc)
     # 发起 zap 请求和等待 zap 处理结果是使用的 asyncio.Future 来处理异步等待，
     # 并且使用 LRUCache 缓存每个地址使用不同的校验策略的结果，避免频繁发起验证请求而导致增加 rpc 调用的时间
-    gr_majordomo.run()
-    # 如果要连接其他的代理节点，需要在本地代理启动后
-    await gr_majordomo.connect_gate(connect_gate)
+    majordomo.run()
 
 客户端直接连接代理地址，使用点语法调用远程方法，一般格式是 client.服务名.方法名，当直接使用 client.方法名时，会使用默认服务名调用。
 
@@ -231,6 +273,8 @@ gate-rpc
 Gate cluster
 ************
 
+当布置多代理集群时，用 bind_gate 绑定集群节点地址。
+
 在 Gate 集群内各个节点可以转发当前节点的前端请求到其他节点，
 也可以请求其他节点的内部方法（比如分布式算法的集群节点选举）,
 内部方法必须返回一个由状态码和结果组成的元组。
@@ -243,11 +287,38 @@ Gate cluster
     from gaterpc.core import AMajordomo
 
     class Gate(AMajordomo):
+        # 可以新增内部处理程序，用于扩展分布式应用，所有内部处理程序都必须能接收关键词参数
+        # 位置参数可以自定义，也可以没有，关键词参数会被更新加入固定参数
+        # kwargs 的结构是固定的
+        # kwargs = {
+        #    "client_id": client_id,
+        #    "client_addr": client_addr,
+        #    "request_id": request_id,
+        #    "body": body
+        # }
         @interface
         def internal_service(self, *args, **kwargs):
             status_code = b"200" # response code
             result = Any
             return status_code, result
+
+    Settings.setup()
+    ctx = Context()
+    gate = Gate(
+        context=ctx,
+        gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
+        gate_zap_credentials=(
+            Settings.ZAP_PLAIN_DEFAULT_USER,
+            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        )
+    )
+
+    # 为其他代理提供服务
+    gate.bind_gate(bind_gate)
+    # 如果启用了 zap 服务
+    await gate.connect_zap(zap_addr=zipc)
+    # 要连接其他的代理节点，需要在本地代理启动后
+    await gate.connect_gate(connect_gate)
 
 笔记
 ******

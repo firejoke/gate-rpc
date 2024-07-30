@@ -110,35 +110,27 @@ class Context(z_aio.Context):
             super().__init__(io_threads=io_threads)
 
 
-def set_ctx(ctx: Context, settings: dict = None):
-    _settings = dict()
-    for k in Settings:
-        if k.startswith("ZMQ_CONTEXT_"):
-            _settings[k[12:]] = getattr(Settings, k)
-    if not settings:
-        settings = dict()
-    settings.update(_settings)
-    for k, v in settings.items():
+def set_ctx(ctx: Context, options: dict = None):
+    _options = Settings.ZMQ_CONTEXT
+    if options:
+        _options.update(options)
+    for op, v in _options.items():
         try:
-            ctx.set(getattr(z_const, k), v)
+            ctx.set(op, v)
         except AttributeError:
             pass
 
 
-def set_sock(sock: z_aio.Socket, settings: dict = None):
-    _settings = dict()
-    for k in Settings:
-        if k.startswith("ZMQ_SOCK_"):
-            _settings[k[9:]] = getattr(Settings, k)
-    if not settings:
-        settings = dict()
-    settings.update(_settings)
-    for k, v in settings.items():
+def set_sock(sock: z_aio.Socket, options: dict = None):
+    _options = Settings.ZMQ_CONTEXT
+    if options:
+        _options.update(options)
+    for op, v in _options.items():
         try:
-            if k == "HWM":
+            if op == z_const.HWM:
                 sock.set_hwm(v)
             else:
-                sock.set(getattr(z_const, k), v)
+                sock.set(op, v)
         except AttributeError:
             pass
 

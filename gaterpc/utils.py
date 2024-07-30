@@ -16,15 +16,19 @@ import struct
 import threading
 import time
 import warnings
+from pathlib import Path
 
 import math
 import zlib
 
 from asyncio import Future, Task
-from collections import UserDict, deque, namedtuple
+from collections import Counter, UserDict, deque, namedtuple
 from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ProcessPoolExecutor
-from functools import _make_key, partial, update_wrapper, wraps, lru_cache
+from functools import (
+    WRAPPER_ASSIGNMENTS, _make_key, partial, update_wrapper,
+    wraps, lru_cache,
+)
 from importlib import import_module
 from logging import Handler
 from multiprocessing import Manager
@@ -45,8 +49,6 @@ from .mixins import _LoopBoundMixin
 
 
 SyncManager = Manager()
-KT = TypeVar("KT")
-VT = TypeVar("VT")
 
 
 def singleton(cls):
@@ -143,11 +145,13 @@ async def throw_exception_agenerator(ag: AsyncGenerator, exc: BaseException):
         pass
 
 
-class Temp:
+class Empty:
 
     def __bool__(self):
         return False
 
+
+empty = Empty()
 
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
@@ -174,33 +178,19 @@ class LRUCache(object):
         if key in self.cache:
             return
         if self.full:
-            # Use the old root to store the new key and result.
             oldroot = self.root
             oldroot[self.KEY] = key
             oldroot[self.RESULT] = value
-            # Empty the oldest link and make it the new root.
-            # Keep a reference to the old key and old result to
-            # prevent their ref counts from going to zero during the
-            # update. That will prevent potentially arbitrary object
-            # clean-up code (i.e. __del__) from running while we're
-            # still adjusting the links.
             self.root = oldroot[self.NEXT]
             oldkey = self.root[self.KEY]
             oldresult = self.root[self.RESULT]
             self.root[self.KEY] = self.root[self.RESULT] = None
-            # Now update the cache dictionary.
             del self.cache[oldkey]
-            # Save the potentially reentrant cache[key] assignment
-            # for last, after the root and links have been put in
-            # a consistent state.
             self.cache[key] = oldroot
         else:
-            # Put result in a new link at the front of the queue.
             last = self.root[self.PREV]
             link = [last, self.root, key, value]
             last[self.NEXT] = self.root[self.PREV] = self.cache[key] = link
-            # Use the cache_len bound method instead of the len() function
-            # which could potentially be wrapped in an lru_cache itself.
             self.full = len(self.cache) >= self.maxsize
 
     def __getitem__(self, item):
@@ -224,24 +214,22 @@ class LRUCache(object):
 
 def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
     loop = asyncio.get_event_loop()
-    # Constants shared by all lru cache instances:
-    sentinel = object()          # unique object used to signal cache misses
-    make_key = _make_key         # build a key from the function arguments
-    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3   # names for the link fields
+    sentinel = object()
+    make_key = _make_key
+    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3
 
     cache = {}
     hits = misses = 0
     full = False
-    cache_get = cache.get    # bound method to lookup a key or return None
-    cache_len = cache.__len__  # get cache size without calling len()
-    lock = threading.RLock()           # because linkedlist updates aren't threadsafe
-    root = []                # root of the circular doubly linked list
-    root[:] = [root, root, None, None]     # initialize by pointing to self
+    cache_get = cache.get
+    cache_len = cache.__len__
+    lock = threading.RLock()
+    root = []
+    root[:] = [root, root, None, None]
 
     if maxsize == 0:
 
         async def wrapper(*args, **kwds):
-            # No caching -- just a statistics update
             nonlocal misses
             misses += 1
             result = await user_function(*args, **kwds)
@@ -250,7 +238,6 @@ def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
     elif maxsize is None:
 
         async def wrapper(*args, **kwds):
-            # Simple caching without ordering or size limit
             nonlocal hits, misses
             key = make_key(args, kwds, typed)
             result = cache_get(key, sentinel)
@@ -266,13 +253,11 @@ def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
     else:
 
         async def wrapper(*args, **kwds):
-            # Size limited caching that tracks accesses by recency
             nonlocal root, hits, misses, full
             key = make_key(args, kwds, typed)
             with lock:
                 link = cache_get(key)
                 if link is not None:
-                    # Move the link to the front of the circular queue
                     link_prev, link_next, _key, result = link
                     link_prev[NEXT] = link_next
                     link_next[PREV] = link_prev
@@ -286,39 +271,21 @@ def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
             f = loop.create_future()
             with lock:
                 if key in cache:
-                    # Getting here means that this same key was added to the
-                    # cache while the lock was released.  Since the link
-                    # update is already done, we need only return the
-                    # computed result and update the count of misses.
                     pass
                 elif full:
-                    # Use the old root to store the new key and result.
                     oldroot = root
                     oldroot[KEY] = key
                     oldroot[RESULT] = f
-                    # Empty the oldest link and make it the new root.
-                    # Keep a reference to the old key and old result to
-                    # prevent their ref counts from going to zero during the
-                    # update. That will prevent potentially arbitrary object
-                    # clean-up code (i.e. __del__) from running while we're
-                    # still adjusting the links.
                     root = oldroot[NEXT]
                     oldkey = root[KEY]
                     oldresult = root[RESULT]
                     root[KEY] = root[RESULT] = None
-                    # Now update the cache dictionary.
                     del cache[oldkey]
-                    # Save the potentially reentrant cache[key] assignment
-                    # for last, after the root and links have been put in
-                    # a consistent state.
                     cache[key] = oldroot
                 else:
-                    # Put result in a new link at the front of the queue.
                     last = root[PREV]
                     link = [last, root, key, f]
                     last[NEXT] = root[PREV] = cache[key] = link
-                    # Use the cache_len bound method instead of the len() function
-                    # which could potentially be wrapped in an lru_cache itself.
                     full = (cache_len() >= maxsize)
 
             f.set_result(await user_function(*args, **kwds))
@@ -371,696 +338,154 @@ def coroutine_lru_cache(maxsize=128, typed=False):
     return decorating_function
 
 
-class _LazyProperty:
-    def __init__(self, _property, ins: Any = None):
-        """
-        延时计算的属性
-        """
-        self._property = _property
-        self._ins = ins
+class Validator:
+    def __init__(self, error_message=None):
+        if error_message:
+            self.error_message = error_message
 
-    def __call__(self, ins: Any = None):
-        if not ins:
-            ins = self._ins
-        if not ins:
-            raise RuntimeError
-        if callable(self._property):
-            return self._property(ins)
-        return getattr(ins, self._property)
-
-    def __add__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.add(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.add(self(ins), other),
-            self._ins
-        )
-
-    def __radd__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.add(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.add(other, self(ins)),
-            self._ins
-        )
-
-    def __sub__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.sub(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.sub(self(ins), other),
-            self._ins
-        )
-
-    def __rsub__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.sub(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.sub(other, self(ins)),
-            self._ins
-        )
-
-    def __mul__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.mul(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.mul(self(ins), other),
-            self._ins
-        )
-
-    def __rmul__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.mul(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.mul(other, self(ins)),
-            self._ins
-        )
-
-    def __matmul__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.matmul(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.matmul(self(ins), other),
-            self._ins
-        )
-
-    def __rmatmul__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.matmul(other(ins), self(ins)),
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.matmul(other, self(ins)),
-            self._ins
-        )
-
-    def __truediv__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.truediv(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.truediv(self(ins), other),
-            self._ins
-        )
-
-    def __rtruediv__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.truediv(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.truediv(other, self(ins)),
-            self._ins
-        )
-
-    def __floordiv__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.floordiv(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.floordiv(self(ins), other),
-            self._ins
-        )
-
-    def __rfloordiv__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.floordiv(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.floordiv(other, self(ins)),
-            self._ins
-        )
-
-    def __mod__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.mod(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.mod(self(ins), other),
-            self._ins
-        )
-
-    def __rmod__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.mod(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.mod(other, self(ins)),
-            self._ins
-        )
-
-    def __divmod__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: divmod(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: divmod(self(ins), other),
-            self._ins
-        )
-
-    def __rdivmod__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: divmod(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: divmod(other, self(ins)),
-            self._ins
-        )
-
-    def __pow__(self, other, modulo=None):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: pow(self(ins), other(ins), modulo),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: pow(self(ins), other, modulo),
-            self._ins
-        )
-
-    def __rpow__(self, other, modulo=None):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: pow(other(ins), self(ins), modulo),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: pow(other, self(ins), modulo),
-            self._ins
-        )
-
-    def __lshift__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.lshift(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.lshift(self(ins), other),
-        )
-
-    def __rlshift__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.lshift(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.lshift(other, self(ins)),
-        )
-
-    def __rshift__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.rshift(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.rshift(self(ins), other),
-            self._ins
-        )
-
-    def __rrshift__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.rshift(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.rshift(other, self(ins)),
-            self._ins
-        )
-
-    def __and__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.and_(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.and_(self(ins), other),
-            self._ins
-        )
-
-    def __rand__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.and_(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.and_(other, self(ins)),
-            self._ins
-        )
-
-    def __xor__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.xor(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.xor(self(ins), other),
-            self._ins
-        )
-
-    def __rxor__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.xor(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.xor(other, self(ins)),
-            self._ins
-        )
-
-    def __or__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.or_(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.or_(self(ins), other),
-            self._ins
-        )
-
-    def __ror__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.or_(other(ins), self(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.or_(other, self(ins)),
-            self._ins
-        )
-
-    def __lt__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.lt(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.lt(self(ins), other),
-            self._ins
-        )
-
-    def __le__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.le(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.le(self(ins), other),
-            self._ins
-        )
-
-    def __eq__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.eq(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.eq(self(ins), other),
-            self._ins
-        )
-
-    def __ne__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.ne(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.ne(self(ins), other),
-            self._ins
-        )
-
-    def __ge__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.ge(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.ge(self(ins), other),
-            self._ins
-        )
-
-    def __gt__(self, other):
-        if isinstance(other, _LazyProperty):
-            return _LazyProperty(
-                lambda ins=None: operator.gt(self(ins), other(ins)),
-                self._ins
-            )
-        return _LazyProperty(
-            lambda ins=None: operator.gt(self(ins), other),
-            self._ins
-        )
-
-    def __neg__(self):
-        return _LazyProperty(
-            lambda ins=None: operator.neg(self(ins)),
-            self._ins
-        )
-
-    def __pos__(self):
-        return _LazyProperty(
-            lambda ins=None: operator.pos(self(ins)),
-            self._ins
-        )
-
-    def __abs__(self):
-        return _LazyProperty(
-            lambda ins=None: operator.abs(self(ins)),
-            self._ins
-        )
-
-    def __invert__(self):
-        return _LazyProperty(
-            lambda ins=None: operator.invert(self(ins)),
-            self._ins
-        )
-
-    def __int__(self):
-        return int(self())
-
-    def __float__(self):
-        return float(self())
-
-    def __floor__(self):
-        return _LazyProperty(
-            lambda ins=None: math.floor(self(ins)),
-            self._ins
-        )
-
-    def __ceil__(self):
-        return _LazyProperty(
-            lambda ins=None: math.ceil(self(ins)),
-            self._ins
-        )
-
-    def __trunc__(self):
-        return _LazyProperty(
-            lambda ins=None: math.trunc(self(ins)),
-            self._ins
-        )
-
-    def __str__(self):
-        return (
-            f"Lazy retrieval of the value for instance \"{self._property}\"."
-        )
-
-
-class BoundedDict(UserDict, _LoopBoundMixin):
-    """
-    参考 asyncio.BoundedSemaphore
-    有大小限制和超时获取的字典类，可存储键值对的最大数量默认为1000，
-    建议根据内存大小和可能接收的消息的大小设置
-    """
-
-    def __init__(
-        self, maxsize: int = 1000, timeout: float = 0,
-        /, **kwargs
-    ):
-        """
-        :param maxsize: 键值对最大数量。
-        :param timeout: 任何异步操作的超时时间，单位是秒。
-        :param kwargs: 初始键值对。
-        """
-        self.maxsize = maxsize
-        if self.maxsize <= 0:
-            self.maxsize = float("+inf")
-        self.usable_size = maxsize
-        self.timeout = timeout
-        self._waiters: dict[KT, tuple[Future, deque[Future]]] = dict()
-        self._later_task: set = set()
-        self._sync_task = deque()
-        data = kwargs
-        if (len(data) + len(kwargs)) > maxsize:
-            raise RuntimeError(
-                "The initial data size exceeds the maximum size limit."
-            )
-        super().__init__(data, **kwargs)
-
-    def _set_locked(self):
-        return self.usable_size == 0
-
-    def full(self):
-        return self._set_locked()
-
-    async def aset(self, key: KT, value: VT, timeout: float = None):
-        if timeout is None:
-            timeout = self.timeout
-        fut, waiters = self._waiters.get(key, (None, None))
-        if not fut and not self._set_locked():
-            if key not in self.data:
-                self.usable_size -= 1
-            self.data[key] = value
-            return
-        elif fut and not self._set_locked():
-            if not fut.done():
-                fut.set_result(None)
-        elif not fut:
-            fut = self._get_loop().create_future()
-            waiters: deque[Future] = deque()
-            self._waiters[key] = (fut, waiters)
-        try:
-            if not fut.done():
-                await asyncio.wait_for(fut, timeout)
-            self.data[key] = value
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_result(True)
-        except asyncio.CancelledError:
-            for waiter in waiters:
-                if not waiter.done():
-                    waiter.cancel()
-            self.usable_size += 1
-            self._wake_up_next_set()
-            raise
-        except asyncio.TimeoutError:
-            raise DictFull(self.maxsize)
-        finally:
-            self._waiters.pop(key)
-            self._wake_up_next_set()
-        return
-
-    def set(self, key: KT, value: VT):
-        sync_task = self._get_loop().create_task(self.aset(key, value))
-        self._sync_task.append(sync_task)
-        sync_task.add_done_callback(self._sync_task.remove)
-        return sync_task
-
-    def _release_set(self):
-        if self.usable_size >= self.maxsize:
-            return
-            # raise ValueError('BoundedDict released too many times')
-        self.usable_size += 1
-        self._wake_up_next_set()
-
-    def _wake_up_next_set(self):
-        for key, (fut, waiters) in self._waiters.items():
-            if not fut.done():
-                self.usable_size -= 1
-                fut.set_result(True)
-            return
-
-    async def apop(
-        self,
-        key: KT,
-        default: VT = Temp,
-        timeout: float = None,
-    ):
-        """
-        :param key: 要弹出的 key
-        :param default: 没有 key 时返回的值
-        :param timeout: 超时时间
-        :return:
-        """
-        if timeout is None:
-            timeout = self.timeout
-
-        try:
-            value = self.data.pop(key)
-            return value
-        except KeyError:
-            if self.full():
-                if default != Temp:
-                    return default
-                raise
-            if key in self._waiters and self._waiters[key][0].done():
-                raise RuntimeWarning('wait for the "set" lock to be released.')
-            if key not in self._waiters:
-                self._waiters[key] = (self._get_loop().create_future(), deque())
-            fut = self._get_loop().create_future()
-            dq = self._waiters[key][1]
-            self._waiters[key][1].append(fut)
-            try:
-                await asyncio.wait_for(fut, timeout)
-                try:
-                    return self.data.pop(key)
-                except KeyError:
-                    if default != Temp:
-                        return default
-                    raise
-            except asyncio.TimeoutError:
-                if default != Temp:
-                    return default
-                raise KeyError
-            finally:
-                dq.remove(fut)
-
-    async def aget(
-        self, key: KT,
-        default: VT = Temp,
-        timeout: float = None,
-    ) -> VT:
-        """
-        :param key: 要查询的 key
-        :param default: 没有 key 时返回的值
-        :param timeout: 超时时间
-        :return:
-        """
-        if timeout is None:
-            timeout = self.timeout
-
-        try:
-            value = self.data[key]
-            return value
-        except KeyError:
-            if self.full():
-                if default != Temp:
-                    return default
-                raise
-            if key in self._waiters and self._waiters[key][0].done():
-                raise RuntimeWarning('wait for the "set" lock to be released.')
-            if key not in self._waiters:
-                self._waiters[key] = (self._get_loop().create_future(), deque())
-            fut = self._get_loop().create_future()
-            dq = self._waiters[key][1]
-            dq.append(fut)
-            try:
-                await asyncio.wait_for(fut, timeout)
-                try:
-                    return self.data[key]
-                except KeyError:
-                    if default != Temp:
-                        return default
-                    raise
-            except asyncio.TimeoutError:
-                if default != Temp:
-                    return default
-                raise KeyError
-            finally:
-                dq.remove(fut)
-
-    def __getitem__(self, key) -> VT:
-        return self.data[key]
-
-    def __setitem__(self, key: KT, value: VT) -> None:
-        if not self._set_locked():
-            if key not in self.data:
-                self.usable_size -= 1
-            self.data[key] = value
-        else:
-            raise RuntimeWarning('wait for the "set" lock to be released.')
-
-    def __delitem__(self, key: KT) -> None:
-        del self.data[key]
-        return self._release_set()
-
-    def popitem(self) -> tuple[KT, VT]:
-        k, v = super().popitem()
-        return k, v
-
-    def pop(self, key: KT, default=Temp) -> VT:
-        if default == Temp:
-            value = super().pop(key)
-        else:
-            value = super().pop(key, default=default)
+    def __call__(self, value):
         return value
 
-    @overload
-    def update(self, m: MutableMapping[KT, VT], **kwargs: VT) -> None:
-        pass
 
-    @overload
-    def update(self, m: Iterable[tuple[KT, VT]], **kwargs: VT) -> None:
-        pass
+class TypeValidator(Validator):
+    error_message = "require {require_type}."
 
-    def update(self, m: None, **kwargs: VT) -> None:
-        if isinstance(m, MutableMapping):
-            items = m.items()
-        elif isinstance(m, Iterable):
-            items = m
+    def __init__(self, require_type, error_message=None):
+        self.require_type = require_type
+        super().__init__(error_message)
+
+    def __call__(self, value):
+        if not isinstance(value, self.require_type):
+            raise TypeError(
+                self.error_message.format(require_type=self.require_type)
+            )
+        return value
+
+
+def ensure_mkdir(p: Union[str, Path]):
+    if isinstance(p, str):
+        p = Path(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+_I = TypeVar("_I")
+_PV = TypeVar("_PV")
+
+
+class LazyAttribute:
+    def __init__(
+        self, raw: Any = empty,
+        render: Optional[Callable[[_I, _PV], _PV]] = None,
+        process: Optional[Callable[[_I, _PV], _PV]] = None,
+
+    ):
+        self._raw = raw
+        self._process = process
+        self._render = render
+
+    def __set_name__(self, owner, name):
+        self._name = name
+
+    def __get__(self, instance, owner=None):
+        if self._render:
+            return self._render(instance, self._raw)
+        return self._raw
+
+    def __set__(self, instance, value):
+        if self._process:
+            self._raw = self._process(instance, value)
         else:
-            items = []
-        for k, v in items:
-            self.set(key=k, value=v)
-        for k, v in kwargs.items():
-            self.set(key=k, value=v)
-        return
+            self._raw = value
+
+
+class QueueListener(object):
+    _sentinel = None
+
+    def __init__(
+        self, handlers: Union[list[Handler], tuple[Handler]] = None,
+        respect_handler_level=True
+    ):
+        self.respect_handler_level = respect_handler_level
+        self.queue = queue.Queue()
+        self.handlers = dict()
+        self._thread = None
+        if handlers:
+            self.add_handlers(handlers)
+        atexit.register(self.stop)
+        # self._loop.call_soon(self.start)
+        self.start()
+
+    def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
+        for handler in handlers:
+            self.handlers[handler.get_name()] = handler
+
+    def dequeue(self):
+        return self.queue.get()
+
+    def prepare(self, record):
+        return record
+
+    def handle(self, record):
+        record = self.prepare(record)
+        handler = self.handlers.get(record.h_name)
+        if handler:
+            if not self.respect_handler_level:
+                process = True
+            else:
+                process = record.levelno >= handler.level
+            if process:
+                handler.handle(record)
+
+    def enqueue_sentinel(self):
+        self.queue.put_nowait(self._sentinel)
+
+    def _monitor(self):
+        q = self.queue
+        has_task_done = hasattr(q, 'task_done')
+        while True:
+            try:
+                record = self.dequeue()
+                if record is self._sentinel:
+                    if has_task_done:
+                        q.task_done()
+                    break
+                self.handle(record)
+                if has_task_done:
+                    q.task_done()
+            except queue.Empty:
+                break
+            except Exception as e:
+                warnings.warn(e.__repr__())
+
+    def start(self):
+        self._thread = t = threading.Thread(target=self._monitor)
+        t.daemon = True
+        t.start()
+
+    def stop(self):
+        if self._thread:
+            self.enqueue_sentinel()
+            self._thread.join()
+            self._thread = None
 
 
 class AQueueListener(object):
     _sentinel = None
 
     def __init__(
-        self, loop, handlers: Union[list[Handler], tuple[Handler]] = None,
+        self, handlers: Union[list[Handler], tuple[Handler]] = None,
         respect_handler_level=True
     ):
+        if not (loop := asyncio.get_event_loop()).is_running():
+            self._loop = loop
+            # self._loop.run_forever()
+        else:
+            self._loop = None
         self.respect_handler_level = respect_handler_level
-        if isinstance(loop, str):
-            loop = resolve_module_attr(loop)
-        if isinstance(loop, Callable):
-            loop = loop()
-        self._loop: asyncio.AbstractEventLoop = loop
         self.queue = asyncio.Queue()
         self.handlers = dict()
         self._task: Optional[asyncio.Task] = None
-        self._thread = None
         if handlers:
             self.add_handlers(handlers)
         atexit.register(self.stop)
@@ -1113,7 +538,10 @@ class AQueueListener(object):
                 warnings.warn(e.__repr__())
 
     def start(self):
-        self._task = asyncio.create_task(self._monitor())
+        if self._loop:
+            self._task = self._loop.create_task(self._monitor())
+        else:
+            self._task = asyncio.create_task(self._monitor())
         # self._thread = t = threading.Thread(target=self._monitor)
         # t.daemon = True
         # t.start()
@@ -1121,22 +549,31 @@ class AQueueListener(object):
     def stop(self):
         if self._task:
             self._task.cancel()
+        if self._loop:
+            self._loop.stop()
         # if self._thread:
         #     self.enqueue_sentinel()
         #     self._thread.join()
         #     self._thread = None
 
 
-class QueueHandler(Handler):
+class AQueueHandler(Handler):
     def __init__(
         self, handler_class: Union[Handler, str], *args, **kwargs
     ):
         Handler.__init__(self)
         if isinstance(handler_class, str):
             handler_class = resolve_module_attr(handler_class)
-        self.listener: Optional[AQueueListener] = None
         self.handler = handler_class(*args, **kwargs)
-        self.h_name = f"QueueHandler-handler"
+        if asyncio.get_event_loop().is_running():
+            self._name = f"AQueueHandler{id(self.handler)}"
+            self.listener = singleton_aqueue_listener()
+        else:
+            self._name = f"QueueHandler{id(self.handler)}"
+            self.listener = singleton_queue_listener()
+        self.h_name = f"{self._name}-handler"
+        self.handler.set_name(self.h_name)
+        self.listener.add_handlers((self.handler,))
 
     def prepare(self, record):
         msg = self.format(record)
@@ -1166,20 +603,8 @@ class QueueHandler(Handler):
         super().close()
 
 
-class AQueueHandler(QueueHandler):
-    def __init__(
-        self, *args, handler_class: Union[Handler, str],
-        loop, **kwargs
-    ):
-        super().__init__(handler_class, *args, **kwargs)
-        self._name = f"AQueueHandler{id(self.handler)}"
-        self.h_name = f"{self._name}-handler"
-        self.handler.set_name(self.h_name)
-        self.listener = singleton_aqueue_listener(loop)
-        self.listener.add_handlers((self.handler,))
-
-
 singleton_aqueue_listener = singleton(AQueueListener)
+singleton_queue_listener = singleton(QueueListener)
 
 
 class MessagePack(object):
