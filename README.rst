@@ -40,6 +40,8 @@ gate-rpc
     # 在 run.py 里
     Settings.xxxx = yyyy
     Settings.USER_SETTINGS = "package.settings or settings"
+    # 当日志使用 utils.AQueueHandler类，并且listener指向的是一个使用asyncio的异步队列时，
+    # Settings.setup 方法要在协程里调用，因为setup方法内会初始化日志配置。
     Settings.setup()
 
 
@@ -143,7 +145,8 @@ LazyAttribute 初始化时接受三个可选参数：
     )
     zap.start()
 
-继承Worker类，用interface装饰希望被远程调用的方法，然后实例化一个Server来创建Worker的实例，这个worker实例的描述信息由server实例提供。
+继承Worker类，用interface装饰希望被远程调用的方法，
+然后实例化一个Server来创建Worker的实例，这个worker实例的描述信息由server实例提供。
 
 ::
 
@@ -162,7 +165,10 @@ LazyAttribute 初始化时接受三个可选参数：
                 "loop_time": loop.time()
             }
 
-        @interface
+        @interface("process"):
+            cpu_bound()
+
+        @interface("thread")
         def test(self, *args, **kwargs):
             return {
                 "name": "test",
@@ -186,27 +192,33 @@ LazyAttribute 初始化时接受三个可选参数：
                 yield i
                 i += 1
 
-    Settings.setup()
-    ctx = Context()
-    gr = Service(name="SRkv")
-    gr_worker = gr.create_worker(
-        GRWorker, "inproc://gate.worker.01",
-        context=ctx,
-        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
-        zap_credentials=(
-            Settings.ZAP_PLAIN_DEFAULT_USER,
-            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+    async def test():
+        Settings.setup()
+        ctx = Context()
+        gr = Service(name="SRkv")
+        gr_worker = gr.create_worker(
+            GRWorker, "inproc://gate.worker.01",
+            context=ctx,
+            zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
+            zap_credentials=(
+                Settings.ZAP_PLAIN_DEFAULT_USER,
+                Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+            )
         )
-    )
-    gr_worker.run()
+        gr_worker.run()
 
-当要执行 IO 密集或 CPU 密集型操作时，可以在方法内使用执行器来执行，可以使用自带的两个执行器，也可以使用自定义的。
+当要执行 IO 密集或 CPU 密集型操作时，可以通过interface装饰器指定是否使用在执行器里运行，
+也可以不通过interface指定，而是在方法内使用run_in_executor，也可以使用自定义的。
 
 另外，所有同步的函数都会使用默认执行器执行，默认执行器是 ThreadPoolExecutor 实例，可以修改。
 
 如果连接地址使用的 inproc 类型，一定要和 Majordomo 使用同一个 Context。
 
 ::
+
+    @interface("thread")
+    async def test_io():
+        return result
 
     @interface
     async def test_io():
@@ -215,12 +227,16 @@ LazyAttribute 初始化时接受三个可选参数：
 
     @interface
     async def test_cpu():
-        # 如果需要和 CPU 密集型执行器里的方法交换数据，可以使用 utils.SyncManager 来创建代理对象使用。
+        # 如果需要和 CPU 密集型执行器里的方法交换数据，
+        # 可以使用 utils 模块内定义的全局代理管理器 SyncManager 来创建代理对象使用。
         queue = SyncManager.Queue()
         result = await self.run_in_executor(self.process_executor, func, queue, *args, **kwargs)
         return result
 
-实例化代理时需要绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来。
+实例化代理时要绑定两个地址，一个用于给后端服务连接上来，一个给前端客户端连接上来。
+
+也可以只绑定后端地址，将代理实例作为前端使用，适合不长期自动运行的任务（参见test/testMajordomo.py）。
+还可以只绑定前端地址，将代理实例作为后端使用，适合简单的rpc调用。
 
 ::
 
@@ -269,6 +285,8 @@ LazyAttribute 初始化时接受三个可选参数：
 
 客户端调用的远程方法后，会创建一个延迟回调用来删掉缓存的已经执行完毕的请求，包括超时没拿到回复的请求，
 而流式回复会每次回调时都检查一次该 StreamReply 实例是否已经结束，没结束就再创建一个延迟回调后续再检查。
+
+更详细的测试用例可以看看test目录下的测试脚本
 
 Gate cluster
 ************
@@ -337,32 +355,37 @@ Gate cluster
 
 ::
 
-    # data 必须要是 bytes 或 bytearray，简言之能用 memoryview 包装的
+    # data 必须要是 bytes ，会通过 SharedMemory 或 os.pipe 来传递给压缩器或解压缩器
     hd = HugeData(
         Settings.HUGE_DATA_END_TAG,
         Settings.HUGE_DATA_EXCEPT_TAG,
-        data=data, compress_module="gzip", compress_level=9, frame_size_limit=1000
+        data=data, compress_module="gzip", compress_level=9, blksize=1000
     )
     c_d = b""
     async for _d in hd.compress():
         c_d += _d
-    # 或者不提供 data ，HugeData 初始化时会创建一个 Queue 的跨进程代理对象，往这个跨进程队列里传输数据即可
+    # 或者不提供 data ，HugeData 初始化时会创建一个 os.pipe 的管道，然后通过 add_data 追加需要处理的数据
     hd = HugeData(
         Settings.HUGE_DATA_END_TAG,
         Settings.HUGE_DATA_EXCEPT_TAG,
-        get_timeout=10,
-        compress_module="gzip", compress_level=9, frame_size_limit=1000
+        compress_module="gzip", compress_level=9, blksize=1000
     )
     d = process_data()
+    # 可以整个直接丢进去
+    hd.add_data(d)
+    # 或者分块传递
     for i in range(0, len(d), 1000):
         _d = d[i: i + 1000]
-        hd.data.put(_d)
+        hd.add_data(_d)
+    # 数据添加完毕后，务必调用一下flush方法
+    hd.flush()
     d_d = b""
+    # 传递未处理数据和接收已处理数据可以异步执行
     async for _d in hd.decompress(1000):
         d_d += _d
 
 HugeData 的 compress 和 decompress 方法都会在进程池里执行增量压缩和增量解压缩，
-返回的异步生成器每次获取的字节数大小不会超过 Settings.HUGE_DATA_SIZEOF ，
+返回的异步生成器每次获取的字节数大小可以通过初始化 HugeData 时传递 blksize 来限制，
 compress 方法对每一块返回的大小的限制是 HugeData 内部实现，
 decompress 方法对每一块返回的大小限制则是由压缩模块来实现，
 会在调用解压缩器实例的 decompress 方法时传递一个 max_length 位置参数。

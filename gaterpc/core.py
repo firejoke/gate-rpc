@@ -2,15 +2,12 @@
 # Author      : ShiFan
 # Created Date: 2023/3/30 11:09
 import asyncio
-import contextvars
-import functools
 import inspect
 import sys
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Coroutine, Callable, AsyncGenerator, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from time import time
 from traceback import format_exception, format_tb
 from typing import Annotated, Any, List, Tuple, Union, overload, Optional
 from uuid import uuid4
@@ -19,6 +16,8 @@ from logging import getLogger
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
 import zmq.error as z_error
+from gaterpc.exceptions import HugeDataException
+from pkg_resources import resource_listdir
 from zmq.auth import Authenticator
 
 from .global_settings import Settings
@@ -27,32 +26,24 @@ from .exceptions import (
     GateUnAvailableError, ServiceUnAvailableError,
     RemoteException,
 )
-from .mixins import _LoopBoundMixin
 from .utils import (
     HugeData, LRUCache, MsgUnpackError, StreamReply,
-    check_socket_addr,
-    generator_to_agenerator, interface, msg_pack,
-    msg_unpack, from_bytes,
-    throw_exception_agenerator, to_bytes,
+    check_socket_addr, generator_to_agenerator, throw_exception_agenerator,
+    interface, run_in_executor, from_bytes, msg_pack, msg_unpack, to_bytes,
 )
+
 
 __all__ = ["Worker", "Service", "AsyncZAPService", "AMajordomo", "Client"]
 
-
-logger = getLogger(__name__)
+logger = getLogger("gaterpc")
+Wlogger = getLogger("gaterpc.worker")
+Mlogger = getLogger("gaterpc.majordomo")
+Clogger = getLogger("gaterpc.client")
 
 
 async def generate_reply(
-    task: asyncio.Task = None,
     result: Any = None, exception: Exception = None
 ):
-    if task:
-        try:
-            await task
-            result = task.result()
-        except Exception as error:
-            result = None
-            exception = error
     if exception:
         exception = (
             exception.__class__.__name__,
@@ -63,23 +54,6 @@ async def generate_reply(
         result = generator_to_agenerator(result)
     if isinstance(result, (AsyncGenerator, HugeData)):
         return result
-    if sys.getsizeof(
-            result, Settings.HUGE_DATA_SIZEOF
-    ) > Settings.HUGE_DATA_SIZEOF:
-        loop = asyncio.get_event_loop()
-        with ProcessPoolExecutor() as executor:
-            _msg_pack = functools.partial(
-                msg_pack, result
-            )
-            data = await loop.run_in_executor(executor, _msg_pack)
-        return HugeData(
-            Settings.HUGE_DATA_END_TAG,
-            Settings.HUGE_DATA_EXCEPT_TAG,
-            data=data,
-            compress_module=Settings.HUGE_DATA_COMPRESS_MODULE,
-            compress_level=Settings.HUGE_DATA_COMPRESS_LEVEL,
-            frame_size_limit=Settings.HUGE_DATA_SIZEOF
-        )
     else:
         return {
             "result": result,
@@ -88,6 +62,7 @@ async def generate_reply(
 
 
 class Context(z_aio.Context):
+
     @overload
     def __init__(self, io_threads: int = 1):
         ...
@@ -127,7 +102,7 @@ def set_sock(sock: z_aio.Socket, options: dict = None):
         _options.update(options)
     for op, v in _options.items():
         try:
-            if op == z_const.HWM:
+            if op == z_const.HWM and isinstance(v, int):
                 sock.set_hwm(v)
             else:
                 sock.set(op, v)
@@ -164,7 +139,6 @@ class ABCService(ABC):
     description: str
     workers: dict[bytes, ABCWorker]
     idle_workers: deque[bytes]
-    RemoteWorkerClass: ABCWorker
 
     @abstractmethod
     def add_worker(self, worker: Optional[ABCWorker]) -> None:
@@ -179,19 +153,21 @@ class ABCService(ABC):
         pass
 
     @abstractmethod
-    def acquire_idle_worker(self) -> Optional[ABCWorker]:
+    async def acquire_idle_worker(self) -> Optional[ABCWorker]:
         pass
 
     @abstractmethod
-    def release_worker(self, worker: Optional[ABCWorker]):
+    async def release_worker(self, worker: Optional[ABCWorker]):
         pass
 
 
 class RemoteWorker(ABCWorker):
+
     def __init__(
         self,
         identity: bytes,
         heartbeat: int,
+        max_allowed_request: int,
         socket: z_aio.Socket,
         mdp_version: bytes,
         service: "ABCService"
@@ -200,7 +176,10 @@ class RemoteWorker(ABCWorker):
         远程 worker 的本地映射
         :param identity: 远程 worker 的id
         :param heartbeat: 和远程 worker 的心跳间隔，单位是毫秒
-        :param service: 该 worker 提供的服务的名字
+        :param max_allowed_request: 能处理的最大请求数
+        :param socket: socket
+        :param mdp_version: MDP版本
+        :param service: 该 worker 提供的服务
         """
         self.identity = identity
         self.socket = socket
@@ -212,20 +191,21 @@ class RemoteWorker(ABCWorker):
         else:
             self.heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
         self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
-        self.max_allowed_request = Settings.MESSAGE_MAX
+        self.last_message_sent_time: float = 0.0
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        self.max_allowed_request = max_allowed_request
         self.destroy_task: Optional[asyncio.Task] = None
-        self.prolong()
 
     def is_alive(self):
-        if time() > self.expiry:
-            return False
-        return True
+        return self.ready
 
-    def prolong(self):
-        self.expiry = 1e-3 * self.heartbeat * self.heartbeat_liveness + time()
+    def prolong(self, now_time):
+        self.expiry = (
+                1e-3 * self.heartbeat * self.heartbeat_liveness + now_time
+        )
 
 
-class Worker(ABCWorker, _LoopBoundMixin):
+class Worker(ABCWorker):
     """
     所有要给远端调用的方法都需要用interface函数装饰。
     """
@@ -239,6 +219,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
         context: Context = None,
         zap_mechanism: Union[str, bytes] = None,
         zap_credentials: tuple = None,
+        max_allowed_request: int = None,
         thread_executor: ThreadPoolExecutor = None,
         process_executor: ProcessPoolExecutor = None
     ):
@@ -250,9 +231,15 @@ class Worker(ABCWorker, _LoopBoundMixin):
         :param context: 用于创建socket的zeroMQ的上下文
         :param zap_mechanism: 使用的 ZAP 验证机制
         :param zap_credentials: 用于 ZAP 验证的凭据
+        :param max_allowed_request: 能处理的最大请求数
         :param thread_executor: 用于执行io密集型任务
         :param process_executor: 用于执行cpu密集型任务
         """
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
+
         self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
         self.service = service
         self.ready = False
@@ -278,30 +265,32 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
         self.expiry = self.heartbeat_liveness * self.heartbeat
 
-        self.max_allowed_request = Settings.MESSAGE_MAX
-        self.requests = deque()
+        self.sent_tasks = set()
+        self.last_message_sent_time: float = heartbeat
+
+        if max_allowed_request:
+            self.max_allowed_request = max_allowed_request
+        else:
+            self.max_allowed_request = Settings.MESSAGE_MAX
+        self.requests = set()
 
         if not thread_executor:
-            thread_executor = ThreadPoolExecutor()
-        self.thread_executor = thread_executor
+            self.thread_executor = ThreadPoolExecutor()
+        else:
+            self.thread_executor = thread_executor
         if not process_executor:
-            process_executor = ProcessPoolExecutor()
-        self.process_executor = process_executor
-        self.default_executor = self.thread_executor
+            self.process_executor = ProcessPoolExecutor()
+        else:
+            self.process_executor = process_executor
 
-        self.interfaces: dict = self.get_interfaces()
+        self.interfaces: dict = self._get_interfaces()
 
         self._reconnect: bool = False
         self._recv_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
-    @interface
-    def get_interfaces(self):
-        interfaces = {
-            # "_get_interfaces": {
-            #     "doc": "get interfaces",
-            #     "signature": inspect.signature(self.get_interfaces)
-            # }
-        }
+    def _get_interfaces(self):
+        interfaces = dict()
         for name, method in inspect.getmembers(self):
             if (
                     (
@@ -317,12 +306,16 @@ class Worker(ABCWorker, _LoopBoundMixin):
                 }
         return interfaces
 
+    @interface
+    def get_interfaces(self):
+        return self.interfaces
+
     def is_alive(self):
         return self.ready
 
     async def connect(self):
         if not self.is_alive():
-            logger.info(
+            Wlogger.info(
                 f"Worker is attempting to connect to the broker at "
                 f"{self._broker_addr}."
             )
@@ -333,7 +326,10 @@ class Worker(ABCWorker, _LoopBoundMixin):
             set_sock(self._socket)
             self._socket.connect(self._broker_addr)
             self._poller.register(self._socket, z_const.POLLIN)
-            service = ":".join((self.service.name, self.service.description))
+            service = Settings.MDP_DESCRIPTION_SEP.join((
+                self.service.name, self.service.description,
+                str(self.max_allowed_request)
+            ))
             await self.send_to_majordomo(
                 Settings.MDP_COMMAND_READY,
                 (service,)
@@ -342,7 +338,7 @@ class Worker(ABCWorker, _LoopBoundMixin):
 
     async def disconnect(self):
         if self.is_alive():
-            logger.warning("Disconnecting from broker")
+            Wlogger.warning("Disconnecting from broker")
             # await self.send_to_majordomo(
             #     Settings.MDP_COMMAND_DISCONNECT
             # )
@@ -359,11 +355,22 @@ class Worker(ABCWorker, _LoopBoundMixin):
         self.thread_executor.shutdown()
         self.process_executor.shutdown()
 
+    def run(self):
+        if not self._recv_task:
+            self._recv_task = self._loop.create_task(self.recv())
+
     def stop(self):
-        if self.is_alive():
-            if not self._recv_task.cancelled():
-                self._recv_task.cancel()
-            self.close()
+        if self._recv_task and not self._recv_task.cancelled():
+            self._recv_task.cancel()
+            self._recv_task = None
+
+    def cleanup_sent(self, task: asyncio.Task):
+        self.sent_tasks.remove(task)
+        if exception := task.exception():
+            exception_info = "".join(format_tb(exception.__traceback__))
+            exception_info = (f"{exception.__class__}:{exception.__repr__()}"
+                              f"\n{exception_info}")
+            Wlogger.error(f"sent task exception:\n{exception_info}")
 
     def cleanup_request(self, task: asyncio.Task):
         self.requests.remove(task)
@@ -371,166 +378,192 @@ class Worker(ABCWorker, _LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception.__repr__()}"
                               f"\n{exception_info}")
-            logger.error(f"process request task exception:\n{exception_info}")
+            Wlogger.error(f"process request task exception:\n{exception_info}")
 
     async def send_to_majordomo(
         self,
         command: bytes,
         option: tuple[Union[bytes, str], ...] = None,
-        messages: tuple[Union[bytes, str], ...] = None
+        messages: Union[Union[bytes, str], tuple[Union[bytes, str], ...]] = None
     ):
         """
-        在MDP的Worker端发出的消息的命令帧后面加一个worker id帧，用作掉线重连，幂等。
+        TODO: 在MDP的Worker端发出的消息的命令帧后面加一个worker id帧，
+            用作掉线重连，幂等。
         """
         if not self._socket:
             return
-        if not messages:
-            messages = tuple()
-        if not option:
-            option = tuple()
-        if self.zap_frames:
-            option = (*self.zap_frames, *option)
-        messages = (
+        reply = [
             b"",
             Settings.MDP_WORKER,
             command,
-            *option,
-            *messages
-        )
-        messages = tuple(to_bytes(s) for s in messages)
-        await self._socket.send_multipart(messages)
+        ]
+        if self.zap_frames:
+            reply.extend(self.zap_frames)
+        if option:
+            reply.extend(option)
+        if isinstance(messages, (tuple, list)):
+            reply.extend(messages)
+        elif isinstance(messages, (bytes, str)):
+            reply.append(messages)
+        reply = tuple(to_bytes(s) for s in reply)
+        await self._socket.send_multipart(reply)
+        self.last_message_sent_time = self._loop.time()
 
-    def run_in_executor(self, executor, func, *args, **kwargs):
-        loop = self._get_loop()
-        func_call = functools.partial(
-            func, *args, **kwargs
-        )
-        if isinstance(executor, ThreadPoolExecutor):
-            ctx = contextvars.copy_context()
-            func_call = functools.partial(
-                ctx.run, func, *args, **kwargs
+    async def send_hugedata(self, option: tuple, hugedata):
+        try:
+            async for data in hugedata.compress(self._loop):
+                await self.send_to_majordomo(
+                    Settings.MDP_COMMAND_REPLY,
+                    option,
+                    (Settings.STREAM_HUGE_DATA_TAG, data)
+                )
+            await self.send_to_majordomo(
+                Settings.MDP_COMMAND_REPLY,
+                option,
+                (Settings.STREAM_HUGE_DATA_TAG, hugedata.end_tag)
             )
-        return loop.run_in_executor(executor, func_call)
+        except Exception as e:
+            e = (
+                e.__class__.__name__,
+                e.__repr__(),
+                "".join(format_tb(e.__traceback__))
+            )
+            Wlogger.error(e)
+            e = msg_pack(e)
+            await self.send_to_majordomo(
+                Settings.MDP_COMMAND_REPLY,
+                option,
+                (
+                    Settings.STREAM_HUGE_DATA_TAG,
+                    Settings.STREAM_EXCEPT_TAG,
+                    e
+                )
+            )
+        finally:
+            hugedata.destroy()
+
+    async def send_agenerator(self, option: tuple, agenerator: AsyncGenerator):
+        try:
+            async for sub_reply in agenerator:
+                messages = msg_pack(sub_reply)
+                await self.send_to_majordomo(
+                    Settings.MDP_COMMAND_REPLY, option,
+                    (Settings.STREAM_GENERATOR_TAG, messages)
+                )
+            await self.send_to_majordomo(
+                Settings.MDP_COMMAND_REPLY, option,
+                (
+                    Settings.STREAM_GENERATOR_TAG, Settings.STREAM_END_TAG
+                )
+            )
+        except Exception as e:
+            e = (
+                e.__class__.__name__,
+                e.__repr__(),
+                "".join(format_tb(e.__traceback__))
+            )
+            e = msg_pack(e)
+            Wlogger.error(e)
+            await self.send_to_majordomo(
+                Settings.MDP_COMMAND_REPLY, option,
+                (
+                    Settings.STREAM_GENERATOR_TAG,
+                    Settings.STREAM_EXCEPT_TAG,
+                    e
+                )
+            )
 
     async def process_request(
-        self, cli_id: bytes, request_id: bytes,
+        self, client_id: bytes, request_id: bytes,
         func_name: str, args: tuple, kwargs: dict
     ):
-        """
-        MDP的reply命令的命令帧后加上一个worker id帧，掉线重连，幂等
-        """
-        loop = self._get_loop()
+        result = exception = None
         try:
+            if len(self.requests) > self.max_allowed_request:
+                if not Settings.SECURE:
+                    return
+                raise RuntimeError("Request count exceeds the maximum value")
             if not self.interfaces.get(func_name, None):
+                if Settings.SECURE:
+                    return
                 raise AttributeError(
                     "Function not found: {0}".format(func_name)
                 )
             func = getattr(self, func_name)
             if inspect.iscoroutinefunction(func):
-                coro = func(*args, **kwargs)
-                task = loop.create_task(coro)
+                result = await func(*args, **kwargs)
             else:
-                task = self.run_in_executor(
-                    self.default_executor, func, *args, **kwargs
-                )
+                if func.__executor__ == "thread":
+                    result = await run_in_executor(
+                                self._loop, self.thread_executor,
+                                func, *args, **kwargs
+                            )
+                elif func.__executor__ == "process":
+                    result = await run_in_executor(
+                                self._loop, self.process_executor,
+                                func, *args, **kwargs
+                            )
+                else:
+                    result = func(*args, **kwargs)
         except Exception as e:
-            reply = await generate_reply(exception=e)
-        else:
-            reply = await generate_reply(task)
-        option = (cli_id, b"", request_id)
-        if isinstance(reply, HugeData):
-            try:
-                async for data in reply.compress():
-                    await self.send_to_majordomo(
-                        Settings.MDP_COMMAND_REPLY,
-                        option,
-                        (Settings.STREAM_HUGE_DATA_TAG, data)
-                    )
-            except Exception as e:
-                await self.send_to_majordomo(
-                    Settings.MDP_COMMAND_REPLY,
-                    option,
-                    (Settings.STREAM_HUGE_DATA_TAG, reply.except_tag)
-                )
-                e = msg_pack(
-                    (
-                        e.__class__.__name__,
-                        e.__repr__(),
-                        "".join(format_tb(e.__traceback__))
-                    )
-                )
-                await self.send_to_majordomo(
-                    Settings.MDP_COMMAND_REPLY,
-                    option,
-                    (Settings.STREAM_HUGE_DATA_TAG, e)
-                )
-            await self.send_to_majordomo(
-                Settings.MDP_COMMAND_REPLY,
-                option,
-                (Settings.STREAM_HUGE_DATA_TAG, reply.end_tag)
+            exception = e
+        option = (client_id, b"", request_id)
+        if isinstance(result, HugeData):
+            task = self._loop.create_task(
+                self.send_hugedata(option, result),
+                name=f"SendHD-{client_id}-{request_id}"
             )
-            reply.destroy()
-        elif isinstance(reply, AsyncGenerator):
-            try:
-                async for sub_reply in reply:
-                    messages = msg_pack(sub_reply)
-                    await self.send_to_majordomo(
-                        Settings.MDP_COMMAND_REPLY, option,
-                        (Settings.STREAM_GENERATOR_TAG, messages)
-                    )
-                await self.send_to_majordomo(
-                    Settings.MDP_COMMAND_REPLY, option,
-                    (
-                        Settings.STREAM_GENERATOR_TAG, Settings.STREAM_END_TAG
-                    )
-                    )
-            except Exception as e:
-                e = msg_pack(
-                    (
-                        e.__class__.__name__,
-                        e.__repr__(),
-                        "".join(format_tb(e.__traceback__))
-                    )
+        elif isinstance(result, AsyncGenerator):
+            task = self._loop.create_task(
+                self.send_agenerator(option, result),
+                name=f"SendAG-{client_id}-{request_id}"
+            )
+        else:
+            reply = msg_pack(
+                await generate_reply(result=result, exception=exception)
+            )
+            task = self._loop.create_task(
+                self.send_to_majordomo(
+                    Settings.MDP_COMMAND_REPLY, option, reply
                 )
-                await self.send_to_majordomo(
-                    Settings.MDP_COMMAND_REPLY, option,
-                    (
-                        Settings.STREAM_EXCEPT_TAG,
-                        Settings.STREAM_EXCEPT_TAG,
-                        e
-                    )
-                )
+            )
+        self.sent_tasks.add(task)
+        task.add_done_callback(self.cleanup_sent)
 
-        else:
-            messages = (msg_pack(reply),)
-            await self.send_to_majordomo(
-                Settings.MDP_COMMAND_REPLY, option, messages
+    async def send_heartbeat(self):
+        while 1:
+            time_from_last_message = (
+                    self._loop.time() - self.last_message_sent_time
             )
+            if time_from_last_message >= 1e-3 * self.heartbeat:
+                await self.send_to_majordomo(
+                    Settings.MDP_COMMAND_HEARTBEAT,
+                )
+                await asyncio.sleep(1e-3 * self.heartbeat)
+            else:
+                await asyncio.sleep(
+                    1e-3 * self.heartbeat - time_from_last_message
+                )
 
     async def recv(self):
-        loop = None
         try:
-            loop = self._get_loop()
             await self.connect()
-            logger.info("Worker event loop starts running.")
-            self.ready = True
-            heartbeat_at = 1e-3 * self.heartbeat + loop.time()
+            Wlogger.info("Worker event loop starts running.")
             majordomo_liveness = self.heartbeat_liveness
             while 1:
                 if not self.ready:
                     break
-                if loop.time() > heartbeat_at:
-                    await self.send_to_majordomo(
-                        Settings.MDP_COMMAND_HEARTBEAT,
-                    )
-                    heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 socks = dict(await self._poller.poll(self.heartbeat))
                 if not socks:
                     majordomo_liveness -= 1
                     if majordomo_liveness == 0:
-                        logger.error("Majordomo offline")
+                        Wlogger.error("Majordomo offline")
                         break
                     continue
+                if not self._heartbeat_task:
+                    self._heartbeat_task = self._loop.create_task(
+                        self.send_heartbeat()
+                    )
                 messages = await self._socket.recv_multipart()
                 try:
                     (
@@ -545,21 +578,18 @@ class Worker(ABCWorker, _LoopBoundMixin):
                     continue
                 if mdp_worker_version != Settings.MDP_WORKER:
                     continue
-                # logger.debug(
+                # Wlogger.debug(
                 #     f"worker recv\n"
                 #     f"command: {command}\n"
                 #     f"messages: {messages}"
                 # )
-                heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 majordomo_liveness = self.heartbeat_liveness
                 if command == Settings.MDP_COMMAND_HEARTBEAT:
                     pass
                 elif command == Settings.MDP_COMMAND_DISCONNECT:
-                    logger.warning(f"{self.identity} disconnected")
+                    Wlogger.warning(f"{self.identity} disconnected")
                     break
                 elif command == Settings.MDP_COMMAND_REQUEST:
-                    if len(self.requests) > Settings.MESSAGE_MAX:
-                        continue
                     try:
                         (
                             client_id,
@@ -581,31 +611,31 @@ class Worker(ABCWorker, _LoopBoundMixin):
                         func_name = msg_unpack(func_name)
                     except MsgUnpackError:
                         continue
-                    task = loop.create_task(
+                    task = self._loop.create_task(
                         self.process_request(
                             client_id, request_id,
                             func_name, args, kwargs
-                        )
+                        ),
+                        name=f"Func({func_name})-{client_id}-{request_id}"
                     )
-                    self.requests.append(task)
+                    self.requests.add(task)
                     task.add_done_callback(self.cleanup_request)
         except asyncio.CancelledError:
             self._reconnect = False
             pass
         except Exception:
             exception = "".join(format_exception(*sys.exc_info()))
-            logger.error(exception)
+            Wlogger.error(exception)
             raise
         finally:
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
             await self.disconnect()
-            if loop.is_running() and self._reconnect:
-                logger.warning("Reconnect to Majordomo")
-                self._recv_task = loop.create_task(self.recv())
-
-    def run(self):
-        if not self._recv_task:
-            loop = self._get_loop()
-            self._recv_task = loop.create_task(self.recv())
+            if self._loop.is_running() and self._reconnect:
+                Wlogger.warning("Reconnect to Majordomo")
+                self._recv_task = self._loop.create_task(self.recv())
+            else:
+                self.close()
 
 
 class Service(ABCService):
@@ -613,7 +643,6 @@ class Service(ABCService):
     管理本地和远程提供该服务的 worker。
     TODO: 如何避免有同名但接口不一样的服务连上来，会导致客户端调用本该有却没有的接口而出错。
     """
-    RemoteWorkerClass = RemoteWorker
 
     def __init__(
         self, name: str = None,
@@ -628,7 +657,7 @@ class Service(ABCService):
         self.name = name
         self.description: Annotated[str, "Keep it short"] = description
         self.workers: dict[bytes, ABCWorker] = dict()
-        self.idle_workers: deque[bytes] = deque()
+        self.idle_workers: asyncio.Queue[bytes] = asyncio.Queue()
         self.running = False
 
     def add_worker(self, worker: ABCWorker):
@@ -636,12 +665,10 @@ class Service(ABCService):
             return
         worker.service = self
         self.workers[worker.identity] = worker
-        self.idle_workers.appendleft(worker.identity)
+        self.idle_workers.put_nowait(worker.identity)
         self.running = True
 
     def remove_worker(self, worker: ABCWorker):
-        if worker.identity in self.idle_workers:
-            self.idle_workers.remove(worker.identity)
         if worker.identity in self.workers:
             self.workers.pop(worker.identity)
         if hasattr(worker, "stop"):
@@ -652,22 +679,30 @@ class Service(ABCService):
     def get_workers(self) -> dict[bytes, ABCWorker]:
         return self.workers
 
-    def acquire_idle_worker(self) -> Optional[ABCWorker]:
-        while self.idle_workers:
-            worker = self.workers[self.idle_workers.pop()]
-            if worker.is_alive() and worker.max_allowed_request != 0:
-                worker.max_allowed_request -= 1
-                return worker
-        return None
+    async def acquire_idle_worker(self) -> Optional[ABCWorker]:
+        while 1:
+            try:
+                worker_id = await asyncio.wait_for(
+                    self.idle_workers.get(),
+                    Settings.TIMEOUT
+                )
+            except TimeoutError:
+                return None
+            try:
+                worker = self.workers[worker_id]
+                if worker.is_alive() and worker.max_allowed_request != 0:
+                    worker.max_allowed_request -= 1
+                    if worker.max_allowed_request > 0:
+                        await self.idle_workers.put(worker.identity)
+                    return worker
+            except KeyError:
+                continue
 
-    def release_worker(self, worker: ABCWorker):
-        if (
-                worker.identity in self.workers
-                and worker.identity not in self.idle_workers
-                and worker.is_alive()
-        ):
+    async def release_worker(self, worker: ABCWorker):
+        if worker.identity in self.workers and worker.is_alive():
+            if worker.max_allowed_request == 0:
+                await self.idle_workers.put(worker.identity)
             worker.max_allowed_request += 1
-            self.idle_workers.appendleft(worker.identity)
 
     def create_worker(
         self,
@@ -677,6 +712,7 @@ class Service(ABCService):
         context: Context = None,
         zap_mechanism: str = None,
         zap_credentials: tuple = None,
+        max_allowed_request: int = None,
         thread_executor: ThreadPoolExecutor = None,
         process_executor: ProcessPoolExecutor = None
     ) -> Worker:
@@ -694,6 +730,7 @@ class Service(ABCService):
             context=context,
             zap_mechanism=zap_mechanism,
             zap_credentials=zap_credentials,
+            max_allowed_request=max_allowed_request,
             thread_executor=thread_executor,
             process_executor=process_executor
         )
@@ -701,7 +738,7 @@ class Service(ABCService):
         return worker
 
 
-class AsyncZAPService(Authenticator, _LoopBoundMixin):
+class AsyncZAPService(Authenticator):
     """
     异步的 zap 身份验证服务，继承并重写为使用 ROUTE 模式
     """
@@ -710,6 +747,11 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
     encoding = "utf-8"
 
     def __init__(self, addr: str = None, context=None):
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
+
         if not context:
             context = Context()
         set_ctx(context)
@@ -723,10 +765,9 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
         self.zap_socket.bind(check_socket_addr(addr))
         self._poller = z_aio.Poller()
         self._recv_task: Optional[asyncio.Task] = None
-        self.request = deque()
+        self.request = set()
 
     async def handle_zap(self) -> None:
-        loop = self._get_loop()
         self._poller.register(self.zap_socket, z_const.POLLIN)
         self.log.debug("ZAP Service start.")
         try:
@@ -734,22 +775,21 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
                 socks = dict(await self._poller.poll())
                 if self.zap_socket in socks:
                     message = await self.zap_socket.recv_multipart()
-                    t = loop.create_task(self.handle_zap_message(message))
-                    self.request.append(t)
+                    t = self._loop.create_task(self.handle_zap_message(message))
+                    self.request.add(t)
                     t.add_done_callback(self.cleanup_request)
         except asyncio.CancelledError:
             return
         except Exception:
             exception = "".join(format_exception(*sys.exc_info()))
-            self.log.error(exception)
+            self.log.warning(exception)
             self.stop()
             raise
 
     def start(self) -> None:
-        loop = self._get_loop()
         if not self._recv_task:
             self.log.debug(f"create ZAP task.")
-            self._recv_task = loop.create_task(self.handle_zap())
+            self._recv_task = self._loop.create_task(self.handle_zap())
 
     def stop(self) -> None:
         if self._recv_task and not self._recv_task.cancelled():
@@ -852,14 +892,14 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
                     await self._asend_zap_reply(
                         request_address, request_id,
                         b"400", b"Invalid credentials",
-                        )
+                    )
                     return
                 username, password = (
                     c.decode(self.encoding, 'replace') for c in credentials
                 )
                 allowed, reason = self._authenticate_plain(
                     domain, username, password
-                    )
+                )
 
             elif mechanism == b'CURVE':
                 # For CURVE, even a _alloweded address must authenticate
@@ -868,7 +908,7 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
                     await self._asend_zap_reply(
                         request_address, request_id,
                         b"400", b"Invalid credentials",
-                        )
+                    )
                     return
                 key = credentials[0]
                 allowed, reason = await self._authenticate_curve(domain, key)
@@ -879,11 +919,11 @@ class AsyncZAPService(Authenticator, _LoopBoundMixin):
                 if len(credentials) != 1:
                     self.log.error(
                         "Invalid GSSAPI credentials: %r", credentials
-                        )
+                    )
                     await self._asend_zap_reply(
                         request_address, request_id,
                         b"400", b"Invalid credentials",
-                        )
+                    )
                     return
                 # use principal as user-id for now
                 principal = credentials[0]
@@ -1021,6 +1061,7 @@ def parse_zap_frame(messages):
 
 
 class RemoteGateRPC(RemoteWorker):
+
     def __init__(
         self,
         identity: bytes,
@@ -1038,16 +1079,17 @@ class RemoteGateRPC(RemoteWorker):
         """
         super().__init__(
             identity, heartbeat,
-            socket, mdp_version, service
+            Settings.MESSAGE_MAX, socket, mdp_version,
+            service
         )
         self.work_services = work_services
         self.addr = None
 
 
 class GateClusterService(ABCService):
-    RemoteWorkerClass = RemoteGateRPC
 
-    def __init__(self):
+    def __init__(self, local_gate: "AMajordomo"):
+        self.local_gate = local_gate
         self.name = Settings.GATE_CLUSTER_NAME
         self.description = Settings.GATE_CLUSTER_DESCRIPTION
         self.services: dict[str, deque[bytes]] = dict()
@@ -1067,9 +1109,9 @@ class GateClusterService(ABCService):
         self.running = True
 
     def remove_worker(self, gate: Optional[RemoteGateRPC]) -> None:
-        for gates in self.services.values():
-            if gate.identity in gates:
-                gates.remove(gate.identity)
+        # for gates in self.services.values():
+        #     if gate.identity in gates:
+        #         gates.remove(gate.identity)
         if gate.identity in self.workers:
             self.workers.pop(gate.identity)
         if gate.identity in self.idle_workers:
@@ -1080,35 +1122,50 @@ class GateClusterService(ABCService):
         if not self.workers:
             self.running = False
 
-    def get_workers(self) -> dict[bytes, RemoteGateRPC]:
+    def get_workers(self) -> dict[bytes, Union[RemoteGateRPC]]:
         return self.workers
 
-    def acquire_idle_worker(self) -> Optional[RemoteGateRPC]:
-        return None
+    async def acquire_idle_worker(self) -> Optional[RemoteGateRPC]:
+        return await self.acquire_service_idle_worker(self.name)
 
-    def acquire_service_idle_worker(
+    async def acquire_service_idle_worker(
         self, service: str
     ) -> Optional[RemoteGateRPC]:
         if service == self.name:
-            service = self.idle_workers
+            idle_gates = self.idle_workers
         else:
-            service = self.services[service]
-        while idle_gates := service:
-            gate = self.workers[(g_id := idle_gates.pop())]
-            self.idle_workers.remove(g_id)
-            if gate.is_alive() and gate.max_allowed_request != 0:
-                gate.max_allowed_request -= 1
-                return gate
-        return None
+            idle_gates = self.services[service]
+        try:
+            while 1:
+                gate = self.workers[(g_id := idle_gates.pop())]
+                self.idle_workers.remove(g_id)
+                if gate.is_alive() and gate.max_allowed_request != 0:
+                    gate.max_allowed_request -= 1
+                    return gate
+        except IndexError:
+            return None
 
-    def release_worker(self, gate: Optional[RemoteGateRPC]):
-        if gate.identity in self.workers and gate.is_alive():
-            gate.max_allowed_request += 1
-            for idle_gates in list(self.services.values()):
+    async def release_worker(self, gate: RemoteGateRPC):
+        return await self.release_service_worker(self.name, gate)
+
+    async def release_service_worker(
+        self, service: str,
+        gate: RemoteGateRPC
+    ):
+        if (
+                gate.identity in self.workers
+                and gate.is_alive()
+        ):
+            if service == self.name:
+                idle_gates = self.idle_workers
+            else:
+                idle_gates = self.services[service]
+            if gate.identity not in idle_gates:
+                gate.max_allowed_request += 1
                 idle_gates.appendleft(gate.identity)
 
 
-class AMajordomo(_LoopBoundMixin):
+class AMajordomo:
     """
     异步管家模式
     Asynchronous Majordomo
@@ -1116,7 +1173,7 @@ class AMajordomo(_LoopBoundMixin):
     多偏好服务集群，连接多个提供不同服务的 Service（远程的 Service 也可能是一个代理，进行负载均衡）
     """
 
-    ClusterServiceClass = GateClusterService
+    # ClusterServiceClass = GateClusterService
     RemoteServiceClass = Service
     RemoteWorkerClass = RemoteWorker
 
@@ -1128,12 +1185,19 @@ class AMajordomo(_LoopBoundMixin):
         heartbeat: int = None,
         gate_zap_mechanism: Union[str, bytes] = None,
         gate_zap_credentials: tuple = None,
+        thread_executor: ThreadPoolExecutor = None,
+        process_executor: ProcessPoolExecutor = None
     ):
         """
         :param identity: 用于在集群时的识别id
         :param context: 用于在使用 inproc 时使用同一上下文
         :param heartbeat: 需要和后端服务保持的心跳间隔，单位是毫秒。
         """
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
+
         self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
         if not context:
             context = Context()
@@ -1143,29 +1207,30 @@ class AMajordomo(_LoopBoundMixin):
         self.frontend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         self.frontend.set(z_const.IDENTITY, self.identity)
         set_sock(self.frontend)
-        self.clients = deque()
-        self.frontend_tasks = deque()
+        self.clients = set()
+        self.frontend_tasks = set()
         # backend
         self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         set_sock(self.backend)
         self.backend.set(z_const.IDENTITY, self.identity)
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, Union[RemoteWorker, RemoteGateRPC]] = dict()
-        self.backend_tasks = deque()
+        self.backend_tasks = set()
         # zap
         self.zap: Optional[z_aio.Socket] = None
         # TODO: ZAP domain
-        self.zap_domain: bytes = Settings.ZAP_DEFAULT_DOMAIN
+        self.zap_addr: str = ""
+        self.zap_domain: bytes = b""
         self.zap_replies: dict[bytes, asyncio.Future] = dict()
         self.zap_cache = LRUCache(128)
-        self.zap_tasks = deque()
+        self.zap_tasks = set()
         # gate
         self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         set_sock(self.gate)
         self.gate.set(z_const.IDENTITY, self.identity)
-        self.gate_cluster = self.ClusterServiceClass()
+        self.gate_cluster = GateClusterService(self)
         self.gate_replies: dict[bytes, asyncio.Future] = dict()
-        self.gate_tasks = deque()
+        self.gate_tasks = set()
         # 被转发的客户端请求和其他代理的请求和客户端id或其他地理的id的映射
         self.request_map: dict[bytes, bytes] = dict()
         gate_zap_mechanism, gate_zap_credentials = check_zap_args(
@@ -1175,16 +1240,20 @@ class AMajordomo(_LoopBoundMixin):
             self.gate_zap_frames = [gate_zap_mechanism, *gate_zap_credentials]
         else:
             self.gate_zap_frames = []
-        self.gate_tasks = deque()
         # majordomo
         if not heartbeat:
             heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
         self.heartbeat = heartbeat
-        self.internal_processes: dict[str, Callable] = dict()
-        # 内部程序应该只执行简单的资源消耗少的逻辑处理
-        # 不需要用到 ProcessPoolExecutor
-        self._executor = ThreadPoolExecutor()
-        self.ban_timer_handle: dict[bytes, asyncio.Task] = dict()
+        self.internal_func: dict[str, dict] = dict()
+        if not thread_executor:
+            self.thread_executor = ThreadPoolExecutor()
+        else:
+            self.thread_executor = thread_executor
+        if not process_executor:
+            self.process_executor = ProcessPoolExecutor()
+        else:
+            self.process_executor = process_executor
+        self.internal_tasks = set()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
         self.cache_request = dict()
         self.max_process_tasks = Settings.MESSAGE_MAX
@@ -1216,38 +1285,6 @@ class AMajordomo(_LoopBoundMixin):
     def unbind_gate(self, addr: str) -> None:
         self.gate.unbind(check_socket_addr(addr))
 
-    def register_gate(
-        self, gate_id, socket, mdp_version, work_services
-    ):
-        gate = self.gate_cluster.RemoteWorkerClass(
-            gate_id, self.heartbeat,
-            socket, mdp_version,
-            self.gate_cluster,
-            work_services
-        )
-        gate.ready = True
-        self.gate_cluster.add_worker(gate)
-        self.ban_at_expiration(gate)
-
-    async def ban_gate(self, gate: RemoteGateRPC, wait: float = 0):
-        """
-        和 ban_worker 分开，方便以后加逻辑
-        """
-        try:
-            if wait:
-                await asyncio.sleep(wait)
-            elif gate.destroy_task:
-                gate.destroy_task.cancel()
-            logger.warning(f"ban gate({gate.identity}).")
-            if gate.is_alive():
-                await self.send_to_gate(
-                    gate.identity,
-                    Settings.GATE_COMMAND_DISCONNECT,
-                )
-            self.gate_cluster.remove_worker(gate)
-        except asyncio.CancelledError:
-            return
-
     async def connect_gate(self, addr: str) -> None:
         gate_c = self.ctx.socket(z_const.REQ, z_aio.Socket)
         gate_c.set(z_const.SNDTIMEO, Settings.HEARTBEAT)
@@ -1268,7 +1305,7 @@ class AMajordomo(_LoopBoundMixin):
                 error.__repr__(),
                 ''.join(format_tb(error.__traceback__))
             )
-            logger.error("\n".join(error))
+            Mlogger.error("\n".join(error))
             replies = None
         finally:
             gate_c.disconnect(addr)
@@ -1289,7 +1326,7 @@ class AMajordomo(_LoopBoundMixin):
                 if gate_id in self.gate_cluster.get_workers():
                     return
                 self.gate.connect(addr)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0)
                 await self.send_to_gate(
                     gate_id,
                     Settings.GATE_COMMAND_READY,
@@ -1297,12 +1334,7 @@ class AMajordomo(_LoopBoundMixin):
                 )
                 self.gate_cluster.unready_gates[gate_id] = addr
 
-    async def disconnect_gate(self, gate: RemoteGateRPC):
-        await self.ban_gate(gate)
-        if gate.addr:
-            self.gate.disconnect(gate.addr)
-
-    async def connect_zap(
+    def connect_zap(
         self,
         zap_addr: str = None,
         zap_domain: str = None,
@@ -1312,24 +1344,71 @@ class AMajordomo(_LoopBoundMixin):
         :param zap_domain: 需要告诉 zap 服务在哪个域验证。
         """
         if zap_domain:
-            self.zap_domain = zap_domain.encode("utf-8")
+            zap_domain = zap_domain.encode("utf-8")
+        else:
+            zap_domain = Settings.ZAP_DEFAULT_DOMAIN
+        self.zap_domain = zap_domain
         if not zap_addr:
             zap_addr = Settings.ZAP_ADDR
         if zap_addr := check_socket_addr(zap_addr):
+            self.zap_addr = zap_addr
             self.zap = self.ctx.socket(z_const.DEALER, z_aio.Socket)
             set_sock(self.zap)
-            logger.info(f"Connecting to zap at {zap_addr}")
-            self.zap.connect(zap_addr)
+            # Mlogger.info(f"Connecting to zap at {zap_addr}")
+            self.zap.connect(self.zap_addr)
         else:
             raise ValueError(
                 "The ZAP mechanism is specified and "
                 "the ZAP server address must also be provided."
             )
 
+    def disconnect_zap(self):
+        self.zap_domain = b""
+        self.zap.disconnect(self.zap_addr)
+
+    async def disconnect_all(self):
+        # TODO: 需要通知客户端吗？
+        Mlogger.warning("Disconnected and all the workers.")
+        wts = [
+            self.now_ban(work)
+            for work in self.workers.values()
+        ]
+        gts = [
+            self.now_ban(gate)
+            for gate in self.gate_cluster.get_workers().values()
+        ]
+        await asyncio.gather(
+            *wts, *gts
+        )
+        # for work in list(self.workers.values()):
+        #     await self.now_ban(work)
+        # for gate in self.gate_cluster.get_workers().values():
+        #     await self.now_ban(gate)
+
     def close(self):
+        self.thread_executor.shutdown()
+        self.process_executor.shutdown()
+
+    def run(self):
+        if not self._broker_task:
+            self._broker_task = self._loop.create_task(self._broker_loop())
+
+    def stop(self):
+        if self._broker_task:
+            if not self._broker_task.cancelled():
+                self._broker_task.cancel()
+            self._broker_task = None
+        self._poller.unregister(self.frontend)
+        self._poller.unregister(self.backend)
+        self._poller.unregister(self.gate)
         self.frontend.close()
         self.backend.close()
-        self._executor.shutdown()
+        self.gate.close()
+        if self.zap:
+            self.disconnect_zap()
+            self._poller.unregister(self.zap)
+            self.zap.close()
+            self.zap = None
 
     def register_internal_process(self):
         """
@@ -1344,7 +1423,10 @@ class AMajordomo(_LoopBoundMixin):
                     and not name.startswith("_")
                     and getattr(method, "__interface__", False)
             ):
-                self.internal_processes[name] = method
+                self.internal_func[name] = {
+                    "doc": inspect.getdoc(method),
+                    "signature": str(inspect.signature(method))
+                }
 
     def register_service(self, name, description):
         """
@@ -1353,59 +1435,133 @@ class AMajordomo(_LoopBoundMixin):
         service = self.RemoteServiceClass(
             name, description
         )
+        Mlogger.debug(
+            f"register service: {service.name}({service.description})"
+        )
         self.services[service.name] = service
 
-    def register_worker(
-        self, worker_id, socket, mdp_version, service
+    async def register_worker(
+        self, worker_id, max_allowed_request, socket, mdp_version, service
     ):
         worker = self.RemoteWorkerClass(
             worker_id, self.heartbeat,
-            socket, mdp_version, service
+            max_allowed_request, socket,
+            mdp_version, service
         )
+        worker.prolong(self._loop.time())
         worker.ready = True
+        worker.destroy_task = self._loop.create_task(
+            self.ban_at_expiration(worker)
+        )
+        worker.heartbeat_task = self._loop.create_task(
+            self.send_heartbeat(worker)
+        )
         service.add_worker(worker)
         self.workers[worker.identity] = worker
-        self.ban_at_expiration(worker)
 
-    async def ban_worker(self, worker: RemoteWorker, wait: float = 0):
+    async def ban_worker(self, worker: RemoteWorker):
         """
         屏蔽掉指定 worker
         """
-        try:
-            if wait:
-                await asyncio.sleep(wait)
-            elif worker.destroy_task:
-                worker.destroy_task.cancel()
-            logger.warning(f"ban worker({worker.identity}).")
-            if worker.is_alive():
-                await self.send_to_backend(
-                    worker.identity, Settings.MDP_COMMAND_DISCONNECT
-                )
-            worker.service.remove_worker(worker)
-            self.workers.pop(worker.identity, None)
-            return True
-        except asyncio.CancelledError:
-            return
+        Mlogger.warning(f"ban worker({worker.identity}).")
+        if worker.is_alive():
+            await self.send_to_backend(
+                worker.identity,
+                Settings.MDP_COMMAND_DISCONNECT
+            )
+            worker.ready = False
+            worker.heartbeat_task.cancel()
+        worker.service.remove_worker(worker)
+        self.workers.pop(worker.identity, None)
+        return True
 
-    def ban_at_expiration(
+    async def register_gate(
+        self, gate_id, socket, mdp_version, work_services
+    ):
+        gate = RemoteGateRPC(
+            gate_id, self.heartbeat,
+            socket, mdp_version,
+            self.gate_cluster,
+            work_services
+        )
+        gate.prolong(self._loop.time())
+        gate.ready = True
+        gate.destroy_task = self._loop.create_task(
+            self.ban_at_expiration(gate)
+        )
+        self.gate_cluster.add_worker(gate)
+
+    async def ban_gate(self, gate: RemoteGateRPC):
+        """
+        和 ban_worker 分开，方便以后加逻辑
+        """
+        Mlogger.warning(f"ban gate({gate.identity}).")
+        if gate.is_alive():
+            await self.send_to_gate(
+                gate.identity,
+                Settings.GATE_COMMAND_DISCONNECT,
+            )
+            gate.ready = False
+            gate.heartbeat_task.cancel()
+        self.gate_cluster.remove_worker(gate)
+        if gate.addr:
+            self.gate.disconnect(gate.addr)
+        return True
+
+    async def ban_at_expiration(
         self, worker: Union[RemoteWorker, RemoteGateRPC]
     ):
-        loop = self._get_loop()
-        wait = 1e-3 * worker.heartbeat * worker.heartbeat_liveness
-        if isinstance(worker, self.ClusterServiceClass.RemoteWorkerClass):
-            worker.destroy_task = loop.create_task(
-                self.ban_gate(worker, wait=wait)
-            )
-        elif isinstance(worker, self.RemoteWorkerClass):
-            worker.destroy_task = loop.create_task(
-                self.ban_worker(worker, wait=wait)
+        while 1:
+            if worker.expiry <= self._loop.time():
+                if isinstance(worker, RemoteGateRPC):
+                    await self.ban_gate(worker)
+                elif isinstance(worker, self.RemoteWorkerClass):
+                    await self.ban_worker(worker)
+                return
+            await asyncio.sleep(
+                1e-3 * worker.heartbeat * worker.heartbeat_liveness
             )
 
-    def delay_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
-        worker.prolong()
-        if worker.destroy_task is not None:
+    async def now_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+        if worker.destroy_task:
             worker.destroy_task.cancel()
-        self.ban_at_expiration(worker)
+        if isinstance(worker, RemoteGateRPC):
+            await self.ban_gate(worker)
+        elif isinstance(worker, self.RemoteWorkerClass):
+            await self.ban_worker(worker)
+
+    async def delay_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+        worker.prolong(self._loop.time())
+
+    async def send_heartbeat(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+        while 1:
+            time_from_last_message = (
+                    self._loop.time() - worker.last_message_sent_time
+            )
+            if time_from_last_message >= 1e-3 * worker.heartbeat:
+                if isinstance(worker, self.RemoteWorkerClass):
+                    await self.send_to_backend(
+                        worker.identity,
+                        Settings.MDP_COMMAND_HEARTBEAT
+                    )
+                elif isinstance(worker, RemoteGateRPC):
+                    await self.send_to_gate(
+                        worker.identity,
+                        Settings.MDP_COMMAND_HEARTBEAT
+                    )
+                await asyncio.sleep(1e-3 * worker.heartbeat)
+            else:
+                await asyncio.sleep(
+                    1e-3 * worker.heartbeat - time_from_last_message
+                )
+
+    def cleanup_internal_task(self, task: asyncio.Task):
+        self.internal_tasks.remove(task)
+        if exception := task.exception():
+            exception_info = ''.join(format_tb(exception.__traceback__))
+            exception_info = (f"{exception.__class__}:{exception.__repr__()}"
+                              f"\n{exception_info}")
+            Mlogger.warning(f"internal task exception:\n{exception_info}")
 
     def cleanup_frontend_task(self, task: asyncio.Task):
         self.frontend_tasks.remove(task)
@@ -1413,7 +1569,7 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = ''.join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception.__repr__()}"
                               f"\n{exception_info}")
-            logger.error(f"frontend task exception:\n{exception_info}")
+            Mlogger.warning(f"frontend task exception:\n{exception_info}")
 
     def cleanup_backend_task(self, task: asyncio.Task):
         self.backend_tasks.remove(task)
@@ -1421,7 +1577,7 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception.__repr__()}"
                               f"\n{exception_info}")
-            logger.error(f"backend task exception:\n{exception_info}")
+            Mlogger.warning(f"backend task exception:\n{exception_info}")
 
     def cleanup_gate_task(self, task: asyncio.Task):
         self.gate_tasks.remove(task)
@@ -1429,17 +1585,185 @@ class AMajordomo(_LoopBoundMixin):
             exception_info = "".join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception.__repr__()}"
                               f"\n{exception_info}")
-            logger.error(f"gate task exception:\n{exception_info}")
+            Mlogger.warning(f"gate task exception:\n{exception_info}")
+
+    async def internal_process(
+        self, client_id: bytes, request_id: bytes, func_name, args, kwargs
+    ):
+        reply = None
+        exception = None
+        kwargs.update({
+            "client_id": client_id,
+            "request_id": request_id,
+        })
+        try:
+            if not self.internal_func.get(func_name, None):
+                if Settings.SECURE:
+                    return
+                raise AttributeError(
+                    "Function not found: {0}".format(func_name)
+                )
+            func = getattr(self, func_name)
+            # Mlogger.debug(
+            #     f"internal process, "
+            #     f"func_name: {func_name}, "
+            #     f"args: {args}, "
+            #     f"kwargs: {kwargs}"
+            # )
+            if inspect.iscoroutinefunction(func):
+                reply = await func(*args, **kwargs)
+            else:
+                if func.__executor__ == "thread":
+                    reply = await run_in_executor(
+                        self._loop, self.thread_executor,
+                        func, *args, **kwargs
+                    )
+                elif func.__executor__ == "process":
+                    reply = await run_in_executor(
+                        self._loop, self.process_executor,
+                        func, *args, **kwargs
+                    )
+                else:
+                    reply = func(*args, **kwargs)
+        except Exception as error:
+            exception = error
+        reply = await generate_reply(result=reply, exception=exception)
+        if client_id in self.clients:
+            if isinstance(reply, HugeData):
+                task = self._loop.create_task(
+                    self.reply_hugedata(
+                        client_id, request_id, self.reply_frontend, reply
+                    ),
+                    name=f"MajordomoReplyCliHD-{client_id}-{request_id}"
+                )
+            elif isinstance(reply, AsyncGenerator):
+                task = self._loop.create_task(
+                    self.reply_agenerator(
+                        client_id, request_id, self.reply_frontend, reply
+                    ),
+                    name=f"MajordomoReplyCliAG-{client_id}-{request_id}"
+                )
+            else:
+                task = self._loop.create_task(
+                    self.reply_frontend(
+                        client_id, Settings.MDP_INTERNAL_SERVICE,
+                        request_id, msg_pack(reply)
+                    )
+                )
+            self.frontend_tasks.add(task)
+            task.add_done_callback(self.cleanup_frontend_task)
+        elif client_id in self.gate_cluster.get_workers():
+            if isinstance(reply, HugeData):
+                task = self._loop.create_task(
+                    self.reply_hugedata(
+                        client_id, request_id, self.reply_gate, reply
+                    ),
+                    name=f"MajordomoReplyGateHD-{client_id}-{request_id}"
+                )
+            elif isinstance(reply, AsyncGenerator):
+                task = self._loop.create_task(
+                    self.reply_agenerator(
+                        client_id, request_id, self.reply_gate, reply
+                    ),
+                    name=f"MajordomoReplyGateAG-{client_id}-{request_id}"
+                )
+            else:
+                task = self._loop.create_task(
+                    self.reply_gate(
+                        client_id, Settings.MDP_INTERNAL_SERVICE,
+                        request_id, msg_pack(reply)
+                    )
+                )
+            self.gate_tasks.add(task)
+            task.add_done_callback(self.cleanup_gate_task)
+
+    async def reply_hugedata(self, client_id, request_id, reply_func, hugedata):
+        try:
+            async for data in hugedata.compress(self._loop):
+                await reply_func(
+                    client_id,
+                    Settings.MDP_INTERNAL_SERVICE,
+                    request_id,
+                    Settings.STREAM_HUGE_DATA_TAG,
+                    data
+                )
+        except Exception as e:
+            await reply_func(
+                client_id,
+                Settings.MDP_INTERNAL_SERVICE,
+                request_id,
+                Settings.STREAM_HUGE_DATA_TAG,
+                hugedata.except_tag
+            )
+            e = msg_pack(
+                (
+                    e.__class__.__name__,
+                    e.__repr__(),
+                    "".join(format_tb(e.__traceback__))
+                )
+            )
+            await reply_func(
+                client_id,
+                Settings.MDP_INTERNAL_SERVICE,
+                request_id,
+                Settings.STREAM_HUGE_DATA_TAG,
+                e
+            )
+        await reply_func(
+            client_id,
+            Settings.MDP_INTERNAL_SERVICE,
+            request_id,
+            Settings.STREAM_HUGE_DATA_TAG,
+            hugedata.end_tag
+        )
+        hugedata.destroy()
+
+    async def reply_agenerator(
+        self, client_id, request_id, reply_func, agenerator: AsyncGenerator
+    ):
+        try:
+            async for sub_reply in agenerator:
+                messages = msg_pack(sub_reply)
+                await reply_func(
+                    client_id,
+                    Settings.MDP_INTERNAL_SERVICE,
+                    request_id,
+                    Settings.STREAM_GENERATOR_TAG,
+                    messages
+                )
+            await reply_func(
+                client_id,
+                Settings.MDP_INTERNAL_SERVICE,
+                request_id,
+                Settings.STREAM_GENERATOR_TAG,
+                Settings.STREAM_END_TAG
+            )
+        except Exception as e:
+            e = msg_pack(
+                (
+                    e.__class__.__name__,
+                    e.__repr__(),
+                    "".join(format_tb(e.__traceback__))
+                )
+            )
+            await reply_func(
+                client_id,
+                Settings.MDP_INTERNAL_SERVICE,
+                request_id,
+                Settings.STREAM_EXCEPT_TAG,
+                Settings.STREAM_EXCEPT_TAG,
+                e
+            )
 
     async def request_zap(
         self, identity: bytes, address: bytes, request_id: bytes,
         mechanism: bytes, credentials: tuple
     ) -> bool:
         cache_key = (address, mechanism, *credentials)
-        cache_key = hash(cache_key)
-        if cache_key in self.zap_cache:
+        try:
             return self.zap_cache[cache_key]
-        logger.debug("miss zap cache")
+        except KeyError:
+            pass
         reply_key = request_id + b"-" + uuid4().bytes
         zap_frames = (
             b"",  # 空帧
@@ -1454,16 +1778,16 @@ class AMajordomo(_LoopBoundMixin):
         zap_frames = tuple(to_bytes(s) for s in zap_frames)
         self.zap_replies[reply_key] = asyncio.Future()
         failed_reply = {
-                "user_id": identity,
-                "request_id": request_id,
-                "metadata": b"",
-                "status_code": b"500",
-                "status_text": b"ZAP Service Failed.",
-            }
+            "user_id": identity,
+            "request_id": request_id,
+            "metadata": b"",
+            "status_code": b"500",
+            "status_text": b"ZAP Service Failed.",
+        }
         try:
             await self.zap.send_multipart(zap_frames)
         except asyncio.TimeoutError:
-            logger.error(f"send ZAP request failed: {zap_frames}.")
+            Mlogger.warning(f"send ZAP request failed: {zap_frames}.")
             zap_reply = failed_reply
         else:
             try:
@@ -1473,10 +1797,10 @@ class AMajordomo(_LoopBoundMixin):
                 )
                 self.zap_replies.pop(reply_key).cancel()
             except asyncio.TimeoutError:
-                logger.error(f"get ZAP replies failed: {reply_key}")
+                Mlogger.warning(f"get ZAP replies failed: {reply_key}")
                 zap_reply = failed_reply
         if zap_reply["status_code"] != b"200":
-            logger.error(
+            Mlogger.warning(
                 f"Authentication failure: {zap_reply['status_code']}"
                 f"({zap_reply['status_text']})"
             )
@@ -1501,7 +1825,6 @@ class AMajordomo(_LoopBoundMixin):
                 metadata
             ) = replies
         except ValueError:
-            logger.debug("ZAP replies frame invalid.")
             return
         request_id = reply_key.split(b"-")[0]
         future = self.zap_replies[reply_key]
@@ -1516,7 +1839,7 @@ class AMajordomo(_LoopBoundMixin):
                 }
             )
         except asyncio.InvalidStateError as e:
-            logger.error(
+            Mlogger.warning(
                 f"zap_replies({reply_key}) set result failed: {e}, "
                 f"done: {future.done()}, cancelled: {future.cancelled()}"
             )
@@ -1539,19 +1862,18 @@ class AMajordomo(_LoopBoundMixin):
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
             else:
-                logger.debug("ZAP frames invalid")
                 return
         else:
             mechanism = credentials = None
 
-        logger.debug(
-            f"gate id: {gate_id}\n"
-            f"command: {command}\n"
-            f"messages: {messages}\n"
-        )
+        # Mlogger.debug(
+        #     f"gate id: {gate_id}\n"
+        #     f"command: {command}\n"
+        #     f"messages: {messages}\n"
+        # )
 
-        if not (gate := self.gate_cluster.workers.get(gate_id, None)):
-            logger.warning(f"The gate({gate_id}) was not registered.")
+        if not (gate := self.gate_cluster.get_workers().get(gate_id, None)):
+            Mlogger.warning(f"The gate({gate_id}) was not registered.")
         if command == Settings.GATE_COMMAND_RING:
             if mechanism:
                 request_id = b"gate_ring"
@@ -1561,11 +1883,16 @@ class AMajordomo(_LoopBoundMixin):
                 )
                 if not zap_result:
                     return
-            await self.send_to_gate(
-                gate_id,
-                Settings.GATE_COMMAND_REPLY,
-                (self.identity,)
+            self.gate_tasks.add(
+                task := self._loop.create_task(
+                    self.send_to_gate(
+                        gate_id,
+                        Settings.GATE_COMMAND_REPLY,
+                        (self.identity,)
+                    )
+                )
             )
+            task.add_done_callback(self.cleanup_gate_task)
 
         elif command == Settings.GATE_COMMAND_READY:
             if mechanism:
@@ -1577,19 +1904,23 @@ class AMajordomo(_LoopBoundMixin):
                 if not zap_result:
                     return
             if gate:
-                return await self.ban_gate(gate)
+                return await self.now_ban(gate)
             try:
                 work_services = msg_unpack(messages[0])
             except MsgUnpackError:
                 return
             if gate_id not in self.gate_cluster.unready_gates:
-                logger.debug(f"send ready command to gate.")
-                await self.send_to_gate(
-                    gate_id,
-                    Settings.GATE_COMMAND_READY,
-                    (msg_pack(list(self.services.keys())),)
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.send_to_gate(
+                            gate_id,
+                            Settings.GATE_COMMAND_READY,
+                            (msg_pack(list(self.services.keys())),)
+                        )
+                    )
                 )
-            self.register_gate(
+                task.add_done_callback(self.cleanup_gate_task)
+            await self.register_gate(
                 gate_id, self.gate,
                 gate_version, work_services
             )
@@ -1607,11 +1938,11 @@ class AMajordomo(_LoopBoundMixin):
                 zap_result = True
             if gate:
                 if not gate.ready or not zap_result:
-                    return await self.ban_gate(gate)
-                self.delay_ban(gate)
+                    return await self.now_ban(gate)
+                await self.delay_ban(gate)
 
         elif command == Settings.GATE_COMMAND_REQUEST:
-            if len(self.gate_replies) > Settings.MESSAGE_MAX:
+            if len(self.gate_replies) > self.max_process_tasks:
                 return
             try:
                 (
@@ -1623,20 +1954,42 @@ class AMajordomo(_LoopBoundMixin):
                 return
             if mechanism:
                 zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id, mechanism, credentials
+                    gate_id, gate_id, request_id,
+                    mechanism, credentials
                 )
                 if not zap_result:
                     return
             service_name = from_bytes(service_name)
             if service_name == Settings.MDP_INTERNAL_SERVICE:
-                await self.internal_process(
-                    gate_id, request_id, body
+                func_name, *body = body
+                func_name = msg_unpack(func_name)
+                if not body:
+                    args, kwargs = tuple(), dict()
+                elif len(body) == 1:
+                    args, kwargs = msg_unpack(body[0]), dict()
+                elif len(body) == 2:
+                    args, kwargs = (msg_unpack(b) for b in body)
+                else:
+                    return
+                self.internal_tasks.add(
+                    task := self._loop.create_task(
+                        self.internal_process(
+                            gate_id, request_id, func_name, args, kwargs
+                        ),
+                        name=f"InternalFunc({func_name})-{gate_id}-{request_id}"
+                    )
                 )
+                task.add_done_callback(self.cleanup_internal_task)
             else:
-                await self.request_backend(
-                    service_name, gate_id,
-                    request_id, body
+                self.backend_tasks.add(
+                    task := self._loop.create_task(
+                        self.request_backend(
+                            service_name, gate_id,
+                            request_id, body
+                        )
+                    )
                 )
+                task.add_done_callback(self.cleanup_backend_task)
 
         elif command == Settings.GATE_COMMAND_REPLY:
             try:
@@ -1646,12 +1999,11 @@ class AMajordomo(_LoopBoundMixin):
             if mechanism:
                 # 流式回复的request_id是不变的
                 zap_result = await self.request_zap(
-                    gate_id, gate_id,
-                    request_id,
+                    gate_id, gate_id, request_id,
                     mechanism, credentials
                 )
                 if not zap_result:
-                    logger.error(
+                    Mlogger.warning(
                         f"ZAP verification of Gate({gate_id})"
                         f" fails,'{mechanism}' mechanism is used, and the "
                         f"credential is '{credentials}', and the request_id "
@@ -1661,13 +2013,29 @@ class AMajordomo(_LoopBoundMixin):
             if not gate:
                 return
             if not gate.ready:
-                return await self.ban_gate(gate)
-            self.delay_ban(gate)
-            if frontend_id := self.request_map.get(request_id, None):
-                await self.reply_frontend(
-                    frontend_id, service_name,
-                    request_id, *body
-                )
+                return await self.now_ban(gate)
+            await self.delay_ban(gate)
+            if client_id := self.request_map.get(request_id, None):
+                if client_id in self.clients:
+                    self.frontend_tasks.add(
+                        task := self._loop.create_task(
+                            self.reply_frontend(
+                                client_id, service_name,
+                                request_id, *body
+                            )
+                        )
+                    )
+                    task.add_done_callback(self.cleanup_frontend_task)
+                elif client_id in self.gate_cluster.get_workers():
+                    self.gate_tasks.add(
+                        task := self._loop.create_task(
+                            self.reply_gate(
+                                client_id, service_name,
+                                request_id, *body
+                            )
+                        )
+                    )
+                    task.add_done_callback(self.cleanup_gate_task)
 
             elif request_id in self.gate_replies:
                 if len(body) == 1:
@@ -1702,16 +2070,21 @@ class AMajordomo(_LoopBoundMixin):
                             huge_reply = HugeData(
                                 Settings.HUGE_DATA_END_TAG,
                                 Settings.HUGE_DATA_EXCEPT_TAG,
-                                compress_module=
-                                Settings.HUGE_DATA_COMPRESS_MODULE,
-                                compress_level=
-                                Settings.HUGE_DATA_COMPRESS_LEVEL,
-                                frame_size_limit=Settings.HUGE_DATA_SIZEOF
+                                compress_module=(
+                                    Settings.HUGE_DATA_COMPRESS_MODULE
+                                ),
+                                compress_level=(
+                                    Settings.HUGE_DATA_COMPRESS_LEVEL
+                                ),
+                                blksize=Settings.HUGE_DATA_SIZEOF
                             )
                             self.gate_replies[request_id].set_result(huge_reply)
                         else:
                             huge_reply = reply.result()
-                        huge_reply.data.put_nowait(body)
+                        await self._loop.run_in_executor(
+                            self.thread_executor, huge_reply.add_data, body
+                        )
+                        # huge_reply.add_data(body)
 
         elif command == Settings.GATE_COMMAND_DISCONNECT:
             if mechanism:
@@ -1724,8 +2097,8 @@ class AMajordomo(_LoopBoundMixin):
                     return
             if gate:
                 gate.ready = False
-                gate.expiry = time()
-                await self.ban_gate(gate)
+                gate.expiry = self._loop.time()
+                await self.now_ban(gate)
 
     async def request_gate(
         self,
@@ -1733,12 +2106,11 @@ class AMajordomo(_LoopBoundMixin):
         service: str,
         body: tuple[Union[bytes, str], ...]
     ):
-        for gid, gate in self.gate_cluster.workers.items():
-            if not gate.is_alive():
-                await self.ban_gate(gate)
-        if not self.gate_cluster.running:
+        if not self.gate_cluster.get_workers():
             raise GateUnAvailableError()
-        elif gate := self.gate_cluster.acquire_service_idle_worker(service):
+        elif gate := await self.gate_cluster.acquire_service_idle_worker(
+                service
+        ):
             option = (service, request_id)
             await self.send_to_gate(
                 gate.identity,
@@ -1768,23 +2140,24 @@ class AMajordomo(_LoopBoundMixin):
         gate_id,
         command: Union[bytes, str],
         option: tuple[Union[bytes, str], ...] = None,
-        messages: tuple[Union[bytes, str], ...] = None,
+        messages: Union[
+            Union[bytes, str], tuple[Union[bytes, str], ...]] = None,
     ):
-        if not option:
-            option = tuple()
-        if not messages:
-            messages = tuple()
-        messages = (
+        _message = [
             gate_id,
             b"",
             Settings.GATE_MEMBER,
             command,
-            *self.gate_zap_frames,
-            *option,
-            *messages
-        )
+        ]
+        if self.gate_zap_frames:
+            _message.extend(self.gate_zap_frames)
+        if option:
+            _message.extend(option)
+        if isinstance(messages, (tuple, list)):
+            _message.extend(messages)
+        elif isinstance(messages, (bytes, str)):
+            _message.append(messages)
         messages = tuple(to_bytes(s) for s in messages)
-        logger.debug(f"send to gate: {messages}")
         await self.gate.send_multipart(messages)
 
     async def process_replies_from_backend(self, replies: list):
@@ -1805,17 +2178,16 @@ class AMajordomo(_LoopBoundMixin):
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
             else:
-                logger.debug("ZAP frames invalid")
                 return
         else:
             mechanism = credentials = None
         if not (worker := self.workers.get(worker_id, None)):
-            logger.warning(f"The worker({worker_id}) was not registered.")
-        logger.debug(
-            f"worker id: {worker_id}\n"
-            f"command: {command}\n"
-            f"messages: {messages}\n"
-        )
+            Mlogger.warning(f"The worker({worker_id}) was not registered.")
+        # Mlogger.debug(
+        #     f"worker id: {worker_id}\n"
+        #     f"command: {command}\n"
+        #     f"messages: {messages}\n"
+        # )
 
         # MDP 定义的 Worker 命令
         if command == Settings.MDP_COMMAND_READY:
@@ -1830,19 +2202,20 @@ class AMajordomo(_LoopBoundMixin):
             if len(messages) > 1:
                 return
             if worker:
-                return await self.ban_worker(worker)
+                return await self.now_ban(worker)
             try:
-                service_name, service_description = (
+                service_name, service_description, max_allowed_request = (
                     from_bytes(messages[0])
-                ).split(":")
+                ).split(Settings.MDP_DESCRIPTION_SEP)
+                max_allowed_request = int(max_allowed_request)
             except ValueError:
                 return
             if service_name not in self.services:
                 self.register_service(service_name, service_description)
             service = self.services[service_name]
-            self.register_worker(
-                worker_id, self.backend,
-                mdp_version, service
+            await self.register_worker(
+                worker_id, max_allowed_request,
+                self.backend, mdp_version, service
             )
 
         elif command == Settings.MDP_COMMAND_HEARTBEAT:
@@ -1859,8 +2232,8 @@ class AMajordomo(_LoopBoundMixin):
 
             if worker:
                 if not worker.ready or not zap_result:
-                    return await self.ban_worker(worker)
-                self.delay_ban(worker)
+                    return await self.now_ban(worker)
+                await self.delay_ban(worker)
 
         elif command == Settings.MDP_COMMAND_REPLY:
             try:
@@ -1872,12 +2245,11 @@ class AMajordomo(_LoopBoundMixin):
             if mechanism:
                 # 流式回复的request_id是不变的
                 zap_result = await self.request_zap(
-                    worker_id, worker_id,
-                    request_id,
+                    worker_id, worker_id, request_id,
                     mechanism, credentials
                 )
                 if not zap_result:
-                    logger.error(
+                    Mlogger.warning(
                         f"ZAP verification of Worker({worker_id})"
                         f" fails,'{mechanism}' mechanism is used, and the "
                         f"credential is '{credentials}', and the request_id "
@@ -1887,18 +2259,28 @@ class AMajordomo(_LoopBoundMixin):
             if not worker:
                 return
             if not worker.ready:
-                return await self.ban_worker(worker)
-            self.delay_ban(worker)
-            if (
-                    client_id in self.clients
-                    or client_id in self.gate_cluster.workers
-            ):
-                await self.reply_frontend(
-                    client_id, worker.service.name, request_id,
-                    *body
+                return await self.now_ban(worker)
+            if client_id in self.clients:
+                self.frontend_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_frontend(
+                            client_id, worker.service.name, request_id, *body
+                        )
+                    )
                 )
+                task.add_done_callback(self.cleanup_frontend_task)
+            if client_id in self.gate_cluster.get_workers():
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_gate(
+                            client_id, worker.service.name, request_id, *body
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_gate_task)
             service = worker.service
-            service.release_worker(worker)
+            await service.release_worker(worker)
+            await self.delay_ban(worker)
 
         elif command == Settings.MDP_COMMAND_DISCONNECT:
             if mechanism:
@@ -1913,40 +2295,45 @@ class AMajordomo(_LoopBoundMixin):
                 return
             if worker:
                 worker.ready = False
-                worker.expiry = time()
-                logger.warning(
+                worker.expiry = self._loop.time()
+                Mlogger.warning(
                     f"recv disconnect and ban worker({worker.identity})"
                 )
-                await self.ban_worker(worker)
+                await self.now_ban(worker)
 
     async def request_backend(
         self,
         service_name: str,
         client_id: bytes,
         request_id: bytes,
-        body: tuple[Union[bytes, str], ...]
+        body: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]]
     ):
-        for wid, worker in self.workers.items():
-            if not worker.is_alive():
-                await self.ban_worker(worker)
         service = self.services.get(service_name)
         try:
             if not service or not service.running:
                 raise ServiceUnAvailableError(service_name)
-            elif worker := service.acquire_idle_worker():
+            elif worker := await service.acquire_idle_worker():
                 option = (client_id, b"", request_id)
-                await self.send_to_backend(
-                    worker.identity, Settings.MDP_COMMAND_REQUEST,
-                    option, body
+                self.backend_tasks.add(
+                    task := self._loop.create_task(
+                        self.send_to_backend(
+                            worker.identity, Settings.MDP_COMMAND_REQUEST,
+                            option, body
+                        )
+                    )
                 )
-            elif self.gate_cluster.running:
+                task.add_done_callback(self.cleanup_backend_task)
+            elif self.gate_cluster.get_workers():
                 # 转发请求其他代理。
                 self.request_map[request_id] = client_id
-                await self.request_gate(
-                    request_id,
-                    service_name,
-                    body
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.request_gate(
+                            request_id, service_name, body
+                        )
+                    )
                 )
+                task.add_done_callback(self.cleanup_gate_task)
             else:
                 raise BusyWorkerError()
         except (
@@ -1955,30 +2342,46 @@ class AMajordomo(_LoopBoundMixin):
         ) as exception:
             exception = await generate_reply(exception=exception)
             except_reply = msg_pack(exception)
-            await self.reply_frontend(
-                client_id, service_name, request_id,
-                except_reply
-            )
+            if client_id in self.clients:
+                self.frontend_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_frontend(
+                            client_id, service_name, request_id,
+                            except_reply
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_frontend_task)
+            elif client_id in self.gate_cluster.get_workers():
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_gate(
+                            client_id, service_name, request_id,
+                            except_reply
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_gate_task)
 
     async def send_to_backend(
         self,
         worker_id,
         command: bytes,
         option: tuple[Union[bytes, str], ...] = None,
-        messages: tuple[Union[bytes, str], ...] = None
+        messages: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]] = None
     ):
-        if not option:
-            option = tuple()
-        if not messages:
-            messages = tuple()
-        request = (
+        request = [
             worker_id,
             b"",
             Settings.MDP_WORKER,
             command,
-            *option,
-            *messages
-        )
+        ]
+        if option:
+            request.extend(option)
+        if isinstance(messages, (tuple, list)):
+            request.extend(messages)
+        elif isinstance(messages, (bytes, str)):
+            request.append(messages)
         request = tuple(to_bytes(frame) for frame in request)
         await self.backend.send_multipart(request)
         return
@@ -2001,72 +2404,65 @@ class AMajordomo(_LoopBoundMixin):
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
             else:
-                logger.debug("ZAP frames invalid")
                 return
         else:
             mechanism = credentials = None
+        # Mlogger.debug(
+        #     f"client id: {client_id}\n"
+        #     f"service_name: {service_name}\n"
+        #     f"messages: {messages}\n"
+        # )
         try:
             request_id, *body = messages
         except ValueError:
             return
         if mechanism:
             zap_result = await self.request_zap(
-                client_id, client_id, request_id, mechanism, credentials
+                client_id, client_id, request_id,
+                mechanism, credentials
             )
             if not zap_result:
                 return
-        self.clients.append(client_id)
+        self.clients.add(client_id)
         service_name = from_bytes(service_name)
-        if service_name == Settings.MDP_INTERNAL_SERVICE:
-            await self.internal_process(
-                client_id, request_id, body
+        if Settings.DEBUG:
+            self.cache_request[request_id] = (
+                service_name, client_id, request_id, body, self._loop.time()
             )
         else:
-            await self.request_backend(
+            self.cache_request[request_id] = (
                 service_name, client_id, request_id, body
             )
-        return
-
-    async def internal_process(
-        self,
-        client_id: bytes, request_id: bytes, body: list[bytes]
-    ):
-        func_name, *body = body
-        stat_code, replies = b"501", b""
-        exception = None
-        kwargs = {
-            "client_id": client_id,
-            "request_id": request_id,
-        }
-        func_name = msg_unpack(func_name)
-        if (
-                func := self.internal_processes.get(func_name, None)
-        ) and len(body) <= 2:
+        if service_name == Settings.MDP_INTERNAL_SERVICE:
+            func_name, *body = body
+            func_name = msg_unpack(func_name)
             if not body:
-                args = tuple()
+                args, kwargs = tuple(), dict()
             elif len(body) == 1:
-                args = msg_unpack(body[0])
+                args, kwargs = msg_unpack(body[0]), dict()
+            elif len(body) == 2:
+                args, kwargs = (msg_unpack(b) for b in body)
             else:
-                args = msg_unpack(body[0])
-                kwargs.update(msg_unpack(body[1]))
-            try:
-                if inspect.iscoroutinefunction(func):
-                    stat_code, replies = await func(*args, **kwargs)
-                else:
-                    ctx = contextvars.copy_context()
-                    func = functools.partial(
-                        ctx.run, func, *args, **kwargs
+                return
+            self.internal_tasks.add(
+                task := self._loop.create_task(
+                    self.internal_process(
+                        client_id, request_id,
+                        func_name, args, kwargs
+                    ),
+                    name=f"InternalFun({func_name})-{client_id}-{request_id}"
+                )
+            )
+            task.add_done_callback(self.cleanup_internal_task)
+        else:
+            self.backend_tasks.add(
+                task := self._loop.create_task(
+                    self.request_backend(
+                        service_name, client_id, request_id, body
                     )
-                    stat_code, replies = await self._get_loop().run_in_executor(
-                        self._executor, func
-                        )
-            except Exception as error:
-                exception = error
-        replies = await generate_reply(result=replies, exception=exception)
-        await self.reply_frontend(
-            client_id, Settings.MDP_INTERNAL_SERVICE,
-            request_id, func_name, stat_code, msg_pack(replies)
-        )
+                )
+            )
+            task.add_done_callback(self.cleanup_backend_task)
 
     async def reply_frontend(
         self, client_id: bytes,
@@ -2074,6 +2470,20 @@ class AMajordomo(_LoopBoundMixin):
         request_id: Union[str, bytes],
         *body
     ):
+        # Mlogger.debug(
+        #     f"client id: {client_id}\n"
+        #     f"request id: {request_id}\n"
+        #     f"service_name: {service_name}\n"
+        #     f"body: {body}\n"
+        # )
+        if request_id in self.cache_request:
+            self.cache_request.pop(request_id)
+            # request = self.cache_request.pop(request_id)
+            # if Settings.DEBUG:
+            #     Mlogger.debug(
+            #         f"request({request_id}) use time from backend:"
+            #         f" {loop.time() - request[-1]}"
+            #     )
         if client_id in self.clients:
             reply = (
                 client_id,
@@ -2085,62 +2495,30 @@ class AMajordomo(_LoopBoundMixin):
             )
             reply = tuple(to_bytes(frame) for frame in reply)
             await self.frontend.send_multipart(reply)
-        elif client_id in self.gate_cluster.workers:
-            await self.reply_gate(
-                client_id, service_name,
-                request_id, body
-            )
-
-    async def send_heartbeat(self):
-        workers = [
-            worker_id
-            for service in self.services.values()
-            for worker_id in service.idle_workers
-            if service.workers.get(worker_id, None)
-        ]
-        for worker_id in workers:
-            await self.send_to_backend(
-                worker_id, Settings.MDP_COMMAND_HEARTBEAT
-                )
-
-        for gate_id in self.gate_cluster.idle_workers:
-            if gate := self.gate_cluster.workers.get(gate_id, None):
-                await self.send_to_gate(
-                    gate.identity, Settings.MDP_COMMAND_HEARTBEAT
-                )
 
     async def _broker_loop(self):
         try:
-            loop = self._get_loop()
             self._poller.register(self.frontend, z_const.POLLIN)
             self._poller.register(self.backend, z_const.POLLIN)
             self._poller.register(self.gate, z_const.POLLIN)
             if self.zap:
                 self._poller.register(self.zap, z_const.POLLIN)
             self.running = True
-            heartbeat_at = 1e-3 * self.heartbeat + loop.time()
-            heartbeat_task: Optional[asyncio.Task] = None
 
             while 1:
-                socks = dict(await self._poller.poll(self.heartbeat))
-                if (
-                        not heartbeat_task or heartbeat_task.done()
-                ) and loop.time() > heartbeat_at:
-                    heartbeat_at = 1e-3 * self.heartbeat + loop.time()
-                    heartbeat_task = loop.create_task(
-                        self.send_heartbeat()
-                    )
+                socks = await self._poller.poll(self.heartbeat)
+                socks = dict(socks)
                 if self.backend in socks:
                     replies = await self.backend.recv_multipart()
-                    bt = loop.create_task(
+                    bt = self._loop.create_task(
                         self.process_replies_from_backend(replies),
                     )
-                    self.backend_tasks.append(bt)
+                    self.backend_tasks.add(bt)
                     bt.add_done_callback(self.cleanup_backend_task)
 
                 if self.frontend in socks:
                     if len(self.frontend_tasks) >= self.max_process_tasks:
-                        logger.error(
+                        Mlogger.warning(
                             f"The number of pending requests from frontend has "
                             f"exceeded the cache limit for the requesting task."
                             f"The limit is {self.max_process_tasks} "
@@ -2150,63 +2528,41 @@ class AMajordomo(_LoopBoundMixin):
                         continue
                     replies = await self.frontend.recv_multipart()
                     # 同后端任务处理。
-                    ft = loop.create_task(
+                    ft = self._loop.create_task(
                         self.process_request_from_frontend(replies),
                     )
-                    self.frontend_tasks.append(ft)
+                    self.frontend_tasks.add(ft)
                     ft.add_done_callback(self.cleanup_frontend_task)
+
                 if self.gate in socks:
-                    logger.debug(f"recv gate messages")
                     messages = await self.gate.recv_multipart()
-                    gt = loop.create_task(
+                    gt = self._loop.create_task(
                         self.process_messages_from_gate(messages)
                     )
-                    self.gate_tasks.append(gt)
-                    gt.add_done_callback(self.gate_tasks.remove)
+                    self.gate_tasks.add(gt)
+                    gt.add_done_callback(self.cleanup_gate_task)
+
                 if self.zap and self.zap in socks:
                     replies = await self.zap.recv_multipart()
-                    zt = loop.create_task(
+                    zt = self._loop.create_task(
                         self.process_replies_from_zap(replies),
                     )
-                    self.zap_tasks.append(zt)
+                    self.zap_tasks.add(zt)
                     zt.add_done_callback(self.zap_tasks.remove)
         except asyncio.CancelledError:
             return
         except Exception:
             exception = "".join(format_exception(*sys.exc_info()))
-            logger.error(exception)
+            Mlogger.error(exception)
             raise
         finally:
             await self.disconnect_all()
-            self._poller.unregister(self.frontend)
-            self._poller.unregister(self.backend)
-            if self.zap:
-                self._poller.unregister(self.zap)
-            logger.info("broker loop exit.")
-
-    async def disconnect_all(self):
-        # TODO: 需要通知客户端吗？
-        logger.warning("Disconnected and all the workers.")
-        for gate in self.gate_cluster.workers.values():
-            await self.disconnect_gate(gate)
-        for work in list(self.workers.values()):
-            await self.ban_worker(work)
-
-    def run(self):
-        if not self._broker_task:
-            loop = self._get_loop()
-            self._broker_task = loop.create_task(self._broker_loop())
-
-    def stop(self):
-        if self._broker_task:
-            if not self._broker_task.cancelled():
-                self._broker_task.cancel()
+            Mlogger.info("broker loop exit.")
             self.close()
-            self._broker_task = None
 
     @interface
     def info(self, **kwargs):
-        return b"200", {
+        return {
             "my_id": self.identity,
             "services": list(self.services.keys())
         }
@@ -2214,26 +2570,25 @@ class AMajordomo(_LoopBoundMixin):
     @interface
     def query_service(self, service_name, **kwargs):
         if service_name in self.services:
-            return b"200", True
+            return True
         else:
-            return b"404", False
+            return False
 
     @interface
     def get_services(self, **kwargs):
         services = list(self.services.keys())
         services.append(Settings.MDP_INTERNAL_SERVICE)
-        return b"200", services
+        return services
 
     @interface
     def keepalive(self, heartbeat, **kwargs):
         if heartbeat == b"heartbeat":
-            stat_code = b"200"
+            return b"200"
         else:
-            stat_code = b"400"
-        return stat_code, b""
+            return b"400"
 
 
-class Client(_LoopBoundMixin):
+class Client:
 
     def __init__(
         self,
@@ -2254,6 +2609,11 @@ class Client(_LoopBoundMixin):
         :param zap_mechanism: zap 的验证机制。
         :param zap_credentials: zap 的凭据帧列表，不填则为空列表。
         """
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
+
         self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
         self.ready: Optional[asyncio.Future] = None
         self._broker_addr = broker_addr
@@ -2279,6 +2639,8 @@ class Client(_LoopBoundMixin):
         self.heartbeat = heartbeat
         self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
         self.heartbeat_expiry = self.heartbeat * self.heartbeat_liveness
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self.last_message_sent_time: float = 0.0
 
         if not reply_timeout:
             reply_timeout = Settings.REPLY_TIMEOUT
@@ -2286,36 +2648,35 @@ class Client(_LoopBoundMixin):
 
         self._executor = ThreadPoolExecutor()
         self.replies: dict[bytes, asyncio.Future] = dict()
-        self._clear_replies_tasks = deque()
+        self._clear_replies_tasks = set()
         self.stream_reply_maxsize = Settings.STREAM_REPLY_MAXSIZE
 
         self.default_service = Settings.SERVICE_DEFAULT_NAME
         self._remote_services: list[str] = []
         self._remote_service = self._remote_func = None
 
-    def connect(self, broker_addr=None):
+    async def connect(self, broker_addr=None):
         if self._recv_task is not None:
             raise RuntimeError("Broker is connected.")
-        if self._recv_task is None:
-            if broker_addr:
-                self._broker_addr = broker_addr
-            self._broker_addr = check_socket_addr(self._broker_addr)
-            loop = self._get_loop()
-            logger.info(
-                f"Client is attempting to connet to the broker at "
-                f"{self._broker_addr}."
-            )
-            self.socket = self.ctx.socket(
-                z_const.DEALER, z_aio.Socket
-            )
-            set_sock(self.socket)
-            self.socket.set(z_const.IDENTITY, self.identity)
-            self.socket.connect(self._broker_addr)
-            self._poller.register(self.socket, z_const.POLLIN)
-            self.ready = loop.create_future()
-            self._recv_task = loop.create_task(self._recv())
+        if broker_addr:
+            self._broker_addr = broker_addr
+        self._broker_addr = check_socket_addr(self._broker_addr)
+        Clogger.info(
+            f"Client is attempting to connet to the broker at "
+            f"{self._broker_addr}."
+        )
+        self.socket = self.ctx.socket(
+            z_const.DEALER, z_aio.Socket
+        )
+        set_sock(self.socket)
+        self.socket.set(z_const.IDENTITY, self.identity)
+        self.socket.connect(self._broker_addr)
+        self._poller.register(self.socket, z_const.POLLIN)
+        self.ready = self._loop.create_future()
+        self._recv_task = self._loop.create_task(self._recv())
+        await self._get_services()
 
-    def disconnect(self):
+    async def disconnect(self):
         if self.socket is not None:
             self._poller.unregister(self.socket)
             self.socket.disconnect(self._broker_addr)
@@ -2325,33 +2686,20 @@ class Client(_LoopBoundMixin):
     def close(self):
         if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()
+        if self._executor:
+            self._executor.shutdown(False)
+            self._executor = None
         self._recv_task = None
         self.ready = None
 
-    async def _clear_reply(self, request_id):
-        if request_id in self.replies:
-            reply = self.replies[request_id].result()
-            if isinstance(reply, StreamReply):
-                if reply._exit:
-                    self.replies.pop(request_id).cancel()
-                else:
-                    t = self._get_loop().create_task(
-                        self._clear_reply(request_id)
-                    )
-                    self._clear_replies_tasks.append(t)
-                    t.add_done_callback(self._clear_replies_tasks.remove)
-            else:
-                self.replies.pop(request_id).cancel()
-
-    async def _request(
-        self, service_name: Union[str, bytes],
-        func_name: Union[str, bytes], args: tuple, kwargs: dict,
+    async def _send_to_majordomo(
+        self, service_name: Union[str, bytes], *body,
     ) -> bytes:
         """
-        客户端使用 DEALER 类型 socket，每个请求都有一个id，
-        worker 每个回复都会带上这个请求id。 客户端需要将回复和请求对应上。
-        :param service_name: 要访问的服务的名字
-        """
+                客户端使用 DEALER 类型 socket，每个请求都有一个id，
+                worker 每个回复都会带上这个请求id。 客户端需要将回复和请求对应上。
+                :param service_name: 要访问的服务的名字
+                """
         request_id = to_bytes(uuid4().hex)
         request = (
             b"",
@@ -2359,13 +2707,81 @@ class Client(_LoopBoundMixin):
             service_name,
             *self.zap_frames,
             request_id,
-            msg_pack(func_name),
-            msg_pack(args),
-            msg_pack(kwargs)
+            *body
         )
         request = tuple(to_bytes(frame) for frame in request)
         await self.socket.send_multipart(request)
+        self.last_message_sent_time = self._loop.time()
         return request_id
+
+    async def _clear_reply(self, request_id):
+        if request_id in self.replies:
+            reply = self.replies[request_id].result()
+            if isinstance(reply, StreamReply):
+                if reply._exit:
+                    self.replies.pop(request_id).done()
+                else:
+                    t = self._loop.create_task(
+                        self._clear_reply(request_id)
+                    )
+                    self._clear_replies_tasks.add(t)
+                    t.add_done_callback(self._clear_replies_tasks.remove)
+            else:
+                self.replies.pop(request_id).done()
+
+    async def _request(
+        self, service_name: Union[str, bytes],
+        func_name: Union[str, bytes], args: tuple, kwargs: dict,
+    ):
+        st = self._loop.time()
+        request_id = await self._send_to_majordomo(
+            service_name,
+            msg_pack(func_name), msg_pack(args), msg_pack(kwargs)
+        )
+        self.replies[request_id] = self._loop.create_future()
+        try:
+            response = await asyncio.wait_for(
+                self.replies[request_id],
+                self.reply_timeout
+            )
+            # if Settings.DEBUG:
+                # Clogger.debug(
+                #     f"request(request_id) use time from majordomo:"
+                #     f" {self._loop.time() - st}"
+                # )
+                # Clogger.debug(f"response type: {type(response)}")
+            if isinstance(response, StreamReply):
+                return response
+            elif isinstance(response, HugeData):
+                result = b""
+                executor = ProcessPoolExecutor()
+                async for data in response.decompress(
+                        self._loop, Settings.HUGE_DATA_SIZEOF
+                ):
+                    result += data
+                try:
+                    result = await run_in_executor(
+                        self._loop, executor, msg_unpack, result
+                    )
+                    return result
+                finally:
+                    response.destroy()
+                    executor.shutdown(False, cancel_futures=True)
+            else:
+                if exception := response.get("exception"):
+                    raise RemoteException(exception)
+                return response.get("result")
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                "Timeout while requesting the Majordomo service."
+            )
+        except Exception as e:
+            raise e
+        finally:
+            self._clear_replies_tasks.add(
+                t := self._loop.create_task(self._clear_reply(request_id))
+            )
+            t.add_done_callback(self._clear_replies_tasks.remove)
 
     async def knock(
         self, service_name: str, func_name: str, *args, **kwargs
@@ -2378,7 +2794,7 @@ class Client(_LoopBoundMixin):
         :param kwargs: 要调用的该函数要传递的关键字参数
         """
         if not self._recv_task:
-            self.connect()
+            await self.connect()
         await asyncio.wait_for(self.ready, self.reply_timeout)
         if not service_name:
             service_name = self.default_service
@@ -2387,67 +2803,45 @@ class Client(_LoopBoundMixin):
                 f"The remote service named \"{service_name}\" was not "
                 f"found."
             )
-        if len(self.replies) > Settings.MESSAGE_MAX:
-            raise RuntimeError(
-                "The number of pending requests has exceeded the cache limit"
-                " for the requesting task. The limit is "
+        if (replies_len := len(self.replies)) > Settings.MESSAGE_MAX:
+            msg = (
+                f"The number({replies_len}) of pending requests has exceeded "
+                f"the cache limit for the requesting task. The limit is "
                 f"{Settings.MESSAGE_MAX} requests."
             )
-        loop = self._get_loop()
-        request_id = await self._request(
-            service_name, func_name, args, kwargs
-        )
-        self.replies[request_id] = asyncio.Future()
-        try:
-            response = await asyncio.wait_for(
-                self.replies[request_id],
-                self.reply_timeout
-            )
-            if isinstance(response, StreamReply):
-                return response
-            elif isinstance(response, HugeData):
-                result = b""
-                async for data in response.decompress(
-                        Settings.HUGE_DATA_SIZEOF
-                        ):
-                    await asyncio.sleep(0)
-                    result += data
-                with ProcessPoolExecutor() as executor:
-                    _msg_unpack = functools.partial(
-                        msg_unpack, result
-                    )
-                    try:
-                        result = await loop.run_in_executor(
-                            executor, _msg_unpack
-                        )
-                    except MsgUnpackError:
-                        pass
-                return result
-            else:
-                if exception := response.get("exception"):
-                    raise RemoteException(*exception)
-                return response.get("result")
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                "Timeout while requesting the Majordomo service."
-            )
-        finally:
-            t = loop.create_task(self._clear_reply(request_id))
-            self._clear_replies_tasks.append(t)
-            t.add_done_callback(self._clear_replies_tasks.remove)
+            if Settings.SECURE:
+                raise RuntimeError(msg)
+            logger.warning(msg)
+        return await self._request(service_name, func_name, args, kwargs)
 
     async def _majordomo_service(
         self, func_name: str, *args, **kwargs
     ):
-
         return await self._request(
             Settings.MDP_INTERNAL_SERVICE, func_name, args, kwargs
         )
 
     async def _send_heartbeat(self):
-        return await self._majordomo_service(
-            "keepalive", b"heartbeat"
-        )
+        while 1:
+            time_from_last_message = (
+                    self._loop.time() - self.last_message_sent_time
+            )
+            if time_from_last_message >= 1e-3 * self.heartbeat:
+                await self._send_to_majordomo(
+                    Settings.MDP_INTERNAL_SERVICE,
+                    msg_pack("keepalive"), msg_pack((b"heartbeat",))
+                )
+                await asyncio.sleep(1e-3 * self.heartbeat)
+            else:
+                await asyncio.sleep(
+                    1e-3 * self.heartbeat - time_from_last_message
+                )
+
+    async def _get_services(self):
+        services = await self._majordomo_service("get_services")
+        self._remote_services = services
+        if not self.ready.done():
+            self.ready.set_result(True)
 
     async def _query_service(self, service_name: bytes):
         return await self._majordomo_service(
@@ -2456,21 +2850,16 @@ class Client(_LoopBoundMixin):
 
     async def _recv(self):
         try:
-            loop = self._get_loop()
-            heartbeat_at = 0.0
             majordomo_liveness = self.heartbeat_liveness
-            await self._majordomo_service("get_services")
+            self._heartbeat_task = self._loop.create_task(
+                self._send_heartbeat()
+            )
             while 1:
-                if self.ready is None:
-                    return
-                if loop.time() > heartbeat_at:
-                    await self._send_heartbeat()
-                    heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                 socks = await self._poller.poll(self.heartbeat)
                 if not socks:
                     majordomo_liveness -= 1
                     if majordomo_liveness == 0:
-                        logger.error("Majordomo offline")
+                        Clogger.error("Majordomo offline")
                         break
                     continue
                 messages = await self.socket.recv_multipart()
@@ -2489,33 +2878,9 @@ class Client(_LoopBoundMixin):
                 if mdp_client_version != Settings.MDP_CLIENT:
                     continue
                 try:
-                    logger.debug(
-                        f"Reply: \n"
-                        f"frame 0: {empty},\n"
-                        f"frame 1: {mdp_client_version},\n"
-                        f"frame 2: {service_name},\n"
-                        f"frame 3: {request_id},\n"
-                        f"frame 4+: {body}"
-                    )
-                    heartbeat_at = 1e-3 * self.heartbeat + loop.time()
                     majordomo_liveness = self.heartbeat_liveness
-                    if (
-                            service_name := from_bytes(service_name)
-                    ) == Settings.MDP_INTERNAL_SERVICE:
-                        func_name, stat_code, body = body
-                        func_name = from_bytes(func_name)
-                        body = msg_unpack(body)
-                        if func_name == "keepalive":
-                            continue
-                        if func_name == "get_services":
-                            services = body["result"]
-                            self._remote_services = services
-                            if not self.ready.done():
-                                self.ready.set_result(True)
-                            if request_id not in self.replies:
-                                continue
-                        self.replies[request_id].set_result(body)
-
+                    if request_id not in self.replies:
+                        continue
                     elif len(body) == 1:
                         body = msg_unpack(body[0])
                         self.replies[request_id].set_result(body)
@@ -2548,34 +2913,36 @@ class Client(_LoopBoundMixin):
                                 huge_reply = HugeData(
                                     Settings.HUGE_DATA_END_TAG,
                                     Settings.HUGE_DATA_EXCEPT_TAG,
-                                    compress_module=
-                                    Settings.HUGE_DATA_COMPRESS_MODULE,
-                                    compress_level=
-                                    Settings.HUGE_DATA_COMPRESS_LEVEL,
-                                    frame_size_limit=
-                                    Settings.HUGE_DATA_SIZEOF
+                                    compress_module=(
+                                        Settings.HUGE_DATA_COMPRESS_MODULE
+                                    ),
+                                    compress_level=(
+                                        Settings.HUGE_DATA_COMPRESS_LEVEL
+                                    ),
+                                    blksize=Settings.HUGE_DATA_SIZEOF
                                 )
                                 self.replies[request_id].set_result(huge_reply)
                             else:
                                 huge_reply = reply.result()
-                            huge_reply.data.put_nowait(body)
+                            if (len(option) > 1 and option[1] ==
+                                    Settings.STREAM_EXCEPT_TAG):
+                                huge_reply._remote_exception = body
+                            else:
+                                await self._loop.run_in_executor(
+                                    self._executor, huge_reply.add_data, body
+                                )
                 except MsgUnpackError:
                     continue
-                # except asyncio.TimeoutError:
-                #     logger.error(
-                #         f"The number of pending replies has reached"
-                #         f" the limit."
-                #         f" The limit is {self.replies.maxsize} replies."
-                #     )
         except asyncio.CancelledError:
-            logger.warning("recv task cancelled.")
+            Clogger.warning("recv task cancelled.")
             return
         except Exception:
             exception = "".join(format_exception(*sys.exc_info()))
-            logger.error(exception)
+            Clogger.error(exception)
             raise
         finally:
-            self.disconnect()
+            await self.disconnect()
+            self._heartbeat_task.cancel()
             self.ready = None
 
     def __getattr__(self, item):
@@ -2593,9 +2960,8 @@ class Client(_LoopBoundMixin):
         返回一个执行rpc调用的协程
         """
         try:
-            waiting = self.knock(
-                    self._remote_service, self._remote_func, *args, **kwargs
-                )
+            return self.knock(
+                self._remote_service, self._remote_func, *args, **kwargs
+            )
         finally:
             self._remote_service = self._remote_func = None
-        return waiting

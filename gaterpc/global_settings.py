@@ -3,12 +3,16 @@
 # Created Date: 2023/5/10 16:47
 """Gate rpc constants"""
 import asyncio
+import os
 from importlib import import_module
 from logging.config import dictConfig
 from pathlib import Path
 import zmq.constants as z_const
 
-from .utils import TypeValidator, LazyAttribute, empty, ensure_mkdir
+from .utils import (
+    TypeValidator, LazyAttribute, UnixEPollEventLoopPolicy,
+    empty, ensure_mkdir,
+)
 
 
 def user_settings_render(settings: "GlobalSettings", user_settings):
@@ -22,13 +26,7 @@ def user_settings_render(settings: "GlobalSettings", user_settings):
 def logging_render(settings: "GlobalSettings", logging: dict):
     if logging is empty:
         return dict()
-    if settings.DEBUG:
-        for logger in logging["loggers"].values():
-            logger["level"] = "DEBUG"
-            logger["handlers"].append("console")
     for name, handler in logging["handlers"].items():
-        if settings.DEBUG:
-            handler["formatter"] = "debug"
         if handler.get("filename") is empty:
             handler["filename"] = settings.LOG_PATH.joinpath(f"{name}.log")
     return logging
@@ -65,6 +63,7 @@ _DEFAULT_LOGGING = {
             "level": "DEBUG",
             "class": "gaterpc.utils.AQueueHandler",
             "handler_class": "logging.handlers.TimedRotatingFileHandler",
+            "listener": "gaterpc.utils.singleton_aqueue_listener",
             "filename": empty,
             "formatter": "debug",
             "when": "midnight",
@@ -74,6 +73,7 @@ _DEFAULT_LOGGING = {
             "level": "DEBUG",
             "class": "gaterpc.utils.AQueueHandler",
             "handler_class": "logging.handlers.TimedRotatingFileHandler",
+            "listener": "gaterpc.utils.singleton_aqueue_listener",
             "filename": empty,
             "formatter": "verbose",
             "when": "midnight",
@@ -104,7 +104,7 @@ _DEFAULT_LOGGING = {
         "gaterpc.zap": {
             "level": "INFO",
             "handlers": ["gaterpc"],
-            "propagate": True,
+            "propagate": False,
         },
         "commands": {
             "level": "INFO",
@@ -121,8 +121,10 @@ class GlobalSettings(object):
     """
     # system
     DEBUG = False
-    EVENT_LOOP_POLICY: asyncio.AbstractEventLoopPolicy = None
-    GLOBAL_LOOP: asyncio.AbstractEventLoop = None
+    ENVIRONMENT = LazyAttribute(
+        raw=dict(),
+        process=lambda instance, p: TypeValidator(dict)(p)
+    )
 
     # Base
     BASE_PATH: Path = LazyAttribute(
@@ -142,11 +144,12 @@ class GlobalSettings(object):
         ) if p is empty else ensure_mkdir(p),
         process=lambda instance, p: TypeValidator(Path)(p)
     )
-    HEARTBEAT: int = 3000  # millisecond
+    HEARTBEAT: int = 5000  # millisecond
     TIMEOUT: float = 30.0
     WINDOWS_MAX_WORKERS: int = 63 - 2
-    WORKER_ADDR: str = f"inproc://gate.worker.01"
+    WORKER_ADDR: str = "ipc:///tmp/gate-rpc/w1"
     USER_SETTINGS = LazyAttribute(render=user_settings_render)
+    SECURE = True
     # ZMQ
     ZMQ_CONTEXT = {
         z_const.IPV6: 1
@@ -191,6 +194,7 @@ class GlobalSettings(object):
     MDP_COMMAND_REPLY: bytes = b"\x03"
     MDP_COMMAND_HEARTBEAT: bytes = b"\x04"
     MDP_COMMAND_DISCONNECT: bytes = b"\x05"
+    MDP_DESCRIPTION_SEP: str = ":"
     # Gate
     GATE_CLUSTER_NAME: str = "GateCluster"
     GATE_CLUSTER_DESCRIPTION: str = "GateRPC cluster service"
@@ -215,7 +219,7 @@ class GlobalSettings(object):
     STREAM_HUGE_DATA_TAG = b"GateStreamHugData"
     HUGE_DATA_SIZEOF = 1000  # MTU 1500 减去20字节ip头部，20字节tcp头部，去掉MDP的前几帧
     HUGE_DATA_COMPRESS_MODULE: str = "gzip"
-    HUGE_DATA_COMPRESS_LEVEL: int = 9
+    HUGE_DATA_COMPRESS_LEVEL: int = 1
     HUGE_DATA_END_TAG = b"HugeDataEND"
     HUGE_DATA_EXCEPT_TAG = b"HugeDataException"
     SERVICE_DEFAULT_NAME: str = "GateRPC"
@@ -247,11 +251,12 @@ class GlobalSettings(object):
                 continue
             self.configure(name, value)
 
-        if getattr(self, "EVENT_LOOP_POLICY", None):
-            asyncio.set_event_loop_policy(self.EVENT_LOOP_POLICY)
+        if self.DEBUG:
+            self.ENVIRONMENT["PYTHONASYNCIODEBUG"] = "1"
 
-        if not self.GLOBAL_LOOP:
-            self.GLOBAL_LOOP = asyncio.new_event_loop()
+        for name, value in self.ENVIRONMENT.items():
+            os.environ[name] = value
+
         dictConfig(self.DEFAULT_LOGGING)
         if self.LOGGING:
             dictConfig(self.LOGGING)

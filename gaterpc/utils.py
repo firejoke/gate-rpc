@@ -5,50 +5,56 @@ import asyncio
 import atexit
 import bz2
 import copy
+import functools
 import inspect
 import io
-import logging
 import lzma
-import operator
+import os
 import platform
 import queue
+import selectors
 import struct
+import sys
 import threading
 import time
 import warnings
-from pathlib import Path
 
-import math
 import zlib
 
-from asyncio import Future, Task
-from collections import Counter, UserDict, deque, namedtuple
-from collections.abc import AsyncGenerator, Callable, Generator
-from concurrent.futures import ProcessPoolExecutor
+from logging import Handler, getLogger
+from multiprocessing import Manager
+from multiprocessing.managers import (
+    ArrayProxy, DictProxy, ListProxy,
+    ValueProxy,
+)
+from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.resource_tracker import unregister
+from importlib import import_module
+from pathlib import Path
 from functools import (
     WRAPPER_ASSIGNMENTS, _make_key, partial, update_wrapper,
     wraps, lru_cache,
 )
-from importlib import import_module
-from logging import Handler
-from multiprocessing import Manager
-from multiprocessing.managers import (
-    ArrayProxy, DictProxy, ListProxy, ValueProxy,
-)
-from multiprocessing.shared_memory import SharedMemory
-from traceback import format_tb
-from typing import (
-    Any, Iterable, MutableMapping, Optional, TypeVar,
-    Union, overload, ByteString,
-)
+
+from collections import deque, namedtuple
+from collections.abc import AsyncGenerator, Callable, Generator
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from typing import Any, Optional, TypeVar, Union, ByteString, overload
 
 import msgpack
 
-from .exceptions import BadGzip, DictFull, HugeDataException, RemoteException
-from .mixins import _LoopBoundMixin
+from .exceptions import BadGzip, HugeDataException, RemoteException
 
 
+logger = getLogger("commands")
 SyncManager = Manager()
+
+
+class UnixEPollEventLoopPolicy(asyncio.unix_events.DefaultEventLoopPolicy):
+    _loop_factory = asyncio.unix_events.SelectorEventLoop
+
+    def new_event_loop(self):
+        return self._loop_factory(selectors.EpollSelector())
 
 
 def singleton(cls):
@@ -58,6 +64,7 @@ def singleton(cls):
         if cls not in instances:
             instances[cls] = cls(*args, **kwargs)
         return instances.get(cls)
+
     return get_instance
 
 
@@ -156,7 +163,7 @@ empty = Empty()
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
-class LRUCache(object):
+class LRUCache:
     PREV, NEXT, KEY, RESULT = 0, 1, 2, 3
 
     def __init__(self, maxsize: int):
@@ -165,13 +172,11 @@ class LRUCache(object):
         self.full = False
         self.root = []
         self.root[:] = [self.root, self.root, None, None]
-        self.cache = {}
+        self.cache = dict()
 
     def __contains__(self, item):
         if item in self.cache:
-            self.hits += 1
             return True
-        self.misses += 1
         return False
 
     def __setitem__(self, key, value):
@@ -339,6 +344,7 @@ def coroutine_lru_cache(maxsize=128, typed=False):
 
 
 class Validator:
+
     def __init__(self, error_message=None):
         if error_message:
             self.error_message = error_message
@@ -374,11 +380,11 @@ _PV = TypeVar("_PV")
 
 
 class LazyAttribute:
+
     def __init__(
         self, raw: Any = empty,
-        render: Optional[Callable[[_I, _PV], _PV]] = None,
-        process: Optional[Callable[[_I, _PV], _PV]] = None,
-
+        render: Callable[[_I, _PV], Any] = None,
+        process: Callable[[_I, _PV], Any] = None
     ):
         self._raw = raw
         self._process = process
@@ -413,12 +419,14 @@ class QueueListener(object):
         if handlers:
             self.add_handlers(handlers)
         atexit.register(self.stop)
-        # self._loop.call_soon(self.start)
         self.start()
 
     def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
         for handler in handlers:
             self.handlers[handler.get_name()] = handler
+
+    def remove_handler(self, handler: Handler):
+        self.handlers.pop(handler.get_name())
 
     def dequeue(self):
         return self.queue.get()
@@ -477,11 +485,6 @@ class AQueueListener(object):
         self, handlers: Union[list[Handler], tuple[Handler]] = None,
         respect_handler_level=True
     ):
-        if not (loop := asyncio.get_event_loop()).is_running():
-            self._loop = loop
-            # self._loop.run_forever()
-        else:
-            self._loop = None
         self.respect_handler_level = respect_handler_level
         self.queue = asyncio.Queue()
         self.handlers = dict()
@@ -495,6 +498,9 @@ class AQueueListener(object):
     def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
         for handler in handlers:
             self.handlers[handler.get_name()] = handler
+
+    def remove_handler(self, handler: Handler):
+        self.handlers.pop(handler.get_name())
 
     async def dequeue(self):
         return await self.queue.get()
@@ -538,39 +544,28 @@ class AQueueListener(object):
                 warnings.warn(e.__repr__())
 
     def start(self):
-        if self._loop:
-            self._task = self._loop.create_task(self._monitor())
-        else:
-            self._task = asyncio.create_task(self._monitor())
-        # self._thread = t = threading.Thread(target=self._monitor)
-        # t.daemon = True
-        # t.start()
+        self._task = asyncio.create_task(self._monitor())
 
     def stop(self):
         if self._task:
-            self._task.cancel()
-        if self._loop:
-            self._loop.stop()
-        # if self._thread:
-        #     self.enqueue_sentinel()
-        #     self._thread.join()
-        #     self._thread = None
+            self.enqueue_sentinel()
+            # self._task.cancel()
 
 
 class AQueueHandler(Handler):
+
     def __init__(
-        self, handler_class: Union[Handler, str], *args, **kwargs
+        self, *args,
+        handler_class: Union[Handler, str] = None,
+        listener: str = "gaterpc.utils.singleton_queue_listener",
+        **kwargs
     ):
         Handler.__init__(self)
         if isinstance(handler_class, str):
             handler_class = resolve_module_attr(handler_class)
         self.handler = handler_class(*args, **kwargs)
-        if asyncio.get_event_loop().is_running():
-            self._name = f"AQueueHandler{id(self.handler)}"
-            self.listener = singleton_aqueue_listener()
-        else:
-            self._name = f"QueueHandler{id(self.handler)}"
-            self.listener = singleton_queue_listener()
+        self._name = f"QueueHandler{id(self.handler)}"
+        self.listener = resolve_module_attr(listener)()
         self.h_name = f"{self._name}-handler"
         self.handler.set_name(self.h_name)
         self.listener.add_handlers((self.handler,))
@@ -599,7 +594,7 @@ class AQueueHandler(Handler):
 
     def close(self):
         if self.listener:
-            self.listener.stop()
+            self.listener.remove_handler(self.handler)
         super().close()
 
 
@@ -611,6 +606,7 @@ class MessagePack(object):
     """
     用于配置全局的msgpack
     """
+
     def __init__(self):
         self.prepare_pack: Optional[Callable] = None
         self.unpack_object_hook: Optional[Callable] = None
@@ -623,7 +619,7 @@ class MessagePack(object):
                 "unpack_object_hook",
                 "unpack_object_pairs_hook",
                 "unpack_list_hook"
-        ) and value and not callable(value):
+        ) and value and not isinstance(value, Callable):
             raise TypeError(f"`{key}` is not callable")
         super().__setattr__(key, value)
 
@@ -688,11 +684,32 @@ def msg_unpack(data: ByteString) -> Any:
     return obj
 
 
-class StreamReply(AsyncGenerator, _LoopBoundMixin):
+def ensure_shm_unlink(shm: SharedMemory):
+    try:
+        if shm.buf is not None:
+            shm.buf.release()
+        shm.close()
+        shm.unlink()
+    except FileNotFoundError:
+        try:
+            unregister(shm._name, "shared_memory")
+        except KeyError:
+            pass
+    except KeyError:
+        pass
+    except ImportError:
+        pass
+
+
+class StreamReply(AsyncGenerator):
+
     def __init__(self, end_message, maxsize=0, timeout=0):
-        loop = self._get_loop()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
         self.end_message = end_message
-        self.replies = asyncio.Queue(maxsize, loop=loop)
+        self.replies = asyncio.Queue(maxsize, loop=self._loop)
         self.timeout = timeout
         self._exit = False
         self._pause = False
@@ -705,7 +722,7 @@ class StreamReply(AsyncGenerator, _LoopBoundMixin):
             raise GeneratorExit
         if self.timeout:
             value = await asyncio.wait_for(
-                self.replies.get(), self.timeout, loop=self._get_loop()
+                self.replies.get(), self.timeout, loop=self._loop
             )
         else:
             value = self.replies.get_nowait()
@@ -741,6 +758,7 @@ class StreamReply(AsyncGenerator, _LoopBoundMixin):
 
 
 class GzipCompressor(object):
+
     def __init__(self, compresslevel):
         self.compresslevel = compresslevel
         self.crc = zlib.crc32(b"")
@@ -791,6 +809,7 @@ class GzipCompressor(object):
 
 
 class GzipDecompressor(object):
+
     def __init__(self):
         self._buffer = b""
         self._crc = zlib.crc32(b"")
@@ -809,19 +828,16 @@ class GzipDecompressor(object):
         if method != 8:
             raise BadGzip("Unknown conmpression method")
         if flag & 4:
-            # Read & discard the extra field, if present
             extra_len, = struct.unpack(
                 "<H", data[index: (index := index + 2)]
             )
             index += extra_len
         if flag & 8:
-            # Read and discard a null-terminated string containing the filename
             while True:
                 s = data[(index := index + 1)]
                 if not s or s == b'\000':
                     break
         if flag & 16:
-            # Read and discard a null-terminated string containing a comment
             while True:
                 s = data[(index := index + 1)]
                 if not s or s == b'\000':
@@ -839,11 +855,12 @@ class GzipDecompressor(object):
         return self._decompressor.unconsumed_tail == b""
 
     def _read_eof(self):
-        crc32, isize = struct.unpack("<II", self._decompressor.unused_data[:8])
-        if crc32 != self._crc:
-            raise BadGzip(f"CRC check failed {hex(crc32)} != {hex(self._crc)}")
-        elif isize != (self._stream_size & 0xffffffff):
-            raise BadGzip("Incorrect length of data produced")
+        if buffer := self._buffer[:8]:
+            crc32, isize = struct.unpack("<II", buffer)
+            if crc32 != self._crc:
+                raise BadGzip(f"CRC check failed {hex(crc32)} != {hex(self._crc)}")
+            elif isize != (self._stream_size & 0xffffffff):
+                raise BadGzip("Incorrect length of data produced")
 
     def decompress(self, data, max_length=0):
         if max_length < 0:
@@ -851,20 +868,214 @@ class GzipDecompressor(object):
         if self._new_member:
             data = self._remove_header(data)
             self._new_member = False
-        if not self.needs_input:
-            data = self._decompressor.unconsumed_tail + data
+        data += self._buffer
         data = self._decompressor.decompress(data, max_length)
-        if data == b"":
-            raise EOFError("Compressed data ended before the "
-                           "end-of-stream marker was reached")
-        self._crc = zlib.crc32(data, self._crc)
+        self._buffer = self._decompressor.unconsumed_tail
+        if data:
+            self._crc = zlib.crc32(data, self._crc)
         self._stream_size += len(data)
-        if self._decompressor.eof:
-            self._read_eof()
         return data
 
 
-class HugeData(object):
+def _incremental_compress(
+    compress_module: str, compress_level: int,
+    in_data: Union[str, int], out_data: int, end_tag: bytes,
+    blksize: int = 1000
+):
+    """
+    :param compress_module: 压缩模块
+    :param compress_level: 压缩级别
+    :param in_data: 输入数据，管道读取端的文件描述符，或者 SharedMemory 的名
+    :param out_data: 输出数据，管道写入端的文件描述符
+    :param end_tag: 结束标记
+    :param blksize: 每一块数据的大小
+    """
+    sel = selectors.DefaultSelector()
+    sel.register(out_data, selectors.EVENT_WRITE)
+    write_key = (sel.get_key(out_data), selectors.EVENT_WRITE)
+    if isinstance(in_data, str):
+        shm = SharedMemory(name=in_data)
+        shm_index = 0
+
+        def read_data(events):
+            nonlocal shm_index
+            data = shm.buf[
+                   shm_index:
+                   (shm_index := shm_index + io.DEFAULT_BUFFER_SIZE)
+                   ].tobytes()
+            if data:
+                return data
+            else:
+                return end_tag
+
+        def clean():
+            try:
+                shm.close()
+            except BufferError as e:
+                # logger.warning(f"_incremental_compress.clean: {e}")
+                pass
+
+    elif isinstance(in_data, int):
+        sel.register(in_data, selectors.EVENT_READ)
+        read_key = (sel.get_key(in_data), selectors.EVENT_READ)
+
+        def read_data(events):
+            if read_key in events:
+                dl = os.read(in_data, 2)
+                d = os.read(in_data, int.from_bytes(dl, sys.byteorder))
+                return d
+            return None
+
+        def clean():
+            sel.unregister(in_data)
+
+    else:
+        raise TypeError("in_data")
+
+    try:
+        if compress_module == "gzip":
+            compressor = GzipCompressor(compress_level)
+        elif compress_module == "bz2":
+            compressor = bz2.BZ2Compressor(compress_level)
+        elif compress_module == "lzma":
+            compressor = lzma.LZMACompressor(preset=compress_level)
+        else:
+            compress_module = resolve_module_attr(compress_module)
+            compressor = compress_module.compressor(compress_level)
+        buffer = b""
+        stream_end = False
+        finish = False
+        while 1:
+            events = sel.select(1)
+            if stream_end and not finish:
+                buffer += compressor.flush()
+                finish = True
+            elif (len(buffer) > blksize) or (stream_end and buffer):
+                if write_key in events:
+                    c_d, buffer = (
+                        buffer[:blksize],
+                        buffer[blksize:]
+                    )
+                    c_d = len(c_d).to_bytes(2, sys.byteorder) + c_d
+                    os.write(out_data, c_d)
+            elif not stream_end:
+                raw_d = read_data(events)
+                if raw_d == end_tag:
+                    stream_end = True
+                elif raw_d:
+                    buffer += compressor.compress(raw_d)
+            else:
+                break
+    except Exception as error:
+        raise HugeDataException(error)
+    finally:
+        os.write(out_data, len(end_tag).to_bytes(2, sys.byteorder) + end_tag)
+        clean()
+        sel.unregister(out_data)
+        sel.close()
+
+
+def _incremental_decompress(
+    compress_module: str,
+    in_data: Union[str, int], out_data: int,
+    end_tag: bytes,
+    max_length=-1, blksize=1000
+):
+    """
+    :param compress_module: 压缩模块
+    :param in_data: 输入数据，管道读取端的文件描述符，或者 SharedMemory 的名
+    :param out_data: 输出数据，管道写入端的文件描述符
+    :param end_tag: 结束标记
+    :param max_length: 解压缩参数
+    :param blksize: 每一块数据的大小
+    """
+    sel = selectors.DefaultSelector()
+    sel.register(out_data, selectors.EVENT_WRITE)
+    write_key = (sel.get_key(out_data), selectors.EVENT_WRITE)
+    if isinstance(in_data, str):
+        shm = SharedMemory(name=in_data)
+        shm_index = 0
+
+        def read_data(events):
+            nonlocal shm_index
+            data = shm.buf[
+                   shm_index:
+                   (shm_index := shm_index + io.DEFAULT_BUFFER_SIZE)
+                   ].tobytes()
+            if data:
+                return data
+            else:
+                return end_tag
+
+        def clean():
+            try:
+                shm.close()
+            except BufferError as e:
+                # logger.warning(f"_incremental_decompress.clean: {e}")
+                pass
+
+    elif isinstance(in_data, int):
+        sel.register(in_data, selectors.EVENT_READ)
+        read_key = (sel.get_key(in_data), selectors.EVENT_READ)
+
+        def read_data(events):
+            if read_key in events:
+                dl = os.read(in_data, 2)
+                return os.read(in_data, int.from_bytes(dl, sys.byteorder))
+            return None
+
+        def clean():
+            sel.unregister(in_data)
+
+    else:
+        raise TypeError("in_data")
+
+    try:
+        if compress_module == "gzip":
+            decompressor = GzipDecompressor()
+        elif compress_module == "bz2":
+            decompressor = bz2.BZ2Decompressor()
+        elif compress_module == "lzma":
+            decompressor = lzma.LZMADecompressor()
+        else:
+            compress_module = resolve_module_attr(compress_module)
+            decompressor = compress_module.decompressor()
+        buffer = b""
+        stream_end = False
+        while 1:
+            events = sel.select(1)
+            if write_key in events:
+                if buffer:
+                    d_d, buffer = (
+                        buffer[:blksize],
+                        buffer[blksize:]
+                    )
+                    d_d = len(d_d).to_bytes(2, sys.byteorder) + d_d
+                    os.write(out_data, d_d)
+            if not buffer:
+                if decompressor.eof:
+                    break
+                if decompressor.needs_input:
+                    if stream_end:
+                        raise OSError("The compressed data is incomplete")
+                    c_d = read_data(events)
+                else:
+                    c_d = b""
+                if c_d and c_d.endswith(end_tag):
+                    c_d = c_d[:-1 * len(end_tag)]
+                    stream_end = True
+                if c_d is not None:
+                    buffer += decompressor.decompress(c_d, max_length)
+    except Exception as error:
+        raise HugeDataException(error)
+    finally:
+        os.write(out_data, len(end_tag).to_bytes(2, sys.byteorder) + end_tag)
+        clean()
+        sel.unregister(out_data)
+        sel.close()
+
+
+class HugeData:
 
     def __init__(
         self,
@@ -872,175 +1083,235 @@ class HugeData(object):
         except_tag,
         *,
         data: Optional[bytes] = None,
-        get_timeout: int = 0,
         compress_module: str = "gzip",
-        compress_level: int = 9,
-        frame_size_limit: int = 1000
+        compress_level: int = 1,
+        blksize: int = 1000
     ):
+        self.sel = selectors.DefaultSelector()
         self.end_tag = end_tag
         self.except_tag = except_tag
-        self.exception: Optional[tuple[str, str, list]] = None
         self.data: Union[SharedMemory, queue.Queue]
         if data:
             self.data = SharedMemory(create=True, size=len(data))
             self.data.buf[:len(data)] = data
         else:
-            self.data = SyncManager.Queue()
-        self.get_timeout = get_timeout
-        self._queue: queue.Queue = SyncManager.Queue()
-        self.compress_module = compress_module
-        self.compress_level = compress_level
-        self.frame_size_limit = frame_size_limit
+            self.data: tuple = os.pipe()
+        self.compress_module: str = compress_module
+        self.compress_level: int = compress_level
+        self.blksize: int = blksize
+        self._p: tuple = os.pipe()
+        self._write_buffer = b""
+        self._write_end = False
+        self._remote_exception = None
 
         atexit.register(self.destroy)
 
     def destroy(self):
         if isinstance(self.data, SharedMemory):
-            if self.data.buf is not None:
-                self.data.buf.release()
-            self.data.close()
-            try:
-                self.data.unlink()
-            except (FileNotFoundError, ImportError):
-                pass
+            ensure_shm_unlink(self.data)
+        elif isinstance(self.data, tuple):
+            os.close(self.data[0])
+            os.close(self.data[1])
+            self.data = None
+        if self._p:
+            os.close(self._p[0])
+            os.close(self._p[1])
+            self._p = None
+        if self.sel:
+            self.sel.close()
+            self.sel = None
         atexit.unregister(self.destroy)
 
     def __del__(self):
         self.destroy()
 
-    def _incremental_compress(self):
-        try:
-            if self.compress_module == "gzip":
-                compressor = GzipCompressor(self.compress_level)
-            elif self.compress_module == "bz2":
-                compressor = bz2.BZ2Compressor(self.compress_level)
-            elif self.compress_module == "lzma":
-                compressor = lzma.LZMACompressor(preset=self.compress_level)
-            else:
-                compress_module = resolve_module_attr(self.compress_module)
-                compressor = compress_module.compressor(self.compress_level)
-            buffer = b""
-            stream_end = False
-            shm_index = 0
-            while 1:
-                if stream_end and not buffer:
-                    break
-                elif not stream_end:
-                    if isinstance(self.data, SharedMemory):
-                        data = self.data.buf[
-                               shm_index:
-                               (shm_index := shm_index + io.DEFAULT_BUFFER_SIZE)
-                               ]
-                        if not data:
-                            stream_end = True
-                    else:
-                        if self.get_timeout:
-                            data = self.data.get(timeout=self.get_timeout)
-                        else:
-                            data = self.data.get(block=False)
-                        if data == self.end_tag:
-                            data = b""
-                            stream_end = True
-                    if data:
-                        data = compressor.compress(data)
-                        buffer += data
-                elif buffer:
-                    data, buffer = (
-                        buffer[:self.frame_size_limit],
-                        buffer[self.frame_size_limit:]
-                    )
-                    self._queue.put_nowait(data)
-            buffer = compressor.flush()
-            while buffer:
-                data, buffer = (
-                    buffer[:self.frame_size_limit],
-                    buffer[self.frame_size_limit:]
-                )
-                self._queue.put_nowait(data)
-        except Exception as error:
-            raise HugeDataException(error)
-        finally:
-            self._queue.put_nowait(self.end_tag)
+    def add_data(self, data: bytes):
+        if not isinstance(self.data, tuple):
+            raise TypeError("data")
+        if self._write_end:
+            raise RuntimeError("pipe close")
+        self._write_buffer += data
 
-    def _incremental_decompress(self, max_length=-1):
-        try:
-            if self.compress_module == "gzip":
-                decompressor = GzipDecompressor()
-            elif self.compress_module == "bz2":
-                decompressor = bz2.BZ2Decompressor()
-            elif self.compress_module == "lzma":
-                decompressor = lzma.LZMADecompressor()
-            else:
-                compress_module = resolve_module_attr(self.compress_module)
-                decompressor = compress_module.decompressor()
-            shm_index = 0
-            throw = False
-            while not decompressor.eof:
-                if not decompressor.needs_input:
-                    data = b""
-                elif isinstance(self.data, SharedMemory):
-                    data = self.data.buf[
-                           shm_index:
-                           (shm_index := shm_index + self.frame_size_limit)
-                           ]
-                else:
-                    data = self.data.get()
-                    self.data.task_done()
-                if throw:
-                    exception = msg_unpack(data)
-                    raise RemoteException(exception)
-                if data == self.end_tag:
-                    raise OSError("The compressed data is incomplete")
-                if data == self.except_tag:
-                    throw = True
-                    continue
-                data = decompressor.decompress(data, max_length)
-                self._queue.put_nowait(data)
-        except Exception as error:
-            raise HugeDataException(error)
-        finally:
-            self._queue.put_nowait(self.end_tag)
+    def flush(self):
+        self._write_end = True
 
-    async def _data_agenerator(
-        self,
-        func, *args, **kwargs
+    def _write_data1(self):
+        if self._write_buffer:
+            r_d, self._write_buffer = (
+                self._write_buffer[:self.blksize],
+                self._write_buffer[self.blksize:]
+            )
+            r_d = len(r_d).to_bytes(2, sys.byteorder) + r_d
+            os.write(self.data[1], r_d)
+        elif self._write_end:
+            os.write(
+                self.data[1],
+                len(self.end_tag).to_bytes(2, sys.byteorder) + self.end_tag
+            )
+
+    async def compress(
+        self, loop: asyncio.AbstractEventLoop
     ) -> AsyncGenerator[Union[bytes, tuple]]:
-        loop = asyncio.get_event_loop()
-        func = partial(func, *args, **kwargs)
-        with ProcessPoolExecutor() as executor:
-            f = loop.run_in_executor(executor, func)
-            while 1:
-                if self._queue.empty():
-                    await asyncio.sleep(0.5)
-                    continue
-                data = self._queue.get()
-                self._queue.task_done()
-                if data == self.end_tag:
-                    break
-                yield data
-        await f
-        if exc := f.exception():
-            raise exc
+        clean_writer = False
+        if isinstance(self.data, SharedMemory):
+            args = (
+                self.compress_module, self.compress_level,
+                self.data.name, self._p[1], self.end_tag
+            )
+        else:
+            args = (
+                self.compress_module, self.compress_level,
+                self.data[0], self._p[1], self.end_tag
+            )
 
-    def compress(self) -> AsyncGenerator[Union[bytes, tuple]]:
-        return self._data_agenerator(self._incremental_compress)
+            loop.add_writer(self.data[1], self._write_data1)
+            clean_writer = True
 
-    def decompress(self, max_length=-1) -> AsyncGenerator[Union[bytes, tuple]]:
-        return self._data_agenerator(self._incremental_decompress, max_length)
+        func = partial(
+            _incremental_compress, *args,
+            blksize=self.blksize
+        )
+        read_q = asyncio.Queue()
+
+        def _read():
+            dl = os.read(self._p[0], 2)
+            d = os.read(self._p[0], int.from_bytes(dl, sys.byteorder))
+            read_q.put_nowait(d)
+
+        loop.add_reader(self._p[0], _read)
+        process_executor = ProcessPoolExecutor()
+        f = loop.run_in_executor(process_executor, func)
+        try:
+            await asyncio.sleep(0)
+            cont = 1
+            read_num = 0
+            while cont:
+                await asyncio.sleep(0)
+                if self._remote_exception:
+                    remote_exception = msg_unpack(self._remote_exception)
+                    raise RemoteException(remote_exception)
+                try:
+                    data = await asyncio.wait_for(read_q.get(), 1)
+                    read_q.task_done()
+                except asyncio.TimeoutError:
+                    data = b""
+                if data:
+                    read_num += 1
+                    if data.endswith(self.end_tag):
+                        yield data[:-1 * len(self.end_tag)]
+                        cont = 0
+                    else:
+                        yield data
+        finally:
+            loop.remove_reader(self._p[0])
+            if clean_writer:
+                loop.remove_writer(self.data[1])
+            if not f.done():
+                f.cancel()
+            process_executor.shutdown(False, cancel_futures=True)
+            if exc := f.exception():
+                raise exc
+
+    async def decompress(
+        self, loop: asyncio.AbstractEventLoop, max_length=-1
+    ) -> AsyncGenerator[Union[bytes, tuple]]:
+        clean_writer = False
+        if isinstance(self.data, SharedMemory):
+            args = (
+                self.compress_module,
+                self.data.name, self._p[1], self.end_tag
+            )
+        else:
+            args = (
+                self.compress_module,
+                self.data[0], self._p[1], self.end_tag
+            )
+
+            loop.add_writer(self.data[1], self._write_data1)
+            clean_writer = True
+
+        func = partial(
+            _incremental_decompress, *args,
+            max_length=max_length, blksize=self.blksize
+        )
+        read_q = asyncio.Queue()
+
+        def _read():
+            dl = os.read(self._p[0], 2)
+            d = os.read(self._p[0], int.from_bytes(dl, sys.byteorder))
+            read_q.put_nowait(d)
+
+        loop.add_reader(self._p[0], _read)
+        process_executor = ProcessPoolExecutor()
+        f = loop.run_in_executor(process_executor, func)
+        try:
+            await asyncio.sleep(0)
+            cont = 1
+            read_num = 0
+            while cont:
+                if self._remote_exception:
+                    remote_exception = msg_unpack(self._remote_exception)
+                    raise RemoteException(remote_exception)
+                try:
+                    data = await asyncio.wait_for(read_q.get(), 1)
+                    read_q.task_done()
+                except asyncio.TimeoutError:
+                    data = b""
+                if data:
+                    read_num += 1
+                    if data.endswith(self.end_tag):
+                        yield data[:-1 * len(self.end_tag)]
+                        cont = 0
+                    else:
+                        yield data
+                await asyncio.sleep(0)
+        finally:
+            loop.remove_reader(self._p[0])
+            if clean_writer:
+                loop.remove_writer(self.data[1])
+            if not f.done():
+                f.cancel()
+            process_executor.shutdown(False, cancel_futures=True)
+            if exc := f.exception():
+                raise exc
 
 
-def interface(methode):
-    if inspect.iscoroutinefunction(methode):
-        @wraps(methode)
-        async def awrapper(*args, **kwargs):
-            return await methode(*args, **kwargs)
+@overload
+def interface(method_or_executor: Callable):
+    """
+    :param method_or_executor: 给暴露出去的方法添加属性
+    """
 
-        awrapper.__interface__ = True
-        return awrapper
 
-    @wraps(methode)
-    def wrapper(*args, **kwargs):
-        return methode(*args, **kwargs)
+@overload
+def interface(method_or_executor: str):
+    """
+    :param method_or_executor: 当方法为同步方法时，用于执行的执行器偏好，
+      可选 thread 或 process 或 none，none 表示不使用执行器
+    """
 
-    wrapper.__interface__ = True
-    return wrapper
+
+def interface(method_or_executor):
+    if inspect.isfunction(method_or_executor):
+        method_or_executor.__interface__ = True
+        method_or_executor.__executor__ = "none"
+        return method_or_executor
+    elif (
+            isinstance(method_or_executor, str)
+            and method_or_executor in ("thread", "process", "none")
+    ):
+        if inspect.iscoroutinefunction(method_or_executor):
+            raise RuntimeError
+
+        def wrapper(methode):
+            methode.__interface__ = True
+            methode.__executor__ = method_or_executor
+            return methode
+
+        return wrapper
+    raise TypeError(method_or_executor.__class__)
+
+
+def run_in_executor(loop, executor, func, *args, **kwargs) -> asyncio.Future:
+    func_call = functools.partial(func, *args, **kwargs)
+    return loop.run_in_executor(executor, func_call)

@@ -128,12 +128,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-/testAQ.py
-/testBoundeDict.py
-/testConcurrency.py
-/testIncremental.py
-/testMultipartRouteSocket.py
 /门（gate）rpc.xmind
-/testACache.py
-/testREQSocket.py
-/testStreamAG.py
