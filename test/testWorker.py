@@ -17,7 +17,7 @@ from gaterpc.core import (
     AsyncZAPService, Context, Worker, Service, AMajordomo,
 )
 from gaterpc.utils import (
-    HugeData, interface, msg_pack, run_in_executor,
+    HugeData, UnixEPollEventLoopPolicy, interface, msg_pack, run_in_executor,
     to_bytes,
 )
 import testSettings
@@ -143,6 +143,7 @@ async def worker(backend_addr=None):
 
 
 def test(backend_addr=None):
+    asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
     asyncio.run(worker(backend_addr))
 
 

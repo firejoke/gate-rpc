@@ -2,9 +2,7 @@
 # Author      : ShiFan
 # Created Date: 2023/12/29 9:12
 import asyncio
-import hashlib
 # import uvloop
-import secrets
 import sys
 from logging import getLogger
 from pathlib import Path
@@ -21,7 +19,8 @@ from gaterpc.core import (
     AsyncZAPService, Context, Worker, Service, AMajordomo,
 )
 from gaterpc.utils import (
-    HugeData, interface, msg_pack, run_in_executor,
+    HugeData, UnixEPollEventLoopPolicy, interface, msg_pack, msg_unpack,
+    run_in_executor,
     to_bytes,
 )
 import testSettings
@@ -77,12 +76,20 @@ class TAMajordomo(AMajordomo):
                 msg_pack((log,))
             )
             option = (self.identity, b"", request_id)
-            # 需要顺序执行的，就顺序等待发送
+
+            # 要注意并发太多时，对套接字类型的选择和缓冲区的配置，同时适时的让出io
+            # 可以适当提高Settings里的ZMQ_SOCk配置里的 z_const.HWM，
+            # sysctl -w net.core.wmem_default=33554432
+            # sysctl -w net.core.rmem_default=33554432
+            # sysctl -w net.core.wmem_max=67108864
+            # sysctl -w net.core.rmem_max=67108864
+
+            # 可以顺序等待发送
             # await self.send_to_backend(
             #     worker.identity, Settings.MDP_COMMAND_REQUEST,
             #     option, body
             # )
-            # 不需要顺序执行，更在意并发，则创建为发送任务
+            # 也可以创建为发送任务，乱序发送
             self.backend_tasks.add(
                 t := self._loop.create_task(
                     self.send_to_backend(
@@ -96,6 +103,7 @@ class TAMajordomo(AMajordomo):
                 logger.debug(f"sent use time: {self._loop.time() - st}")
             self.rw_replies[request_id] = self._loop.create_future()
             i += 1
+            await asyncio.sleep(0)
 
     rw_replies_num = 0
 
@@ -107,6 +115,7 @@ class TAMajordomo(AMajordomo):
     ):
         if client_id == self.identity:
             if request_id in self.rw_replies:
+                # logger.debug(f"result: {msg_unpack(body[0])}")
                 self.rw_replies.pop(request_id).set_result(body)
                 if not self.rw_replies_num:
                     logger.debug(f"first replies: {self._loop.time()}")
@@ -210,7 +219,7 @@ async def majordomo(
     )
 
     gr_majordomo = TAMajordomo(
-        # context=ctx,
+        context=ctx,
         gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
         gate_zap_credentials=(
             Settings.ZAP_PLAIN_DEFAULT_USER,
@@ -218,7 +227,7 @@ async def majordomo(
         )
     )
     gr_majordomo.bind_backend()
-    gr_majordomo.bind_frontend(frontend)
+    # gr_majordomo.bind_frontend(frontend)
     if bind_gate:
         gr_majordomo.bind_gate(bind_gate)
     await asyncio.sleep(1)
@@ -235,14 +244,24 @@ async def majordomo(
                 raise e
         await asyncio.sleep(5)
         # await gr_majordomo.test_rw()
+        await gr_majordomo.rw_task
         await gr_majordomo._broker_task
     finally:
+        exc = gr_majordomo.rw_task.exception()
         gr_majordomo.stop()
         logger.info(f"request_zap.cache_info: {gr_majordomo.zap_cache}")
         zap.stop()
+        if exc:
+            raise exc
 
 
-def test(frontend=None, backend=None, bind_gate=None, connect_gate=None):
+def test(
+    frontend="ipc:///tmp/gate-rpc/run/c1",
+    backend=None, bind_gate=None, connect_gate=None
+):
+    print(f"frontend: {frontend}, backend: {backend}")
+    print(f"bind_gate: {bind_gate}, connect_gate: {connect_gate}")
+    asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
     asyncio.run(
         majordomo(frontend, backend, bind_gate, connect_gate)
     )
@@ -250,16 +269,4 @@ def test(frontend=None, backend=None, bind_gate=None, connect_gate=None):
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    if not argv:
-        argv = [
-            "ipc:///tmp/gate-rpc/run/c1",
-            Settings.WORKER_ADDR, None, None
-        ]
-    if len(argv) == 1:
-        argv.extend([Settings.WORKER_ADDR, None, None])
-    elif len(argv) == 2:
-        argv.extend([None, None])
-    elif len(argv) == 3:
-        argv.append(None)
-    print(argv)
     test(*argv)

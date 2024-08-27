@@ -16,7 +16,6 @@ from logging import getLogger
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
 import zmq.error as z_error
-from gaterpc.exceptions import HugeDataException
 from zmq.auth import Authenticator
 
 from .global_settings import Settings

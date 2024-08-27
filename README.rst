@@ -341,7 +341,7 @@ Gate cluster
 笔记
 ******
 
-客户端的请求和回复的异步处理是使用的 asyncio.Future ，然后使用 asyncio.wait_for 来超时等待。
+客户端的请求和回复的异步处理是通过创建 asyncio.Future ，并使用 asyncio.wait_for 超时等待。
 
 ::
 
@@ -394,3 +394,8 @@ decompress 方法对每一块返回的大小限制则是由压缩模块来实现
 在使用由"gaterpc.utils.AQueueHandler"做为处理器的日志处理器时，
 要避免跨越线程和跨事件循环实例来记录日志，
 在将StreamHandler作为AQueueHandler的handler_class参数时会就遇到跨事件循环调用的错误
+
+要注意并发太多时，对套接字类型的选择和缓冲区的配置，同时适时的让出io，
+可以适当提高Settings里的ZMQ_SOCk配置里的 z_const.HWM，并且提高系统的默认缓冲区大小；
+
+目前在WSL-AlmaLinux release 8.9上使用ipc协议测得100000次回显，全部请求发送用时20秒左右，包含收到最后一个回复总用时29秒左右。

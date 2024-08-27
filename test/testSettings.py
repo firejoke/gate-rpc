@@ -7,15 +7,15 @@ from gaterpc.utils import empty
 
 DEBUG = True
 SECURE = True
-# EVENT_LOOP_POLICY = None
 
 ZMQ_SOCK = {
-    z_const.HWM: 3000,
+    z_const.HWM: 5000,
     # millisecond
     # z_const.SNDTIMEO: 10 * 1000,
     # millisecond
     # z_const.RCVTIMEO: 10 * 1000
 }
+# WORKER_ADDR: str = "tcp://0:5060"
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
