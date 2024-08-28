@@ -120,7 +120,10 @@ class GlobalSettings(object):
     全局配置，运行Worker、AMajorodomo、Client之前都需要先执行该配置类的setup函数
     """
     # system
-    DEBUG = False
+    DEBUG = LazyAttribute(
+        raw=0,
+        process=lambda instance, p: TypeValidator(int)(p)
+    )
     ENVIRONMENT = LazyAttribute(
         raw=dict(),
         process=lambda instance, p: TypeValidator(dict)(p)

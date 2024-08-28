@@ -97,7 +97,7 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
     return socket_addr
 
 
-def to_bytes(s: Union[str, bytes, float, int]):
+def to_bytes(s: Union[str, bytes, float, int]) -> bytes:
     if isinstance(s, bytes):
         return s
     if isinstance(s, str):
@@ -716,6 +716,9 @@ class StreamReply(AsyncGenerator):
 
     def __aiter__(self):
         return self
+
+    def is_exit(self):
+        return self._exit
 
     async def __anext__(self):
         if self._exit:

@@ -26,12 +26,17 @@ from .exceptions import (
 )
 from .utils import (
     HugeData, LRUCache, MsgUnpackError, StreamReply,
-    check_socket_addr, generator_to_agenerator, throw_exception_agenerator,
+    check_socket_addr, Empty, empty, generator_to_agenerator,
+    throw_exception_agenerator,
     interface, run_in_executor, from_bytes, msg_pack, msg_unpack, to_bytes,
 )
 
 
-__all__ = ["Worker", "Service", "AsyncZAPService", "AMajordomo", "Client"]
+__all__ = [
+    "Context", "Worker", "RemoteWorker", "RemoteGateRPC",
+    "Service", "GateClusterService", "AMajordomo", "Client",
+    "AsyncZAPService"
+]
 
 logger = getLogger("gaterpc")
 Wlogger = getLogger("gaterpc.worker")
@@ -90,12 +95,13 @@ def set_ctx(ctx: Context, options: dict = None):
     for op, v in _options.items():
         try:
             ctx.set(op, v)
+            logger.debug(f"ctx({ctx}) set {op}: {v}")
         except AttributeError:
             pass
 
 
 def set_sock(sock: z_aio.Socket, options: dict = None):
-    _options = Settings.ZMQ_CONTEXT
+    _options = Settings.ZMQ_SOCK
     if options:
         _options.update(options)
     for op, v in _options.items():
@@ -104,8 +110,9 @@ def set_sock(sock: z_aio.Socket, options: dict = None):
                 sock.set_hwm(v)
             else:
                 sock.set(op, v)
-        except AttributeError:
-            pass
+            logger.debug(f"sock({sock}) set {op}: {v}")
+        except AttributeError as e:
+            logger.error(e)
 
 
 class ABCWorker(ABC):
@@ -245,10 +252,10 @@ class Worker(ABCWorker):
         zap_mechanism, zap_credentials = check_zap_args(
             zap_mechanism, zap_credentials
         )
-        if not zap_mechanism:
-            self.zap_frames = []
+        if zap_mechanism:
+            self.zap_frames = (zap_mechanism, *zap_credentials)
         else:
-            self.zap_frames = [zap_mechanism, *zap_credentials]
+            self.zap_frames = None
 
         if not context:
             self._ctx = Context()
@@ -320,8 +327,7 @@ class Worker(ABCWorker):
             self._socket = self._ctx.socket(
                 z_const.DEALER, z_aio.Socket
             )
-            self._socket.set(z_const.IDENTITY, self.identity)
-            set_sock(self._socket)
+            set_sock(self._socket, {z_const.IDENTITY: self.identity})
             self._socket.connect(self._broker_addr)
             self._poller.register(self._socket, z_const.POLLIN)
             service = Settings.MDP_DESCRIPTION_SEP.join((
@@ -337,9 +343,6 @@ class Worker(ABCWorker):
     async def disconnect(self):
         if self.is_alive():
             Wlogger.warning("Disconnecting from broker")
-            # await self.send_to_majordomo(
-            #     Settings.MDP_COMMAND_DISCONNECT
-            # )
             self._poller.unregister(self._socket)
             self._socket.disconnect(self._broker_addr)
             self._socket.close()
@@ -378,33 +381,39 @@ class Worker(ABCWorker):
                               f"\n{exception_info}")
             Wlogger.error(f"process request task exception:\n{exception_info}")
 
+    async def build_zap_frames(self) -> tuple[bytes, ...]:
+        """
+        用于继承后根据 ZAP 校验方法构建 ZAP 凭据帧，
+        使用协程是为了方便使用 loop.run_in_executor
+        """
+        if self.zap_frames:
+            return tuple(to_bytes(z) for z in self.zap_frames)
+        else:
+            return tuple()
+
     async def send_to_majordomo(
         self,
         command: bytes,
         option: tuple[Union[bytes, str], ...] = None,
         messages: Union[Union[bytes, str], tuple[Union[bytes, str], ...]] = None
     ):
-        """
-        TODO: 在MDP的Worker端发出的消息的命令帧后面加一个worker id帧，
-            用作掉线重连，幂等。
-        """
         if not self._socket:
             return
-        reply = [
+        if isinstance(messages, (bytes, str)):
+            messages = (messages,)
+        elif not messages:
+            messages = tuple()
+        if option:
+            messages = (*option, *messages)
+        messages = (
             b"",
             Settings.MDP_WORKER,
             command,
-        ]
-        if self.zap_frames:
-            reply.extend(self.zap_frames)
-        if option:
-            reply.extend(option)
-        if isinstance(messages, (tuple, list)):
-            reply.extend(messages)
-        elif isinstance(messages, (bytes, str)):
-            reply.append(messages)
-        reply = tuple(to_bytes(s) for s in reply)
-        await self._socket.send_multipart(reply)
+            *(await self.build_zap_frames()),
+            *messages
+        )
+        messages = tuple(to_bytes(s) for s in messages)
+        await self._socket.send_multipart(messages)
         self.last_message_sent_time = self._loop.time()
 
     async def send_hugedata(self, option: tuple, hugedata):
@@ -472,9 +481,31 @@ class Worker(ABCWorker):
             )
 
     async def process_request(
-        self, client_id: bytes, request_id: bytes,
-        func_name: str, args: tuple, kwargs: dict
+        self, messages
     ):
+        try:
+            (
+                client_id,
+                empty_frame,
+                request_id,
+                *messages,
+            ) = messages
+            if empty_frame:
+                return
+            if messages is empty:
+                return
+            (func_name, *params) = messages
+            if not params:
+                args, kwargs = tuple(), dict()
+            elif len(params) == 1:
+                args, kwargs = msg_unpack(params[0]), dict()
+            elif len(params) == 2:
+                args, kwargs = (msg_unpack(p) for p in params)
+            else:
+                return
+            func_name = msg_unpack(func_name)
+        except (MsgUnpackError, ValueError):
+            return
         result = exception = None
         try:
             if len(self.requests) > self.max_allowed_request:
@@ -537,11 +568,11 @@ class Worker(ABCWorker):
                 await self.send_to_majordomo(
                     Settings.MDP_COMMAND_HEARTBEAT,
                 )
-                await asyncio.sleep(1e-3 * self.heartbeat)
+                slt = 1e-3 * self.heartbeat
+                await asyncio.sleep(slt)
             else:
-                await asyncio.sleep(
-                    1e-3 * self.heartbeat - time_from_last_message
-                )
+                slt = 1e-3 * self.heartbeat - time_from_last_message
+                await asyncio.sleep(slt)
 
     async def recv(self):
         try:
@@ -558,63 +589,39 @@ class Worker(ABCWorker):
                         Wlogger.error("Majordomo offline")
                         break
                     continue
-                if not self._heartbeat_task:
+                if not self._heartbeat_task or self._heartbeat_task.done():
                     self._heartbeat_task = self._loop.create_task(
                         self.send_heartbeat()
                     )
                 messages = await self._socket.recv_multipart()
                 try:
                     (
-                        empty,
+                        empty_frame,
                         mdp_worker_version,
                         command,
                         *messages
                     ) = messages
-                    if empty:
+                    if empty_frame:
                         continue
                 except ValueError:
                     continue
                 if mdp_worker_version != Settings.MDP_WORKER:
                     continue
-                # Wlogger.debug(
-                #     f"worker recv\n"
-                #     f"command: {command}\n"
-                #     f"messages: {messages}"
-                # )
                 majordomo_liveness = self.heartbeat_liveness
+                if Settings.DEBUG > 1:
+                    Wlogger.debug(
+                        f"worker recv\n"
+                        f"command: {command}\n"
+                        f"messages: {messages}"
+                    )
                 if command == Settings.MDP_COMMAND_HEARTBEAT:
-                    pass
+                    continue
                 elif command == Settings.MDP_COMMAND_DISCONNECT:
                     Wlogger.warning(f"{self.identity} disconnected")
                     break
                 elif command == Settings.MDP_COMMAND_REQUEST:
-                    try:
-                        (
-                            client_id,
-                            empty,
-                            request_id,
-                            func_name,
-                            *params
-                        ) = messages
-                        if empty:
-                            continue
-                        if not params:
-                            args, kwargs = tuple(), dict()
-                        elif len(params) == 1:
-                            args, kwargs = msg_unpack(params[0]), dict()
-                        elif len(params) == 2:
-                            args, kwargs = (msg_unpack(p) for p in params)
-                        else:
-                            continue
-                        func_name = msg_unpack(func_name)
-                    except MsgUnpackError:
-                        continue
                     task = self._loop.create_task(
-                        self.process_request(
-                            client_id, request_id,
-                            func_name, args, kwargs
-                        ),
-                        name=f"Func({func_name})-{client_id}-{request_id}"
+                        self.process_request(messages)
                     )
                     self.requests.add(task)
                     task.add_done_callback(self.cleanup_request)
@@ -628,6 +635,7 @@ class Worker(ABCWorker):
         finally:
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
+                self._heartbeat_task = None
             await self.disconnect()
             if self._loop.is_running() and self._reconnect:
                 Wlogger.warning("Reconnect to Majordomo")
@@ -684,7 +692,7 @@ class Service(ABCService):
                     self.idle_workers.get(),
                     Settings.TIMEOUT
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return None
             try:
                 worker = self.workers[worker_id]
@@ -759,7 +767,6 @@ class AsyncZAPService(Authenticator):
         self.addr = addr
         self.zap_socket = self.context.socket(z_const.ROUTER, z_aio.Socket)
         set_sock(self.zap_socket)
-        # self.zap_socket.linger = 1
         self.zap_socket.bind(check_socket_addr(addr))
         self._poller = z_aio.Poller()
         self._recv_task: Optional[asyncio.Task] = None
@@ -822,7 +829,7 @@ class AsyncZAPService(Authenticator):
 
         (
             request_address,
-            empty,
+            empty_frame,
             version,
             request_id,
             domain,
@@ -830,7 +837,7 @@ class AsyncZAPService(Authenticator):
             identity,
             mechanism
         ) = msg[:8]
-        if empty:
+        if empty_frame:
             raise ValueError
         credentials = msg[8:]
 
@@ -844,13 +851,13 @@ class AsyncZAPService(Authenticator):
                 b"400", b"Invalid version",
             )
             return
-
-        # self.log.debug(
-        #     f"request address: {request_address}, "
-        #     f"version: {version}, request_id: {request_id}, "
-        #     f"domain: {domain}, address: {address}, "
-        #     f"identity: {identity}, mechanism: {mechanism}"
-        # )
+        if Settings.DEBUG > 1:
+            self.log.debug(
+                f"request address: {request_address}, "
+                f"version: {version}, request_id: {request_id}, "
+                f"domain: {domain}, address: {address}, "
+                f"identity: {identity}, mechanism: {mechanism}"
+            )
 
         # Is address is explicitly allowed or _denied?
         allowed = False
@@ -860,27 +867,22 @@ class AsyncZAPService(Authenticator):
         if self._allowed:
             if address in self._allowed:
                 allowed = True
-                # self.log.debug("PASSED (allowed) address=%s", address)
             else:
                 denied = True
                 reason = b"Address not allowed"
-                # self.log.debug("DENIED (not allowed) address=%s", address)
 
         elif self._denied:
             if address in self._denied:
                 denied = True
                 reason = b"Address denied"
-                # self.log.debug("DENIED (denied) address=%s", address)
             else:
                 allowed = True
-                # self.log.debug("PASSED (not denied) address=%s", address)
 
         # Perform authentication mechanism-specific checks if necessary
         username = "anonymous"
         if not denied:
             if mechanism == b'NULL' and not allowed:
                 # For NULL, we allow if the address wasn't denied
-                # self.log.debug("ALLOWED (NULL)")
                 allowed = True
 
             elif mechanism == b'PLAIN':
@@ -960,20 +962,19 @@ class AsyncZAPService(Authenticator):
                     reason = b"Invalid username"
             else:
                 reason = b"Invalid domain"
-
-            # if allowed:
-            #     self.log.debug(
-            #         "ALLOWED (PLAIN) domain=%s username=%s password=%s",
-            #         domain,
-            #         username,
-            #         password,
-            #     )
-            # else:
-            #     self.log.debug("DENIED %s", reason)
+            if Settings.DEBUG > 1:
+                if allowed:
+                    self.log.debug(
+                        "ALLOWED (PLAIN) domain=%s username=%s password=%s",
+                        domain,
+                        username,
+                        password,
+                    )
+                else:
+                    self.log.debug("DENIED %s", reason)
 
         else:
             reason = b"No passwords defined"
-            # self.log.debug("DENIED (PLAIN) %s", reason)
 
         return allowed, reason
 
@@ -986,10 +987,11 @@ class AsyncZAPService(Authenticator):
         if isinstance(user_id, str):
             user_id = user_id.encode(self.encoding, 'replace')
         metadata = b''  # not currently used
-        # self.log.debug(
-        #     f"ZAP reply user_id={user_id} request_id={request_id}"
-        #     f" code={status_code} text={status_text}"
-        # )
+        if Settings.DEBUG > 1:
+            self.log.debug(
+                f"ZAP reply user_id={user_id} request_id={request_id}"
+                f" code={status_code} text={status_text}"
+            )
         replies = (
             reply_address,
             b"",
@@ -1107,9 +1109,6 @@ class GateClusterService(ABCService):
         self.running = True
 
     def remove_worker(self, gate: Optional[RemoteGateRPC]) -> None:
-        # for gates in self.services.values():
-        #     if gate.identity in gates:
-        #         gates.remove(gate.identity)
         if gate.identity in self.workers:
             self.workers.pop(gate.identity)
         if gate.identity in self.idle_workers:
@@ -1171,7 +1170,6 @@ class AMajordomo:
     多偏好服务集群，连接多个提供不同服务的 Service（远程的 Service 也可能是一个代理，进行负载均衡）
     """
 
-    # ClusterServiceClass = GateClusterService
     RemoteServiceClass = Service
     RemoteWorkerClass = RemoteWorker
 
@@ -1203,20 +1201,17 @@ class AMajordomo:
         set_ctx(self.ctx)
         # frontend
         self.frontend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        self.frontend.set(z_const.IDENTITY, self.identity)
-        set_sock(self.frontend)
+        set_sock(self.frontend, {z_const.IDENTITY: self.identity})
         self.clients = set()
         self.frontend_tasks = set()
         # backend
         self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.backend)
-        self.backend.set(z_const.IDENTITY, self.identity)
+        set_sock(self.backend, {z_const.IDENTITY: self.identity})
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, Union[RemoteWorker, RemoteGateRPC]] = dict()
         self.backend_tasks = set()
         # zap
         self.zap: Optional[z_aio.Socket] = None
-        # TODO: ZAP domain
         self.zap_addr: str = ""
         self.zap_domain: bytes = b""
         self.zap_replies: dict[bytes, asyncio.Future] = dict()
@@ -1224,8 +1219,7 @@ class AMajordomo:
         self.zap_tasks = set()
         # gate
         self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.gate)
-        self.gate.set(z_const.IDENTITY, self.identity)
+        set_sock(self.gate, {z_const.IDENTITY: self.identity})
         self.gate_cluster = GateClusterService(self)
         self.gate_replies: dict[bytes, asyncio.Future] = dict()
         self.gate_tasks = set()
@@ -1237,7 +1231,7 @@ class AMajordomo:
         if gate_zap_mechanism:
             self.gate_zap_frames = [gate_zap_mechanism, *gate_zap_credentials]
         else:
-            self.gate_zap_frames = []
+            self.gate_zap_frames = None
         # majordomo
         if not heartbeat:
             heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
@@ -1293,7 +1287,7 @@ class AMajordomo:
             connect_req = (
                 Settings.GATE_MEMBER,
                 Settings.GATE_COMMAND_RING,
-                *self.gate_zap_frames,
+                *(await self.build_gate_zap_frames()),
             )
             connect_req = tuple(to_bytes(s) for s in connect_req)
             await gate_c.send_multipart(connect_req)
@@ -1311,7 +1305,7 @@ class AMajordomo:
         if replies:
             try:
                 (
-                    GATE_version,
+                    Settings.GATE_VERSION,
                     command,
                     *messages,
                 ) = replies
@@ -1352,7 +1346,7 @@ class AMajordomo:
             self.zap_addr = zap_addr
             self.zap = self.ctx.socket(z_const.DEALER, z_aio.Socket)
             set_sock(self.zap)
-            # Mlogger.info(f"Connecting to zap at {zap_addr}")
+            Mlogger.info(f"Connecting to zap at {zap_addr}")
             self.zap.connect(self.zap_addr)
         else:
             raise ValueError(
@@ -1378,10 +1372,6 @@ class AMajordomo:
         await asyncio.gather(
             *wts, *gts
         )
-        # for work in list(self.workers.values()):
-        #     await self.now_ban(work)
-        # for gate in self.gate_cluster.get_workers().values():
-        #     await self.now_ban(gate)
 
     def close(self):
         self.thread_executor.shutdown()
@@ -1511,6 +1501,7 @@ class AMajordomo:
     ):
         while 1:
             if worker.expiry <= self._loop.time():
+                Mlogger.debug(f"ban ({worker.identity}) at expiration")
                 if isinstance(worker, RemoteGateRPC):
                     await self.ban_gate(worker)
                 elif isinstance(worker, self.RemoteWorkerClass):
@@ -1521,6 +1512,7 @@ class AMajordomo:
             )
 
     async def now_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+        Mlogger.debug(f"now ban ({worker.identity})")
         if worker.destroy_task:
             worker.destroy_task.cancel()
         if isinstance(worker, RemoteGateRPC):
@@ -1602,12 +1594,13 @@ class AMajordomo:
                     "Function not found: {0}".format(func_name)
                 )
             func = getattr(self, func_name)
-            # Mlogger.debug(
-            #     f"internal process, "
-            #     f"func_name: {func_name}, "
-            #     f"args: {args}, "
-            #     f"kwargs: {kwargs}"
-            # )
+            if Settings.DEBUG > 1:
+                Mlogger.debug(
+                    f"internal process, "
+                    f"func_name: {func_name}, "
+                    f"args: {args}, "
+                    f"kwargs: {kwargs}"
+                )
             if inspect.iscoroutinefunction(func):
                 reply = await func(*args, **kwargs)
             else:
@@ -1753,6 +1746,16 @@ class AMajordomo:
                 e
             )
 
+    async def build_gate_zap_frames(self) -> tuple[bytes, ...]:
+        """
+        用于继承后根据 ZAP 校验方法构建 ZAP 凭据帧，
+        使用协程是为了方便使用 loop.run_in_executor
+        """
+        if self.gate_zap_frames:
+            return tuple(to_bytes(z) for z in self.gate_zap_frames)
+        else:
+            return tuple()
+
     async def request_zap(
         self, identity: bytes, address: bytes, request_id: bytes,
         mechanism: bytes, credentials: tuple
@@ -1814,7 +1817,7 @@ class AMajordomo:
         """
         try:
             (
-                empty,
+                empty_frame,
                 zap_version,
                 reply_key,
                 status_code,
@@ -1846,12 +1849,12 @@ class AMajordomo:
         try:
             (
                 gate_id,
-                empty,
+                empty_frame,
                 gate_version,
                 command,
                 *messages
             ) = messages
-            if empty or gate_version != Settings.GATE_MEMBER:
+            if empty_frame or gate_version != Settings.GATE_MEMBER:
                 return
         except ValueError:
             return
@@ -1863,12 +1866,12 @@ class AMajordomo:
                 return
         else:
             mechanism = credentials = None
-
-        # Mlogger.debug(
-        #     f"gate id: {gate_id}\n"
-        #     f"command: {command}\n"
-        #     f"messages: {messages}\n"
-        # )
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"gate id: {gate_id}\n"
+                f"command: {command}\n"
+                f"messages: {messages}\n"
+            )
 
         if not (gate := self.gate_cluster.get_workers().get(gate_id, None)):
             Mlogger.warning(f"The gate({gate_id}) was not registered.")
@@ -1940,8 +1943,6 @@ class AMajordomo:
                 await self.delay_ban(gate)
 
         elif command == Settings.GATE_COMMAND_REQUEST:
-            if len(self.gate_replies) > self.max_process_tasks:
-                return
             try:
                 (
                     service_name,
@@ -1957,6 +1958,7 @@ class AMajordomo:
                 )
                 if not zap_result:
                     return
+
             service_name = from_bytes(service_name)
             if service_name == Settings.MDP_INTERNAL_SERVICE:
                 func_name, *body = body
@@ -2082,7 +2084,6 @@ class AMajordomo:
                         await self._loop.run_in_executor(
                             self.thread_executor, huge_reply.add_data, body
                         )
-                        # huge_reply.add_data(body)
 
         elif command == Settings.GATE_COMMAND_DISCONNECT:
             if mechanism:
@@ -2141,33 +2142,35 @@ class AMajordomo:
         messages: Union[
             Union[bytes, str], tuple[Union[bytes, str], ...]] = None,
     ):
-        _message = [
+        if isinstance(messages, (bytes, str)):
+            messages = (messages,)
+        elif not messages:
+            messages = tuple()
+        if option:
+            messages = (*option, messages)
+        messages = (
             gate_id,
             b"",
             Settings.GATE_MEMBER,
             command,
-        ]
-        if self.gate_zap_frames:
-            _message.extend(self.gate_zap_frames)
-        if option:
-            _message.extend(option)
-        if isinstance(messages, (tuple, list)):
-            _message.extend(messages)
-        elif isinstance(messages, (bytes, str)):
-            _message.append(messages)
+            *(await self.build_gate_zap_frames()),
+            *messages
+        )
         messages = tuple(to_bytes(s) for s in messages)
         await self.gate.send_multipart(messages)
+        if gate := self.gate_cluster.get_workers().get(gate_id):
+            gate.last_message_sent_time = self._loop.time()
 
     async def process_replies_from_backend(self, replies: list):
         try:
             (
                 worker_id,
-                empty,
+                empty_frame,
                 mdp_version,
                 command,
                 *messages
             ) = replies
-            if empty or mdp_version != Settings.MDP_WORKER:
+            if empty_frame or mdp_version != Settings.MDP_WORKER:
                 return
         except ValueError:
             return
@@ -2181,11 +2184,12 @@ class AMajordomo:
             mechanism = credentials = None
         if not (worker := self.workers.get(worker_id, None)):
             Mlogger.warning(f"The worker({worker_id}) was not registered.")
-        # Mlogger.debug(
-        #     f"worker id: {worker_id}\n"
-        #     f"command: {command}\n"
-        #     f"messages: {messages}\n"
-        # )
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"worker id: {worker_id}\n"
+                f"command: {command}\n"
+                f"messages: {messages}\n"
+            )
 
         # MDP 定义的 Worker 命令
         if command == Settings.MDP_COMMAND_READY:
@@ -2235,8 +2239,8 @@ class AMajordomo:
 
         elif command == Settings.MDP_COMMAND_REPLY:
             try:
-                client_id, empty, request_id, *body = messages
-                if empty:
+                client_id, empty_frame, request_id, *body = messages
+                if empty_frame:
                     return
             except ValueError:
                 return
@@ -2368,32 +2372,33 @@ class AMajordomo:
         option: tuple[Union[bytes, str], ...] = None,
         messages: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]] = None
     ):
-        request = [
+        if isinstance(messages, (bytes, str)):
+            messages = (messages,)
+        elif not messages:
+            messages = tuple()
+        if option:
+            messages = (*option, *messages)
+        messages = (
             worker_id,
             b"",
             Settings.MDP_WORKER,
             command,
-        ]
-        if option:
-            request.extend(option)
-        if isinstance(messages, (tuple, list)):
-            request.extend(messages)
-        elif isinstance(messages, (bytes, str)):
-            request.append(messages)
-        request = tuple(to_bytes(frame) for frame in request)
+            *messages
+        )
+        request = tuple(to_bytes(frame) for frame in messages)
         await self.backend.send_multipart(request)
-        return
+        self.workers[worker_id].last_message_sent_time = self._loop.time()
 
     async def process_request_from_frontend(self, request: list):
         try:
             (
                 client_id,
-                empty,
+                empty_frame,
                 mdp_version,
                 service_name,
                 *messages
             ) = request
-            if empty or mdp_version != Settings.MDP_CLIENT:
+            if empty_frame or mdp_version != Settings.MDP_CLIENT:
                 return
         except ValueError:
             return
@@ -2405,11 +2410,12 @@ class AMajordomo:
                 return
         else:
             mechanism = credentials = None
-        # Mlogger.debug(
-        #     f"client id: {client_id}\n"
-        #     f"service_name: {service_name}\n"
-        #     f"messages: {messages}\n"
-        # )
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"client id: {client_id}\n"
+                f"service_name: {service_name}\n"
+                f"messages: {messages}\n"
+            )
         try:
             request_id, *body = messages
         except ValueError:
@@ -2423,13 +2429,9 @@ class AMajordomo:
                 return
         self.clients.add(client_id)
         service_name = from_bytes(service_name)
-        if Settings.DEBUG:
+        if Settings.DEBUG > 2:
             self.cache_request[request_id] = (
                 service_name, client_id, request_id, body, self._loop.time()
-            )
-        else:
-            self.cache_request[request_id] = (
-                service_name, client_id, request_id, body
             )
         if service_name == Settings.MDP_INTERNAL_SERVICE:
             func_name, *body = body
@@ -2468,20 +2470,20 @@ class AMajordomo:
         request_id: Union[str, bytes],
         *body
     ):
-        # Mlogger.debug(
-        #     f"client id: {client_id}\n"
-        #     f"request id: {request_id}\n"
-        #     f"service_name: {service_name}\n"
-        #     f"body: {body}\n"
-        # )
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"client id: {client_id}\n"
+                f"request id: {request_id}\n"
+                f"service_name: {service_name}\n"
+                f"body: {body}\n"
+            )
         if request_id in self.cache_request:
-            self.cache_request.pop(request_id)
-            # request = self.cache_request.pop(request_id)
-            # if Settings.DEBUG:
-            #     Mlogger.debug(
-            #         f"request({request_id}) use time from backend:"
-            #         f" {loop.time() - request[-1]}"
-            #     )
+            request = self.cache_request.pop(request_id)
+            if Settings.DEBUG > 2:
+                Mlogger.debug(
+                    f"request({request_id}) use time from backend:"
+                    f" {self._loop.time() - request[-1]}"
+                )
         if client_id in self.clients:
             reply = (
                 client_id,
@@ -2515,6 +2517,7 @@ class AMajordomo:
                     bt.add_done_callback(self.cleanup_backend_task)
 
                 if self.frontend in socks:
+                    replies = await self.frontend.recv_multipart()
                     if len(self.frontend_tasks) >= self.max_process_tasks:
                         Mlogger.warning(
                             f"The number of pending requests from frontend has "
@@ -2522,15 +2525,13 @@ class AMajordomo:
                             f"The limit is {self.max_process_tasks} "
                             f"requests."
                         )
-                        await asyncio.sleep(1)
-                        continue
-                    replies = await self.frontend.recv_multipart()
-                    # 同后端任务处理。
-                    ft = self._loop.create_task(
-                        self.process_request_from_frontend(replies),
-                    )
-                    self.frontend_tasks.add(ft)
-                    ft.add_done_callback(self.cleanup_frontend_task)
+                    else:
+                        # 同后端任务处理。
+                        ft = self._loop.create_task(
+                            self.process_request_from_frontend(replies),
+                        )
+                        self.frontend_tasks.add(ft)
+                        ft.add_done_callback(self.cleanup_frontend_task)
 
                 if self.gate in socks:
                     messages = await self.gate.recv_multipart()
@@ -2619,10 +2620,10 @@ class Client:
         zap_mechanism, zap_credentials = check_zap_args(
             zap_mechanism, zap_credentials
         )
-        if not zap_mechanism:
-            self.zap_frames = []
-        else:
+        if zap_mechanism:
             self.zap_frames = [zap_mechanism, *zap_credentials]
+        else:
+            self.zap_frames = None
 
         if not context:
             self.ctx = Context()
@@ -2646,6 +2647,7 @@ class Client:
 
         self._executor = ThreadPoolExecutor()
         self.replies: dict[bytes, asyncio.Future] = dict()
+        self._process_replies_tasks = set()
         self._clear_replies_tasks = set()
         self.stream_reply_maxsize = Settings.STREAM_REPLY_MAXSIZE
 
@@ -2666,8 +2668,7 @@ class Client:
         self.socket = self.ctx.socket(
             z_const.DEALER, z_aio.Socket
         )
-        set_sock(self.socket)
-        self.socket.set(z_const.IDENTITY, self.identity)
+        set_sock(self.socket, {z_const.IDENTITY: self.identity})
         self.socket.connect(self._broker_addr)
         self._poller.register(self.socket, z_const.POLLIN)
         self.ready = self._loop.create_future()
@@ -2690,6 +2691,12 @@ class Client:
         self._recv_task = None
         self.ready = None
 
+    async def _build_zap_frames(self):
+        if self.zap_frames:
+            return tuple(to_bytes(f) for f in self.zap_frames)
+        else:
+            return tuple()
+
     async def _send_to_majordomo(
         self, service_name: Union[str, bytes], *body,
     ) -> bytes:
@@ -2703,7 +2710,7 @@ class Client:
             b"",
             Settings.MDP_CLIENT,
             service_name,
-            *self.zap_frames,
+            *(await self._build_zap_frames()),
             request_id,
             *body
         )
@@ -2716,7 +2723,7 @@ class Client:
         if request_id in self.replies:
             reply = self.replies[request_id].result()
             if isinstance(reply, StreamReply):
-                if reply._exit:
+                if reply.is_exit():
                     self.replies.pop(request_id).done()
                 else:
                     t = self._loop.create_task(
@@ -2731,23 +2738,24 @@ class Client:
         self, service_name: Union[str, bytes],
         func_name: Union[str, bytes], args: tuple, kwargs: dict,
     ):
-        st = self._loop.time()
+        f = self._loop.create_future()
+        if Settings.DEBUG > 2:
+            f.start_time = self._loop.time()
         request_id = await self._send_to_majordomo(
             service_name,
             msg_pack(func_name), msg_pack(args), msg_pack(kwargs)
         )
-        self.replies[request_id] = self._loop.create_future()
+        self.replies[request_id] = f
         try:
             response = await asyncio.wait_for(
                 self.replies[request_id],
                 self.reply_timeout
             )
-            # if Settings.DEBUG:
-                # Clogger.debug(
-                #     f"request(request_id) use time from majordomo:"
-                #     f" {self._loop.time() - st}"
-                # )
-                # Clogger.debug(f"response type: {type(response)}")
+            if Settings.DEBUG > 2:
+                Clogger.debug(
+                    f"request(request_id) use time from majordomo:"
+                    f" {self._loop.time() - f.start_time}"
+                )
             if isinstance(response, StreamReply):
                 return response
             elif isinstance(response, HugeData):
@@ -2781,36 +2789,72 @@ class Client:
             )
             t.add_done_callback(self._clear_replies_tasks.remove)
 
-    async def knock(
-        self, service_name: str, func_name: str, *args, **kwargs
-    ):
-        """
-        调用指定的远程服务的指定方法。获取返回结果，如果有异常就重新抛出异常，
-        :param service_name: 要访问的服务的名字
-        :param func_name: 要调用该服务的函数的名字
-        :param args: 要调用的该函数要传递的位置参数
-        :param kwargs: 要调用的该函数要传递的关键字参数
-        """
-        if not self._recv_task:
-            await self.connect()
-        await asyncio.wait_for(self.ready, self.reply_timeout)
-        if not service_name:
-            service_name = self.default_service
-        if service_name not in self._remote_services:
-            raise AttributeError(
-                f"The remote service named \"{service_name}\" was not "
-                f"found."
-            )
-        if (replies_len := len(self.replies)) > Settings.MESSAGE_MAX:
-            msg = (
-                f"The number({replies_len}) of pending requests has exceeded "
-                f"the cache limit for the requesting task. The limit is "
-                f"{Settings.MESSAGE_MAX} requests."
-            )
-            if Settings.SECURE:
-                raise RuntimeError(msg)
-            logger.warning(msg)
-        return await self._request(service_name, func_name, args, kwargs)
+    def _cleanup_process_tasks(self, task: asyncio.Task):
+        self._process_replies_tasks.remove(task)
+        if exception := task.exception():
+            exception_info = "".join(format_tb(exception.__traceback__))
+            exception_info = (f"{exception.__class__}:{exception.__repr__()}"
+                              f"\n{exception_info}")
+            Clogger.error(f"process reply task exception:\n{exception_info}")
+
+    async def _process_reply(self, messages):
+        (
+            service_name,
+            request_id,
+            *body
+        ) = messages
+        if request_id not in self.replies:
+            return
+        if len(body) == 1:
+            body = msg_unpack(body[0])
+            self.replies[request_id].set_result(body)
+        elif len(body) > 1:
+            *option, body = body
+            if option[0] == Settings.STREAM_GENERATOR_TAG:
+                if not (reply := self.replies[request_id]).done():
+                    stream_reply = StreamReply(
+                        Settings.STREAM_END_TAG,
+                        maxsize=self.stream_reply_maxsize,
+                        timeout=self.reply_timeout
+                    )
+                    self.replies[request_id].set_result(
+                        stream_reply
+                    )
+                else:
+                    stream_reply = reply.result()
+                if (len(option) > 1 and option[1] ==
+                        Settings.STREAM_EXCEPT_TAG):
+                    exc = RemoteException(msg_unpack(body))
+                    await throw_exception_agenerator(
+                        stream_reply, exc
+                    )
+                else:
+                    if body != Settings.STREAM_END_TAG:
+                        body = msg_unpack(body)
+                    await stream_reply.asend(body)
+            elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
+                if not (reply := self.replies[request_id]).done():
+                    huge_reply = HugeData(
+                        Settings.HUGE_DATA_END_TAG,
+                        Settings.HUGE_DATA_EXCEPT_TAG,
+                        compress_module=(
+                            Settings.HUGE_DATA_COMPRESS_MODULE
+                        ),
+                        compress_level=(
+                            Settings.HUGE_DATA_COMPRESS_LEVEL
+                        ),
+                        blksize=Settings.HUGE_DATA_SIZEOF
+                    )
+                    self.replies[request_id].set_result(huge_reply)
+                else:
+                    huge_reply = reply.result()
+                if (len(option) > 1 and option[1] ==
+                        Settings.STREAM_EXCEPT_TAG):
+                    huge_reply._remote_exception = body
+                else:
+                    await self._loop.run_in_executor(
+                        self._executor, huge_reply.add_data, body
+                    )
 
     async def _majordomo_service(
         self, func_name: str, *args, **kwargs
@@ -2863,74 +2907,23 @@ class Client:
                 messages = await self.socket.recv_multipart()
                 try:
                     (
-                        empty,
+                        empty_frame,
                         mdp_client_version,
-                        service_name,
-                        request_id,
-                        *body
+                        *messages
                     ) = messages
-                    if empty:
+                    if empty_frame:
                         continue
                 except ValueError:
                     continue
                 if mdp_client_version != Settings.MDP_CLIENT:
                     continue
-                try:
-                    majordomo_liveness = self.heartbeat_liveness
-                    if request_id not in self.replies:
-                        continue
-                    elif len(body) == 1:
-                        body = msg_unpack(body[0])
-                        self.replies[request_id].set_result(body)
-                    elif len(body) > 1:
-                        *option, body = body
-                        if option[0] == Settings.STREAM_GENERATOR_TAG:
-                            if not (reply := self.replies[request_id]).done():
-                                stream_reply = StreamReply(
-                                    Settings.STREAM_END_TAG,
-                                    maxsize=self.stream_reply_maxsize,
-                                    timeout=self.reply_timeout
-                                )
-                                self.replies[request_id].set_result(
-                                    stream_reply
-                                )
-                            else:
-                                stream_reply = reply.result()
-                            if (len(option) > 1 and option[1] ==
-                                    Settings.STREAM_EXCEPT_TAG):
-                                exc = RemoteException(msg_unpack(body))
-                                await throw_exception_agenerator(
-                                    stream_reply, exc
-                                )
-                            else:
-                                if body != Settings.STREAM_END_TAG:
-                                    body = msg_unpack(body)
-                                await stream_reply.asend(body)
-                        elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
-                            if not (reply := self.replies[request_id]).done():
-                                huge_reply = HugeData(
-                                    Settings.HUGE_DATA_END_TAG,
-                                    Settings.HUGE_DATA_EXCEPT_TAG,
-                                    compress_module=(
-                                        Settings.HUGE_DATA_COMPRESS_MODULE
-                                    ),
-                                    compress_level=(
-                                        Settings.HUGE_DATA_COMPRESS_LEVEL
-                                    ),
-                                    blksize=Settings.HUGE_DATA_SIZEOF
-                                )
-                                self.replies[request_id].set_result(huge_reply)
-                            else:
-                                huge_reply = reply.result()
-                            if (len(option) > 1 and option[1] ==
-                                    Settings.STREAM_EXCEPT_TAG):
-                                huge_reply._remote_exception = body
-                            else:
-                                await self._loop.run_in_executor(
-                                    self._executor, huge_reply.add_data, body
-                                )
-                except MsgUnpackError:
-                    continue
+                majordomo_liveness = self.heartbeat_liveness
+                self._process_replies_tasks.add(
+                    t := self._loop.create_task(
+                        self._process_reply(messages)
+                    )
+                )
+                t.add_done_callback(self._cleanup_process_tasks)
         except asyncio.CancelledError:
             Clogger.warning("recv task cancelled.")
             return
@@ -2942,6 +2935,37 @@ class Client:
             await self.disconnect()
             self._heartbeat_task.cancel()
             self.ready = None
+
+    async def knock(
+        self, service_name: str, func_name: str, *args, **kwargs
+    ):
+        """
+        调用指定的远程服务的指定方法。获取返回结果，如果有异常就重新抛出异常，
+        :param service_name: 要访问的服务的名字
+        :param func_name: 要调用该服务的函数的名字
+        :param args: 要调用的该函数要传递的位置参数
+        :param kwargs: 要调用的该函数要传递的关键字参数
+        """
+        if not self._recv_task:
+            await self.connect()
+        await asyncio.wait_for(self.ready, self.reply_timeout)
+        if not service_name:
+            service_name = self.default_service
+        if service_name not in self._remote_services:
+            raise AttributeError(
+                f"The remote service named \"{service_name}\" was not "
+                f"found."
+            )
+        if (replies_len := len(self.replies)) > Settings.MESSAGE_MAX:
+            msg = (
+                f"The number({replies_len}) of pending requests has exceeded "
+                f"the cache limit for the requesting task. The limit is "
+                f"{Settings.MESSAGE_MAX} requests."
+            )
+            if Settings.SECURE:
+                raise RuntimeError(msg)
+            logger.warning(msg)
+        return await self._request(service_name, func_name, args, kwargs)
 
     def __getattr__(self, item):
         if not self._remote_service:

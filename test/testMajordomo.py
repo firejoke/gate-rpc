@@ -10,6 +10,9 @@ from traceback import format_exception
 from typing import Optional, Union
 from uuid import uuid4
 
+import zmq.auth
+import zmq.constants as z_const
+
 
 base_path = Path(__file__).parent
 sys.path.append(base_path.parent.as_posix())
@@ -25,6 +28,18 @@ from gaterpc.utils import (
 )
 import testSettings
 
+
+curve_dir = Path(__file__).parent.joinpath("curvekey/")
+if curve_dir.exists():
+    g_public, g_secret = zmq.auth.load_certificate(
+        curve_dir.joinpath("gate.key_secret")
+    )
+    cw_public, _ = zmq.auth.load_certificate(
+        curve_dir.joinpath("cw.key")
+    )
+else:
+    g_public = g_secret = b""
+    cw_public = b""
 
 Settings.configure("USER_SETTINGS", testSettings)
 logger = getLogger("commands")
@@ -201,40 +216,50 @@ async def majordomo(
     frontend=None, backend=None, bind_gate=None, connect_gate=None
 ):
     Settings.setup()
+    if g_secret:
+        Settings.ZMQ_SOCK.update({
+            z_const.CURVE_SECRETKEY: g_secret,
+            z_const.CURVE_PUBLICKEY: g_public,
+            z_const.CURVE_SERVER: True,
+            z_const.CURVE_SERVERKEY: g_public,
+        })
+    logger.debug(f"g_public: {g_public}, g_secret: {g_secret}")
+    logger.debug(f"cw_public: {cw_public}")
+    logger.debug(f"ZMQ_SOCK: {Settings.ZMQ_SOCK}")
     # loop = asyncio.get_event_loop()
     # loop.slow_callback_duration = 0.01
     if backend:
         Settings.WORKER_ADDR = backend
     Settings.ZAP_REPLY_TIMEOUT = 10.0
     ctx = Context()
-    zipc = Settings.ZAP_ADDR
-    # zipc = f"ipc://{zipc.as_posix()}"
-    logger.info(f"zap ipc addr: {zipc}")
-    zap = AsyncZAPService(addr=zipc)
-    zap.configure_plain(
-        Settings.ZAP_DEFAULT_DOMAIN,
-        {
-            Settings.ZAP_PLAIN_DEFAULT_USER: Settings.ZAP_PLAIN_DEFAULT_PASSWORD
-        }
-    )
+    # zipc = Settings.ZAP_ADDR
+    # logger.info(f"zap ipc addr: {zipc}")
+    # zap = AsyncZAPService(addr=zipc)
+    # zap.configure_plain(
+    #     Settings.ZAP_DEFAULT_DOMAIN,
+    #     {
+    #         Settings.ZAP_PLAIN_DEFAULT_USER: Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+    #     }
+    # )
 
     gr_majordomo = TAMajordomo(
         context=ctx,
-        gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
-        gate_zap_credentials=(
-            Settings.ZAP_PLAIN_DEFAULT_USER,
-            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
-        )
+        # gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
+        # gate_zap_credentials=(
+        #     Settings.ZAP_PLAIN_DEFAULT_USER,
+        #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        # )
     )
     gr_majordomo.bind_backend()
-    # gr_majordomo.bind_frontend(frontend)
+    if frontend:
+        gr_majordomo.bind_frontend(frontend)
     if bind_gate:
         gr_majordomo.bind_gate(bind_gate)
     await asyncio.sleep(1)
     logger.info("start test")
     try:
-        zap.start()
-        gr_majordomo.connect_zap(zap_addr=zipc)
+        # zap.start()
+        # gr_majordomo.connect_zap(zap_addr=zipc)
         gr_majordomo.run()
         if connect_gate:
             try:
@@ -250,7 +275,7 @@ async def majordomo(
         exc = gr_majordomo.rw_task.exception()
         gr_majordomo.stop()
         logger.info(f"request_zap.cache_info: {gr_majordomo.zap_cache}")
-        zap.stop()
+        # zap.stop()
         if exc:
             raise exc
 

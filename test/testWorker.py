@@ -8,6 +8,9 @@ import sys
 from logging import getLogger
 from pathlib import Path
 
+import zmq.auth
+import zmq.constants as z_const
+
 
 base_path = Path(__file__).parent
 sys.path.append(base_path.parent.as_posix())
@@ -23,8 +26,20 @@ from gaterpc.utils import (
 import testSettings
 
 
+curve_dir = Path(__file__).parent.joinpath("curvekey/")
+if curve_dir.exists():
+    g_public, _ = zmq.auth.load_certificate(
+        curve_dir.joinpath("gate.key")
+    )
+    cw_public, cw_secret = zmq.auth.load_certificate(
+        curve_dir.joinpath("cw.key_secret")
+    )
+else:
+    g_public = b""
+    cw_public = cw_secret = b""
+
 Settings.configure("USER_SETTINGS", testSettings)
-Settings.DEBUG = True
+Settings.DEBUG = 1
 logger = getLogger("commands")
 s = ""
 i = 10000
@@ -103,6 +118,12 @@ class GRWorker(Worker):
 
 async def worker(backend_addr=None):
     Settings.setup()
+    if cw_secret:
+        Settings.ZMQ_SOCK.update({
+            z_const.CURVE_SECRETKEY: cw_secret,
+            z_const.CURVE_PUBLICKEY: cw_public,
+            z_const.CURVE_SERVERKEY: g_public,
+        })
     # loop = asyncio.get_event_loop()
     # loop.slow_callback_duration = 0.01
     if backend_addr:
@@ -112,11 +133,11 @@ async def worker(backend_addr=None):
     gr_worker = gr.create_worker(
         GRWorker,
         context=ctx,
-        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
-        zap_credentials=(
-            Settings.ZAP_PLAIN_DEFAULT_USER,
-            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
-        ),
+        # zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
+        # zap_credentials=(
+        #     Settings.ZAP_PLAIN_DEFAULT_USER,
+        #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+        # ),
         max_allowed_request=100000
     )
     logger.info(gr_worker.service)

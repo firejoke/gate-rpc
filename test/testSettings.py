@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 # Author      : ShiFan
 # Created Date: 2024/8/14 10:57
+from pathlib import Path
+
 import zmq.constants as z_const
 from gaterpc.utils import empty
 
 
-DEBUG = True
+DEBUG = 1
 SECURE = True
 
 ZMQ_SOCK = {
@@ -15,7 +17,7 @@ ZMQ_SOCK = {
     # millisecond
     # z_const.RCVTIMEO: 10 * 1000
 }
-# WORKER_ADDR: str = "tcp://0:5060"
+# WORKER_ADDR: str = "tcp://0:777"
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,

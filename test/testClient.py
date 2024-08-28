@@ -124,7 +124,7 @@ async def client(frontend_addr):
 
 
 async def test(frontend_addr):
-    Settings.DEBUG = True
+    Settings.DEBUG = 1
     Settings.setup()
     await client(frontend_addr)
 
