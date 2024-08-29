@@ -91,6 +91,8 @@ LazyAttribute 初始化时接受三个可选参数：
 
 以下是可能修改的一些主要配置的解释
 
+- ZMQ_CONTEXT: dict = ZMQ 的 CONTEXT 的参数配置
+- ZMQ_SOCK: dict = ZMQ 的 SOCKET 的参数配置（CURVE 相关的配置可以在这里配置，也可以在 AMajordomo 的 bind_frontend 和 bind_backend 方法的 sock_opt 参数里传递）
 - HEARTBEAT: int = 全局的默认的心跳间隔，单位是毫秒
 - TIMEOUT: float = 全局的默认超时时间，单位是秒
 - MESSAGE_MAX: int = Worker 和 Client 实例里等待处理的消息最大数量
@@ -108,8 +110,8 @@ LazyAttribute 初始化时接受三个可选参数：
 - ZAP_PLAIN_DEFAULT_PASSWORD: str = ZAP 的 PLAIN 机制的默认密码
 - ZAP_ADDR: str = ZAP 服务绑定的地址，如果是和代理服务一起使用，最好使用 ipc 类型，且不要和代理使用同一个 Context
 - ZAP_REPLY_TIMEOUT: float = 等待 ZAP 服务的回复的超时时间，单位是秒，远比普通的REPLY_TIMEOUT短，因为zap服务处理每一个zap请求必须很快
-- GATE_CLUSTER_NAME: str = gate集群的集群名
-- GATE_CLUSTER_DESCRIPTION: str = gate集群的描述
+- GATE_CLUSTER_NAME: str = gate 集群的集群名
+- GATE_CLUSTER_DESCRIPTION: str = gate 集群的描述
 - MEMBER: str = gate集群的成员版本
 
 特殊返回值的序列化通过 MessagePack 的全局实例（gaterpc.utils.message_pack）来定制 [#f2]_ 。
@@ -254,7 +256,7 @@ LazyAttribute 初始化时接受三个可选参数：
             Settings.ZAP_PLAIN_DEFAULT_PASSWORD
         )
     )
-    # 绑定后端地址，为空则使用 Settings.WORKER_ADDR
+    # 绑定后端地址，为空则使用 Settings.WORKER_ADDR，sock_opt 可选关键字参数用来定制 socket，比如 CURVE 配置
     majordomo.bind_backend()
     majordomo.bind_frontend("ipc:///tmp/gate-rpc/run/c1")
     # 如果启用了 zap 服务
@@ -368,7 +370,8 @@ Gate cluster
     hd = HugeData(
         Settings.HUGE_DATA_END_TAG,
         Settings.HUGE_DATA_EXCEPT_TAG,
-        compress_module="gzip", compress_level=9, blksize=1000
+        compress_module="gzip", compress_level=9, blksize=1000,
+        timeout=Settings.TIMEOUT
     )
     d = process_data()
     # 可以整个直接丢进去
