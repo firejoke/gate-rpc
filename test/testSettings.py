@@ -11,7 +11,7 @@ DEBUG = 1
 SECURE = True
 
 ZMQ_SOCK = {
-    z_const.HWM: 5000,
+    z_const.SocketOption.HWM: 5000,
     # millisecond
     # z_const.SNDTIMEO: 10 * 1000,
     # millisecond
@@ -40,24 +40,6 @@ LOGGING = {
         },
     },
     "handlers": {
-        "asyncio": {
-            "level": "DEBUG",
-            "class": "gaterpc.utils.AQueueHandler",
-            "handler_class": "logging.handlers.TimedRotatingFileHandler",
-            "filename": empty,
-            "formatter": "debug",
-            "when": "midnight",
-            "backupCount": 10
-        },
-        "gaterpc": {
-            "level": "DEBUG",
-            "class": "gaterpc.utils.AQueueHandler",
-            "handler_class": "logging.handlers.TimedRotatingFileHandler",
-            "filename": empty,
-            "formatter": "verbose",
-            "when": "midnight",
-            "backupCount": 10
-        },
         "console": {
             "level": "DEBUG",
             "class": "logging.StreamHandler",

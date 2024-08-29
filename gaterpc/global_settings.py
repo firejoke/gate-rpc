@@ -154,11 +154,10 @@ class GlobalSettings(object):
     USER_SETTINGS = LazyAttribute(render=user_settings_render)
     SECURE = True
     # ZMQ
-    ZMQ_CONTEXT = {
-        z_const.IPV6: 1
-    }
+    ZMQ_CONTEXT = dict()
     ZMQ_SOCK = {
-        z_const.HWM: 3000,
+        z_const.SocketOption.IPV6: 1,
+        z_const.SocketOption.HWM: 3000,
         # millisecond
         # z_const.SNDTIMEO: 10 * 1000,
         # millisecond
@@ -260,9 +259,10 @@ class GlobalSettings(object):
         for name, value in self.ENVIRONMENT.items():
             os.environ[name] = value
 
-        dictConfig(self.DEFAULT_LOGGING)
         if self.LOGGING:
             dictConfig(self.LOGGING)
+        else:
+            dictConfig(self.DEFAULT_LOGGING)
 
 
 Settings = GlobalSettings()

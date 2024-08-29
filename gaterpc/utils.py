@@ -31,10 +31,7 @@ from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.resource_tracker import unregister
 from importlib import import_module
 from pathlib import Path
-from functools import (
-    WRAPPER_ASSIGNMENTS, _make_key, partial, update_wrapper,
-    wraps, lru_cache,
-)
+from functools import _make_key, partial, update_wrapper
 
 from collections import deque, namedtuple
 from collections.abc import AsyncGenerator, Callable, Generator
@@ -557,7 +554,7 @@ class AQueueHandler(Handler):
     def __init__(
         self, *args,
         handler_class: Union[Handler, str] = None,
-        listener: str = "gaterpc.utils.singleton_queue_listener",
+        listener: str = "gaterpc.utils.singleton_aqueue_listener",
         **kwargs
     ):
         Handler.__init__(self)
@@ -695,9 +692,7 @@ def ensure_shm_unlink(shm: SharedMemory):
             unregister(shm._name, "shared_memory")
         except KeyError:
             pass
-    except KeyError:
-        pass
-    except ImportError:
+    except (KeyError, ImportError):
         pass
 
 
@@ -1088,7 +1083,8 @@ class HugeData:
         data: Optional[bytes] = None,
         compress_module: str = "gzip",
         compress_level: int = 1,
-        blksize: int = 1000
+        blksize: int = 1000,
+        timeout: float = 1,
     ):
         self.sel = selectors.DefaultSelector()
         self.end_tag = end_tag
@@ -1106,6 +1102,7 @@ class HugeData:
         self._write_buffer = b""
         self._write_end = False
         self._remote_exception = None
+        self.timeout = timeout
 
         atexit.register(self.destroy)
 
@@ -1194,7 +1191,7 @@ class HugeData:
                     remote_exception = msg_unpack(self._remote_exception)
                     raise RemoteException(remote_exception)
                 try:
-                    data = await asyncio.wait_for(read_q.get(), 1)
+                    data = await asyncio.wait_for(read_q.get(), self.timeout)
                     read_q.task_done()
                 except asyncio.TimeoutError:
                     data = b""
@@ -1209,10 +1206,13 @@ class HugeData:
             loop.remove_reader(self._p[0])
             if clean_writer:
                 loop.remove_writer(self.data[1])
-            if not f.done():
+            if f.done():
+                exc = f.exception()
+            else:
+                exc = None
                 f.cancel()
             process_executor.shutdown(False, cancel_futures=True)
-            if exc := f.exception():
+            if exc:
                 raise exc
 
     async def decompress(
@@ -1256,7 +1256,7 @@ class HugeData:
                     remote_exception = msg_unpack(self._remote_exception)
                     raise RemoteException(remote_exception)
                 try:
-                    data = await asyncio.wait_for(read_q.get(), 1)
+                    data = await asyncio.wait_for(read_q.get(), self.timeout)
                     read_q.task_done()
                 except asyncio.TimeoutError:
                     data = b""
@@ -1272,10 +1272,13 @@ class HugeData:
             loop.remove_reader(self._p[0])
             if clean_writer:
                 loop.remove_writer(self.data[1])
-            if not f.done():
+            if f.done():
+                exc = f.exception()
+            else:
+                exc = None
                 f.cancel()
             process_executor.shutdown(False, cancel_futures=True)
-            if exc := f.exception():
+            if exc:
                 raise exc
 
 

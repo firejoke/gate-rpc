@@ -16,6 +16,9 @@ from logging import getLogger
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
 import zmq.error as z_error
+from zmq import Context as SyncContext
+from zmq import Socket as SyncSocket
+from zmq import ZMQError
 from zmq.auth import Authenticator
 
 from .global_settings import Settings
@@ -94,10 +97,11 @@ def set_ctx(ctx: Context, options: dict = None):
         _options.update(options)
     for op, v in _options.items():
         try:
+            logger.debug(f"ctx({ctx}).{op.name} is {ctx.get(op)}:")
             ctx.set(op, v)
-            logger.debug(f"ctx({ctx}) set {op}: {v}")
-        except AttributeError:
-            pass
+            logger.debug(f"ctx({ctx}) update {op.name} = {v}")
+        except AttributeError as e:
+            logger.error(e)
 
 
 def set_sock(sock: z_aio.Socket, options: dict = None):
@@ -107,10 +111,15 @@ def set_sock(sock: z_aio.Socket, options: dict = None):
     for op, v in _options.items():
         try:
             if op == z_const.HWM and isinstance(v, int):
+                logger.debug(f"sock({sock}).{op.name} is {sock.get_hwm()}")
                 sock.set_hwm(v)
             else:
+                try:
+                    logger.debug(f"sock({sock}).{op.name} is {sock.get(op)}")
+                except ZMQError:
+                    logger.debug(f"sock({sock}).{op.name} is not set.")
                 sock.set(op, v)
-            logger.debug(f"sock({sock}) set {op}: {v}")
+            logger.debug(f"sock({sock}) update {op.name} = {v}")
         except AttributeError as e:
             logger.error(e)
 
@@ -202,6 +211,7 @@ class RemoteWorker(ABCWorker):
         self.destroy_task: Optional[asyncio.Task] = None
 
     def is_alive(self):
+        # TODO: 如果在心跳间隔时间内下线，该如何做？
         return self.ready
 
     def prolong(self, now_time):
@@ -268,16 +278,13 @@ class Worker(ABCWorker):
             heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
         self.heartbeat = heartbeat
         self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
-        self.expiry = self.heartbeat_liveness * self.heartbeat
-
-        self.sent_tasks = set()
-        self.last_message_sent_time: float = heartbeat
 
         if max_allowed_request:
             self.max_allowed_request = max_allowed_request
         else:
             self.max_allowed_request = Settings.MESSAGE_MAX
         self.requests = set()
+        self.sent_tasks = set()
 
         if not thread_executor:
             self.thread_executor = ThreadPoolExecutor()
@@ -292,7 +299,6 @@ class Worker(ABCWorker):
 
         self._reconnect: bool = False
         self._recv_task: Optional[asyncio.Task] = None
-        self._heartbeat_task: Optional[asyncio.Task] = None
 
     def _get_interfaces(self):
         interfaces = dict()
@@ -414,7 +420,6 @@ class Worker(ABCWorker):
         )
         messages = tuple(to_bytes(s) for s in messages)
         await self._socket.send_multipart(messages)
-        self.last_message_sent_time = self._loop.time()
 
     async def send_hugedata(self, option: tuple, hugedata):
         try:
@@ -480,9 +485,7 @@ class Worker(ABCWorker):
                 )
             )
 
-    async def process_request(
-        self, messages
-    ):
+    async def process_request(self, messages):
         try:
             (
                 client_id,
@@ -511,7 +514,10 @@ class Worker(ABCWorker):
             if len(self.requests) > self.max_allowed_request:
                 if not Settings.SECURE:
                     return
-                raise RuntimeError("Request count exceeds the maximum value")
+                raise RuntimeError(
+                    f"Request count exceeds the maximum value("
+                    f"{self.max_allowed_request})"
+                )
             if not self.interfaces.get(func_name, None):
                 if Settings.SECURE:
                     return
@@ -559,21 +565,6 @@ class Worker(ABCWorker):
         self.sent_tasks.add(task)
         task.add_done_callback(self.cleanup_sent)
 
-    async def send_heartbeat(self):
-        while 1:
-            time_from_last_message = (
-                    self._loop.time() - self.last_message_sent_time
-            )
-            if time_from_last_message >= 1e-3 * self.heartbeat:
-                await self.send_to_majordomo(
-                    Settings.MDP_COMMAND_HEARTBEAT,
-                )
-                slt = 1e-3 * self.heartbeat
-                await asyncio.sleep(slt)
-            else:
-                slt = 1e-3 * self.heartbeat - time_from_last_message
-                await asyncio.sleep(slt)
-
     async def recv(self):
         try:
             await self.connect()
@@ -589,10 +580,6 @@ class Worker(ABCWorker):
                         Wlogger.error("Majordomo offline")
                         break
                     continue
-                if not self._heartbeat_task or self._heartbeat_task.done():
-                    self._heartbeat_task = self._loop.create_task(
-                        self.send_heartbeat()
-                    )
                 messages = await self._socket.recv_multipart()
                 try:
                     (
@@ -615,15 +602,24 @@ class Worker(ABCWorker):
                         f"messages: {messages}"
                     )
                 if command == Settings.MDP_COMMAND_HEARTBEAT:
+                    self.sent_tasks.add(
+                        task := self._loop.create_task(
+                            self.send_to_majordomo(
+                                Settings.MDP_COMMAND_HEARTBEAT
+                            )
+                        )
+                    )
+                    task.add_done_callback(self.cleanup_sent)
                     continue
                 elif command == Settings.MDP_COMMAND_DISCONNECT:
                     Wlogger.warning(f"{self.identity} disconnected")
                     break
                 elif command == Settings.MDP_COMMAND_REQUEST:
-                    task = self._loop.create_task(
-                        self.process_request(messages)
+                    self.requests.add(
+                        task := self._loop.create_task(
+                            self.process_request(messages)
+                        )
                     )
-                    self.requests.add(task)
                     task.add_done_callback(self.cleanup_request)
         except asyncio.CancelledError:
             self._reconnect = False
@@ -633,9 +629,6 @@ class Worker(ABCWorker):
             Wlogger.error(exception)
             raise
         finally:
-            if self._heartbeat_task:
-                self._heartbeat_task.cancel()
-                self._heartbeat_task = None
             await self.disconnect()
             if self._loop.is_running() and self._reconnect:
                 Wlogger.warning("Reconnect to Majordomo")
@@ -1200,13 +1193,11 @@ class AMajordomo:
         self.ctx = context
         set_ctx(self.ctx)
         # frontend
-        self.frontend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.frontend, {z_const.IDENTITY: self.identity})
+        self.frontend: Optional[z_aio.Socket] = None
         self.clients = set()
         self.frontend_tasks = set()
         # backend
-        self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.backend, {z_const.IDENTITY: self.identity})
+        self.backend: Optional[z_aio.Socket] = None
         self.services: dict[str, ABCService] = dict()
         self.workers: dict[bytes, Union[RemoteWorker, RemoteGateRPC]] = dict()
         self.backend_tasks = set()
@@ -1218,8 +1209,7 @@ class AMajordomo:
         self.zap_cache = LRUCache(128)
         self.zap_tasks = set()
         # gate
-        self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.gate, {z_const.IDENTITY: self.identity})
+        self.gate: Optional[z_aio.Socket] = None
         self.gate_cluster = GateClusterService(self)
         self.gate_replies: dict[bytes, asyncio.Future] = dict()
         self.gate_tasks = set()
@@ -1248,36 +1238,58 @@ class AMajordomo:
         self.internal_tasks = set()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
         self.cache_request = dict()
-        self.max_process_tasks = Settings.MESSAGE_MAX
         self.running = False
         self._poller = z_aio.Poller()
         self._broker_task: Optional[asyncio.Task] = None
         self.register_internal_process()
 
-    def bind_frontend(self, addr: str) -> None:
+    def bind_frontend(self, addr: str, sock_opt: dict = None) -> None:
         """
         绑定前端地址
         """
+        if not sock_opt:
+            sock_opt = {z_const.IDENTITY: self.identity}
+        else:
+            sock_opt.update({z_const.IDENTITY: self.identity})
+        self.frontend = self.ctx.socket(z_const.ROUTER,z_aio.Socket)
+        set_sock(self.frontend, sock_opt)
         self.frontend.bind(check_socket_addr(addr))
 
     def unbind_frontend(self, addr: str) -> None:
-        self.frontend.unbind(check_socket_addr(addr))
+        if self.frontend:
+            self.frontend.unbind(check_socket_addr(addr))
 
-    def bind_backend(self, addr: str = None) -> None:
+    def bind_backend(self, addr: str = None, sock_opt: dict = None) -> None:
         if not addr:
             addr = Settings.WORKER_ADDR
+        if not sock_opt:
+            sock_opt = {z_const.IDENTITY: self.identity}
+        else:
+            sock_opt.update({z_const.IDENTITY: self.identity})
+        self.backend = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
+        set_sock(self.backend, sock_opt)
         self.backend.bind(check_socket_addr(addr))
 
     def unbind_backend(self, addr: str) -> None:
-        self.backend.unbind(check_socket_addr(addr))
+        if self.backend:
+            self.backend.unbind(check_socket_addr(addr))
 
-    def bind_gate(self, addr: str) -> None:
+    def bind_gate(self, addr: str, sock_opt: dict = None) -> None:
+        if not sock_opt:
+            sock_opt = {z_const.IDENTITY: self.identity}
+        else:
+            sock_opt.update({z_const.IDENTITY: self.identity})
+        self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
+        set_sock(self.gate, sock_opt)
         self.gate.bind(check_socket_addr(addr))
 
     def unbind_gate(self, addr: str) -> None:
-        self.gate.unbind(check_socket_addr(addr))
+        if self.gate:
+            self.gate.unbind(check_socket_addr(addr))
 
     async def connect_gate(self, addr: str) -> None:
+        if not self.gate:
+            raise RuntimeError("require bind gate_addr")
         gate_c = self.ctx.socket(z_const.REQ, z_aio.Socket)
         gate_c.set(z_const.SNDTIMEO, Settings.HEARTBEAT)
         gate_c.set(z_const.RCVTIMEO, Settings.HEARTBEAT)
@@ -1386,12 +1398,18 @@ class AMajordomo:
             if not self._broker_task.cancelled():
                 self._broker_task.cancel()
             self._broker_task = None
-        self._poller.unregister(self.frontend)
-        self._poller.unregister(self.backend)
-        self._poller.unregister(self.gate)
-        self.frontend.close()
-        self.backend.close()
-        self.gate.close()
+        if self.frontend:
+            self._poller.unregister(self.frontend)
+            self.frontend.close()
+            self.frontend = None
+        if self.backend:
+            self._poller.unregister(self.backend)
+            self.backend.close()
+            self.backend = None
+        if self.gate:
+            self._poller.unregister(self.gate)
+            self.gate.close()
+            self.gate = None
         if self.zap:
             self.disconnect_zap()
             self._poller.unregister(self.zap)
@@ -1859,6 +1877,13 @@ class AMajordomo:
         except ValueError:
             return
 
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"gate id: {gate_id}\n"
+                f"command: {command}\n"
+                f"messages: {messages}\n"
+            )
+
         if self.zap:
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
@@ -1866,12 +1891,6 @@ class AMajordomo:
                 return
         else:
             mechanism = credentials = None
-        if Settings.DEBUG > 1:
-            Mlogger.debug(
-                f"gate id: {gate_id}\n"
-                f"command: {command}\n"
-                f"messages: {messages}\n"
-            )
 
         if not (gate := self.gate_cluster.get_workers().get(gate_id, None)):
             Mlogger.warning(f"The gate({gate_id}) was not registered.")
@@ -2002,7 +2021,7 @@ class AMajordomo:
                     gate_id, gate_id, request_id,
                     mechanism, credentials
                 )
-                if not zap_result:
+                if not zap_result and Settings.DEBUG:
                     Mlogger.warning(
                         f"ZAP verification of Gate({gate_id})"
                         f" fails,'{mechanism}' mechanism is used, and the "
@@ -2175,6 +2194,13 @@ class AMajordomo:
         except ValueError:
             return
 
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"worker id: {worker_id}\n"
+                f"command: {command}\n"
+                f"messages: {messages}\n"
+            )
+
         if self.zap:
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
@@ -2184,12 +2210,6 @@ class AMajordomo:
             mechanism = credentials = None
         if not (worker := self.workers.get(worker_id, None)):
             Mlogger.warning(f"The worker({worker_id}) was not registered.")
-        if Settings.DEBUG > 1:
-            Mlogger.debug(
-                f"worker id: {worker_id}\n"
-                f"command: {command}\n"
-                f"messages: {messages}\n"
-            )
 
         # MDP 定义的 Worker 命令
         if command == Settings.MDP_COMMAND_READY:
@@ -2403,6 +2423,13 @@ class AMajordomo:
         except ValueError:
             return
 
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"client id: {client_id}\n"
+                f"service_name: {service_name}\n"
+                f"messages: {messages}\n"
+            )
+
         if self.zap:
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
@@ -2410,12 +2437,6 @@ class AMajordomo:
                 return
         else:
             mechanism = credentials = None
-        if Settings.DEBUG > 1:
-            Mlogger.debug(
-                f"client id: {client_id}\n"
-                f"service_name: {service_name}\n"
-                f"messages: {messages}\n"
-            )
         try:
             request_id, *body = messages
         except ValueError:
@@ -2498,9 +2519,12 @@ class AMajordomo:
 
     async def _broker_loop(self):
         try:
-            self._poller.register(self.frontend, z_const.POLLIN)
-            self._poller.register(self.backend, z_const.POLLIN)
-            self._poller.register(self.gate, z_const.POLLIN)
+            if self.frontend:
+                self._poller.register(self.frontend, z_const.POLLIN)
+            if self.backend:
+                self._poller.register(self.backend, z_const.POLLIN)
+            if self.gate:
+                self._poller.register(self.gate, z_const.POLLIN)
             if self.zap:
                 self._poller.register(self.zap, z_const.POLLIN)
             self.running = True
@@ -2508,7 +2532,7 @@ class AMajordomo:
             while 1:
                 socks = await self._poller.poll(self.heartbeat)
                 socks = dict(socks)
-                if self.backend in socks:
+                if self.backend and self.backend in socks:
                     replies = await self.backend.recv_multipart()
                     bt = self._loop.create_task(
                         self.process_replies_from_backend(replies),
@@ -2516,24 +2540,16 @@ class AMajordomo:
                     self.backend_tasks.add(bt)
                     bt.add_done_callback(self.cleanup_backend_task)
 
-                if self.frontend in socks:
+                if self.frontend and self.frontend in socks:
                     replies = await self.frontend.recv_multipart()
-                    if len(self.frontend_tasks) >= self.max_process_tasks:
-                        Mlogger.warning(
-                            f"The number of pending requests from frontend has "
-                            f"exceeded the cache limit for the requesting task."
-                            f"The limit is {self.max_process_tasks} "
-                            f"requests."
-                        )
-                    else:
-                        # 同后端任务处理。
-                        ft = self._loop.create_task(
-                            self.process_request_from_frontend(replies),
-                        )
-                        self.frontend_tasks.add(ft)
-                        ft.add_done_callback(self.cleanup_frontend_task)
+                    # 同后端任务处理。
+                    ft = self._loop.create_task(
+                        self.process_request_from_frontend(replies),
+                    )
+                    self.frontend_tasks.add(ft)
+                    ft.add_done_callback(self.cleanup_frontend_task)
 
-                if self.gate in socks:
+                if self.gate and self.gate in socks:
                     messages = await self.gate.recv_multipart()
                     gt = self._loop.create_task(
                         self.process_messages_from_gate(messages)
@@ -2569,9 +2585,9 @@ class AMajordomo:
     @interface
     def query_service(self, service_name, **kwargs):
         if service_name in self.services:
-            return True
+            return self.services[service_name].description
         else:
-            return False
+            return None
 
     @interface
     def get_services(self, **kwargs):
@@ -2621,7 +2637,7 @@ class Client:
             zap_mechanism, zap_credentials
         )
         if zap_mechanism:
-            self.zap_frames = [zap_mechanism, *zap_credentials]
+            self.zap_frames = (zap_mechanism, *zap_credentials)
         else:
             self.zap_frames = None
 
@@ -2637,7 +2653,6 @@ class Client:
             heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
         self.heartbeat = heartbeat
         self.heartbeat_liveness = Settings.MDP_HEARTBEAT_LIVENESS
-        self.heartbeat_expiry = self.heartbeat * self.heartbeat_liveness
         self._heartbeat_task: Optional[asyncio.Task] = None
         self.last_message_sent_time: float = 0.0
 
@@ -2684,11 +2699,12 @@ class Client:
 
     def close(self):
         if self._recv_task and not self._recv_task.done():
+            Clogger.warning("Client close.")
             self._recv_task.cancel()
+            self._recv_task = None
         if self._executor:
             self._executor.shutdown(False)
             self._executor = None
-        self._recv_task = None
         self.ready = None
 
     async def _build_zap_frames(self):
@@ -2843,18 +2859,16 @@ class Client:
                         compress_level=(
                             Settings.HUGE_DATA_COMPRESS_LEVEL
                         ),
-                        blksize=Settings.HUGE_DATA_SIZEOF
+                        blksize=Settings.HUGE_DATA_SIZEOF,
+                        timeout=Settings.TIMEOUT
                     )
                     self.replies[request_id].set_result(huge_reply)
                 else:
                     huge_reply = reply.result()
-                if (len(option) > 1 and option[1] ==
-                        Settings.STREAM_EXCEPT_TAG):
+                if len(option) > 1 and option[1] == Settings.STREAM_EXCEPT_TAG:
                     huge_reply._remote_exception = body
                 else:
-                    await self._loop.run_in_executor(
-                        self._executor, huge_reply.add_data, body
-                    )
+                    huge_reply.add_data(body)
 
     async def _majordomo_service(
         self, func_name: str, *args, **kwargs
@@ -2869,10 +2883,7 @@ class Client:
                     self._loop.time() - self.last_message_sent_time
             )
             if time_from_last_message >= 1e-3 * self.heartbeat:
-                await self._send_to_majordomo(
-                    Settings.MDP_INTERNAL_SERVICE,
-                    msg_pack("keepalive"), msg_pack((b"heartbeat",))
-                )
+                await self._majordomo_service("keepalive", b"heartbeat")
                 await asyncio.sleep(1e-3 * self.heartbeat)
             else:
                 await asyncio.sleep(
@@ -2885,9 +2896,9 @@ class Client:
         if not self.ready.done():
             self.ready.set_result(True)
 
-    async def _query_service(self, service_name: bytes):
+    async def _query_service(self, service_name: str):
         return await self._majordomo_service(
-            "query_service", service_name
+            "query_service", msg_pack(service_name)
         )
 
     async def _recv(self):
@@ -2932,6 +2943,7 @@ class Client:
             Clogger.error(exception)
             raise
         finally:
+            self._remote_services.clear()
             await self.disconnect()
             self._heartbeat_task.cancel()
             self.ready = None
@@ -2948,7 +2960,12 @@ class Client:
         """
         if not self._recv_task:
             await self.connect()
-        await asyncio.wait_for(self.ready, self.reply_timeout)
+        if not self.ready:
+            raise RuntimeError("Gate service not yet ready.")
+        try:
+            await asyncio.wait_for(self.ready, self.reply_timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError("waiting for Gate service timed out")
         if not service_name:
             service_name = self.default_service
         if service_name not in self._remote_services:
@@ -2985,5 +3002,93 @@ class Client:
             return self.knock(
                 self._remote_service, self._remote_func, *args, **kwargs
             )
+        finally:
+            self._remote_service = self._remote_func = None
+
+
+class SimpleClient:
+    """
+    简单客户端，只适合用于测试和调用返回结果是单个小型数据的远程方法
+    """
+    def __init__(
+        self,
+        broker_addr,
+        reply_timeout: float = None,
+        zap_mechanism: Union[str, bytes] = None,
+        zap_credentials: tuple = None,
+    ):
+        self.identity = f"sgc-{uuid4().hex}".encode("utf-8")
+        self._broker_addr = check_socket_addr(broker_addr)
+        zap_mechanism, zap_credentials = check_zap_args(
+            zap_mechanism, zap_credentials
+        )
+        if zap_mechanism:
+            self.zap_frames = (zap_mechanism, *zap_credentials)
+        else:
+            self.zap_frames = None
+        self.ctx = SyncContext()
+        set_ctx(self.ctx)
+        if not reply_timeout:
+            reply_timeout = Settings.REPLY_TIMEOUT
+        self.reply_timeout = reply_timeout
+        self.socket = self.ctx.socket(z_const.REQ, SyncSocket)
+        set_sock(self.socket, {z_const.IDENTITY: self.identity})
+        self.socket.connect(self._broker_addr)
+        self._remote_service = self._remote_func = None
+
+    def _build_zap_frames(self):
+        if self.zap_frames:
+            return tuple(to_bytes(f) for f in self.zap_frames)
+        else:
+            return tuple()
+
+    def _close(self):
+        self.socket.disconnect(self._broker_addr)
+        self.socket.close()
+
+    def __del__(self):
+        self._close()
+
+    def __getattr__(self, item):
+        if not self._remote_service:
+            self._remote_service = self._remote_func
+        else:
+            self._remote_service = ".".join(
+                (self._remote_service, self._remote_func)
+            )
+        self._remote_func = item
+        return self
+
+    def __call__(self, *args, **kwargs):
+        """
+        执行rpc调用
+        """
+        request_id = to_bytes(uuid4().hex)
+        request = (
+            Settings.MDP_CLIENT,
+            self._remote_service if self._remote_service else 
+            Settings.SERVICE_DEFAULT_NAME,
+            *(self._build_zap_frames()),
+            request_id,
+            msg_pack(self._remote_func),
+            msg_pack(args),
+            msg_pack(kwargs)
+        )
+        request = tuple(to_bytes(frame) for frame in request)
+        try:
+            self.socket.send_multipart(request)
+            response = self.socket.recv_multipart()
+            (
+                mdp_client_version,
+                service_name,
+                _request_id,
+                *body
+            ) = response
+            if _request_id != request_id:
+                raise RuntimeError("request_id inconsistent")
+            if len(body) == 1:
+                return msg_unpack(body[0])
+            elif len(body) > 1:
+                raise RuntimeError("Does not support streaming data.")
         finally:
             self._remote_service = self._remote_func = None

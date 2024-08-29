@@ -216,16 +216,6 @@ async def majordomo(
     frontend=None, backend=None, bind_gate=None, connect_gate=None
 ):
     Settings.setup()
-    if g_secret:
-        Settings.ZMQ_SOCK.update({
-            z_const.CURVE_SECRETKEY: g_secret,
-            z_const.CURVE_PUBLICKEY: g_public,
-            z_const.CURVE_SERVER: True,
-            z_const.CURVE_SERVERKEY: g_public,
-        })
-    logger.debug(f"g_public: {g_public}, g_secret: {g_secret}")
-    logger.debug(f"cw_public: {cw_public}")
-    logger.debug(f"ZMQ_SOCK: {Settings.ZMQ_SOCK}")
     # loop = asyncio.get_event_loop()
     # loop.slow_callback_duration = 0.01
     if backend:
@@ -250,9 +240,26 @@ async def majordomo(
         #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
         # )
     )
-    gr_majordomo.bind_backend()
+    if g_secret:
+        gr_majordomo.bind_backend(sock_opt={
+                z_const.CURVE_SECRETKEY: g_secret,
+                z_const.CURVE_PUBLICKEY: g_public,
+                z_const.CURVE_SERVER: True,
+            })
+    else:
+        gr_majordomo.bind_backend()
     if frontend:
-        gr_majordomo.bind_frontend(frontend)
+        if g_secret:
+            gr_majordomo.bind_frontend(
+                frontend,
+                sock_opt={
+                    z_const.CURVE_SECRETKEY: g_secret,
+                    z_const.CURVE_PUBLICKEY: g_public,
+                    z_const.CURVE_SERVER: True,
+                }
+            )
+        else:
+            gr_majordomo.bind_frontend(frontend)
     if bind_gate:
         gr_majordomo.bind_gate(bind_gate)
     await asyncio.sleep(1)

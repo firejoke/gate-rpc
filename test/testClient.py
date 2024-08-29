@@ -9,6 +9,9 @@ from logging import getLogger
 from pathlib import Path
 from traceback import format_exception
 
+import zmq.constants as z_const
+import zmq.auth
+
 base_path = Path(__file__).parent
 sys.path.append(base_path.parent.as_posix())
 
@@ -18,6 +21,18 @@ from gaterpc.utils import check_socket_addr
 
 import testSettings
 
+
+curve_dir = Path(__file__).parent.joinpath("curvekey/")
+if curve_dir.exists():
+    g_public, _ = zmq.auth.load_certificate(
+        curve_dir.joinpath("gate.key")
+    )
+    cw_public, cw_secret = zmq.auth.load_certificate(
+        curve_dir.joinpath("cw.key_secret")
+    )
+else:
+    g_public = b""
+    cw_public = cw_secret = b""
 
 Settings.configure("USER_SETTINGS", testSettings)
 logger = getLogger("commands")
@@ -37,13 +52,16 @@ def cleanup_t(t: asyncio.Task):
 
 async def client(frontend_addr):
     loop = asyncio.get_running_loop()
-    gr_cli = Client(
-        zap_mechanism=Settings.ZAP_MECHANISM_PLAIN.decode("utf-8"),
-        zap_credentials=(
-            Settings.ZAP_PLAIN_DEFAULT_USER,
-            Settings.ZAP_PLAIN_DEFAULT_PASSWORD
+    if cw_secret:
+        Settings.ZMQ_SOCK.update(
+            {
+                z_const.CURVE_SECRETKEY: cw_secret,
+                z_const.CURVE_PUBLICKEY: cw_public,
+                z_const.CURVE_SERVERKEY: g_public,
+            }
         )
-    )
+    Settings.MESSAGE_MAX = 10000  # 参考ZMQ HWM
+    gr_cli = Client()
     await gr_cli.connect(check_socket_addr(frontend_addr))
     await asyncio.sleep(5)
     logger.info(await gr_cli.GateRPC.get_interfaces())
