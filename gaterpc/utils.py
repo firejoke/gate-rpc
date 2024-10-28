@@ -8,20 +8,23 @@ import copy
 import functools
 import inspect
 import io
+import ipaddress
 import lzma
 import os
 import platform
 import queue
 import selectors
+import socket
 import struct
 import sys
 import threading
 import time
+import uuid
 import warnings
 
 import zlib
 
-from logging import Handler, getLogger
+from logging import Formatter, Handler, getLogger
 from multiprocessing import Manager
 from multiprocessing.managers import (
     ArrayProxy, DictProxy, ListProxy,
@@ -94,35 +97,60 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
     return socket_addr
 
 
-def to_bytes(s: Union[str, bytes, float, int]) -> bytes:
+class MulticastProtocol(asyncio.DatagramProtocol):
+    def __init__(self, recv_callback: Callable[[bytes, tuple]]):
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.recv_callback = recv_callback
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def connection_lost(self, exc):
+        if self.transport:
+            self.transport.close()
+
+    def datagram_received(self, data, addr):
+        self.recv_callback(data, addr)
+
+
+def to_bytes(s: Union[str, bytes, float, int], fmt: str = None) -> bytes:
     if isinstance(s, bytes):
         return s
     if isinstance(s, str):
         return s.encode("utf-8")
-    fmt = "!d"
-    if isinstance(s, int):
-        if -128 <= s <= 127:
-            fmt = "!b"
-        elif -32768 <= s <= 32767:
-            fmt = "!h"
-        elif -2147483648 <= s <= 2147483647:
-            fmt = "!i"
+    if fmt is None:
+        if isinstance(s, float):
+            fmt = "!d"
+        if isinstance(s, int):
+            if -128 <= s <= 127:
+                fmt = "!b"
+            elif -32768 <= s <= 32767:
+                fmt = "!h"
+            elif -2147483648 <= s <= 2147483647:
+                fmt = "!i"
     return struct.pack(fmt, s)
 
 
-def from_bytes(b: bytes) -> Union[str, float, int]:
-    fmt = {
-        1: "!b",
-        2: "!h",
-        4: "!i",
-        8: "!d"
-    }
-    if b_len := len(b) in fmt:
-        try:
+def from_bytes(b: bytes, to_num: bool = False) -> Union[str, float, int]:
+    if to_num:
+        fmt = {
+            1: "!b",
+            2: "!h",
+            4: "!i",
+            8: "!d"
+        }
+        if (b_len := len(b)) in fmt:
             return struct.unpack(fmt[b_len], b)[0]
-        except struct.error:
-            pass
-    return b.decode("utf-8")
+        else:
+            raise TypeError(
+                "The length of the original byte string is not matching."
+            )
+    else:
+        return b.decode("utf-8")
+
+
+def name2uuid(name):
+    return uuid.uuid5(uuid.NAMESPACE_DNS, name)
 
 
 def encrypt(data):
@@ -400,6 +428,60 @@ class LazyAttribute:
             self._raw = self._process(instance, value)
         else:
             self._raw = value
+
+
+class ColorFormatter(Formatter):
+
+    @staticmethod
+    def colorize(text='', opts=(), **kwargs):
+        color_names = (
+            'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan',
+            'white'
+        )
+        foreground = {color_names[x]: '3%s' % x for x in range(8)}
+        background = {color_names[x]: '4%s' % x for x in range(8)}
+
+        reset = '0'
+        opt_dict = {
+            'bold': '1', 'underscore': '4', 'blink': '5', 'reverse': '7',
+            'conceal': '8'
+        }
+        code_list = []
+        if text == '' and len(opts) == 1 and opts[0] == 'reset':
+            return '\x1b[%sm' % reset
+        for k, v in list(kwargs.items()):
+            if k == 'fg':
+                code_list.append(foreground[v])
+            elif k == 'bg':
+                code_list.append(background[v])
+        for o in opts:
+            if o in opt_dict:
+                code_list.append(opt_dict[o])
+        if 'noreset' not in opts:
+            text = '%s\x1b[%sm' % (text or '', reset)
+        return '%s%s' % (('\x1b[%sm' % ';'.join(code_list)), text or '')
+
+    @classmethod
+    def set_color(cls, levelname, msg):
+        if levelname in ("CRITICAL", "FATAL"):
+            msg = cls.colorize(msg, fg="red", opts=("bold", "reverse"))
+        elif levelname == "ERROR":
+            msg = cls.colorize(msg, fg="red", opts=("bold",))
+        elif levelname in ("WARN", "WARNING"):
+            msg = cls.colorize(msg, fg="yellow", opts=("bold",))
+        elif levelname == "INFO":
+            msg = cls.colorize(msg, fg="green")
+        elif levelname == "DEBUG":
+            msg = cls.colorize(msg, fg="magenta", opts=("bold",))
+        return msg
+
+    def format(self, record):
+        record.msg = self.set_color(record.levelname, record.msg)
+        return super(ColorFormatter, self).format(record)
+
+    def formatException(self, ei):
+        msg = super(ColorFormatter, self).formatException(ei)
+        return self.colorize(msg, fg="red", opts=("bold", "reverse"))
 
 
 class QueueListener(object):

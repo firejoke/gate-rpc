@@ -3,6 +3,9 @@
 # Created Date: 2023/3/30 11:09
 import asyncio
 import inspect
+import secrets
+import socket
+import struct
 import sys
 from abc import ABC, abstractmethod
 from collections import deque
@@ -10,8 +13,8 @@ from collections.abc import Coroutine, Callable, AsyncGenerator, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from traceback import format_exception, format_tb
 from typing import Annotated, Any, List, Tuple, Union, overload, Optional
-from uuid import uuid4
 from logging import getLogger
+from uuid import uuid4
 
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
@@ -28,22 +31,25 @@ from .exceptions import (
     RemoteException,
 )
 from .utils import (
-    HugeData, LRUCache, MsgUnpackError, StreamReply,
+    MulticastProtocol, HugeData, LRUCache, MsgUnpackError, StreamReply,
     check_socket_addr, Empty, empty, generator_to_agenerator,
     throw_exception_agenerator,
     interface, run_in_executor, from_bytes, msg_pack, msg_unpack, to_bytes,
+    name2uuid
 )
 
 
 __all__ = [
-    "Context", "Worker", "RemoteWorker", "RemoteGateRPC",
-    "Service", "GateClusterService", "AMajordomo", "Client",
-    "AsyncZAPService"
+    "AsyncZAPService", "Context",
+    "Worker", "RemoteWorker", "Service", "AMajordomo", "Client",
+    "Gate", "RemoteGate", "GateClusterService",
+
 ]
 
 logger = getLogger("gaterpc")
 Wlogger = getLogger("gaterpc.worker")
 Mlogger = getLogger("gaterpc.majordomo")
+Glogger = getLogger("gaterpc.gate")
 Clogger = getLogger("gaterpc.client")
 
 
@@ -182,7 +188,7 @@ class RemoteWorker(ABCWorker):
         identity: bytes,
         heartbeat: int,
         max_allowed_request: int,
-        socket: z_aio.Socket,
+        sock: z_aio.Socket,
         mdp_version: bytes,
         service: "ABCService"
     ) -> None:
@@ -191,14 +197,14 @@ class RemoteWorker(ABCWorker):
         :param identity: 远程 worker 的id
         :param heartbeat: 和远程 worker 的心跳间隔，单位是毫秒
         :param max_allowed_request: 能处理的最大请求数
-        :param socket: socket
+        :param sock: sock
         :param mdp_version: MDP版本
-        :param service: 该 worker 提供的服务
+        :param service: 该 worker 属于哪个服务
         """
         self.identity = identity
-        self.socket = socket
+        self.sock = sock
         self.mdp_version = mdp_version
-        self.ready = False
+        self.ready = True
         self.service = service
         if heartbeat:
             self.heartbeat = heartbeat
@@ -229,7 +235,7 @@ class Worker(ABCWorker):
         self,
         broker_addr: str,
         service: "Service",
-        identity: str = "gw",
+        identity: str = None,
         heartbeat: int = None,
         context: Context = None,
         zap_mechanism: Union[str, bytes] = None,
@@ -254,8 +260,11 @@ class Worker(ABCWorker):
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = asyncio.get_event_loop()
-
-        self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
+        if not identity:
+            identity = f"gw{secrets.token_hex(8)}"
+        self.identity = name2uuid(identity).bytes
+        if Settings.DEBUG > 1:
+            Wlogger.debug(f"Worker id: {self.identity}")
         self.service = service
         self.ready = False
         self._broker_addr = check_socket_addr(broker_addr)
@@ -544,26 +553,16 @@ class Worker(ABCWorker):
             exception = e
         option = (client_id, b"", request_id)
         if isinstance(result, HugeData):
-            task = self._loop.create_task(
-                self.send_hugedata(option, result),
-                name=f"SendHD-{client_id}-{request_id}"
-            )
+            await self.send_hugedata(option, result),
         elif isinstance(result, AsyncGenerator):
-            task = self._loop.create_task(
-                self.send_agenerator(option, result),
-                name=f"SendAG-{client_id}-{request_id}"
-            )
+            await self.send_agenerator(option, result),
         else:
             reply = msg_pack(
                 await generate_reply(result=result, exception=exception)
             )
-            task = self._loop.create_task(
-                self.send_to_majordomo(
+            await self.send_to_majordomo(
                     Settings.MDP_COMMAND_REPLY, option, reply
                 )
-            )
-        self.sent_tasks.add(task)
-        task.add_done_callback(self.cleanup_sent)
 
     async def recv(self):
         try:
@@ -699,7 +698,7 @@ class Service(ABCService):
 
     async def release_worker(self, worker: ABCWorker):
         if worker.identity in self.workers and worker.is_alive():
-            if worker.max_allowed_request == 0:
+            if worker.max_allowed_request >= 0:
                 await self.idle_workers.put(worker.identity)
             worker.max_allowed_request += 1
 
@@ -724,7 +723,7 @@ class Service(ABCService):
         worker = worker_class(
             workers_addr,
             self,
-            identity=f"{self.name}_Worker",
+            identity=f"{self.name}Worker-{secrets.token_hex(8)}",
             heartbeat=workers_heartbeat,
             context=context,
             zap_mechanism=zap_mechanism,
@@ -1053,106 +1052,32 @@ def parse_zap_frame(messages):
         return None
 
 
-class RemoteGateRPC(RemoteWorker):
+class RemoteGate(RemoteWorker):
 
     def __init__(
         self,
         identity: bytes,
         heartbeat: int,
-        socket: z_aio.Socket,
-        mdp_version: bytes,
-        service: "GateClusterService",
-        work_services: list[str]
+        sock: z_aio.Socket,
+        member_version: bytes,
+        cluster: "GateClusterService",
+        active_services: dict[str, int],
     ):
         """
         远程 GateRPC 的本地映射
-        :param identity:
-        :param heartbeat:
-        :param service:
+        :param identity: Gate ID
+        :param heartbeat: 心跳间隔
+        :param member_version: 成员协议版本
+        :param cluster: GateCluster 服务实例
+        :param active_services: 工作服务
         """
         super().__init__(
             identity, heartbeat,
-            Settings.MESSAGE_MAX, socket, mdp_version,
-            service
+            Settings.MESSAGE_MAX, sock, member_version,
+            cluster
         )
-        self.work_services = work_services
+        self.active_services = active_services
         self.addr = None
-
-
-class GateClusterService(ABCService):
-
-    def __init__(self, local_gate: "AMajordomo"):
-        self.local_gate = local_gate
-        self.name = Settings.GATE_CLUSTER_NAME
-        self.description = Settings.GATE_CLUSTER_DESCRIPTION
-        self.services: dict[str, deque[bytes]] = dict()
-        self.workers: dict[bytes, RemoteGateRPC] = dict()
-        self.idle_workers: deque[bytes] = deque()
-        self.unready_gates: dict[bytes, str] = dict()
-
-    def add_worker(self, gate: Optional[RemoteGateRPC]) -> None:
-        if gate.identity in self.unready_gates:
-            gate.addr = self.unready_gates.pop(gate.identity, None)
-        self.workers[gate.identity] = gate
-        for service in gate.work_services:
-            if service not in self.services:
-                self.services[service] = deque()
-            self.services[service].append(gate.identity)
-        self.idle_workers.appendleft(gate.identity)
-        self.running = True
-
-    def remove_worker(self, gate: Optional[RemoteGateRPC]) -> None:
-        if gate.identity in self.workers:
-            self.workers.pop(gate.identity)
-        if gate.identity in self.idle_workers:
-            self.idle_workers.remove(gate.identity)
-        for service in gate.work_services:
-            if gate.identity in (idle_workers := self.services[service]):
-                idle_workers.remove(gate.identity)
-        if not self.workers:
-            self.running = False
-
-    def get_workers(self) -> dict[bytes, Union[RemoteGateRPC]]:
-        return self.workers
-
-    async def acquire_idle_worker(self) -> Optional[RemoteGateRPC]:
-        return await self.acquire_service_idle_worker(self.name)
-
-    async def acquire_service_idle_worker(
-        self, service: str
-    ) -> Optional[RemoteGateRPC]:
-        if service == self.name:
-            idle_gates = self.idle_workers
-        else:
-            idle_gates = self.services[service]
-        try:
-            while 1:
-                gate = self.workers[(g_id := idle_gates.pop())]
-                self.idle_workers.remove(g_id)
-                if gate.is_alive() and gate.max_allowed_request != 0:
-                    gate.max_allowed_request -= 1
-                    return gate
-        except IndexError:
-            return None
-
-    async def release_worker(self, gate: RemoteGateRPC):
-        return await self.release_service_worker(self.name, gate)
-
-    async def release_service_worker(
-        self, service: str,
-        gate: RemoteGateRPC
-    ):
-        if (
-                gate.identity in self.workers
-                and gate.is_alive()
-        ):
-            if service == self.name:
-                idle_gates = self.idle_workers
-            else:
-                idle_gates = self.services[service]
-            if gate.identity not in idle_gates:
-                gate.max_allowed_request += 1
-                idle_gates.appendleft(gate.identity)
 
 
 class AMajordomo:
@@ -1169,59 +1094,46 @@ class AMajordomo:
     def __init__(
         self,
         *,
-        identity: str = "gm",
+        identity: str = None,
         context: Context = None,
         heartbeat: int = None,
-        gate_zap_mechanism: Union[str, bytes] = None,
-        gate_zap_credentials: tuple = None,
         thread_executor: ThreadPoolExecutor = None,
         process_executor: ProcessPoolExecutor = None
     ):
         """
-        :param identity: 用于在集群时的识别id
-        :param context: 用于在使用 inproc 时使用同一上下文
+        :param identity: 用于识别的id
+        :param context: 在使用 inproc 时使用同一上下文
         :param heartbeat: 需要和后端服务保持的心跳间隔，单位是毫秒。
         """
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = asyncio.get_event_loop()
-
-        self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
+        if not identity:
+            identity = f"gm-{secrets.token_hex(8)}"
+        self.identity = name2uuid(identity).bytes
+        if Settings.DEBUG > 1:
+            Mlogger.debug(f"AMajordomo id: {self.identity}")
         if not context:
             context = Context()
         self.ctx = context
         set_ctx(self.ctx)
         # frontend
         self.frontend: Optional[z_aio.Socket] = None
-        self.clients = set()
-        self.frontend_tasks = set()
+        self.clients: set[bytes] = set()
+        self.frontend_tasks: set[asyncio.Task] = set()
         # backend
         self.backend: Optional[z_aio.Socket] = None
         self.services: dict[str, ABCService] = dict()
-        self.workers: dict[bytes, Union[RemoteWorker, RemoteGateRPC]] = dict()
-        self.backend_tasks = set()
+        self.workers: dict[bytes, RemoteWorker] = dict()
+        self.backend_tasks: set[asyncio.Task] = set()
         # zap
         self.zap: Optional[z_aio.Socket] = None
         self.zap_addr: str = ""
         self.zap_domain: bytes = b""
         self.zap_replies: dict[bytes, asyncio.Future] = dict()
         self.zap_cache = LRUCache(128)
-        self.zap_tasks = set()
-        # gate
-        self.gate: Optional[z_aio.Socket] = None
-        self.gate_cluster = GateClusterService(self)
-        self.gate_replies: dict[bytes, asyncio.Future] = dict()
-        self.gate_tasks = set()
-        # 被转发的客户端请求和其他代理的请求和客户端id或其他地理的id的映射
-        self.request_map: dict[bytes, bytes] = dict()
-        gate_zap_mechanism, gate_zap_credentials = check_zap_args(
-            gate_zap_mechanism, gate_zap_credentials
-        )
-        if gate_zap_mechanism:
-            self.gate_zap_frames = [gate_zap_mechanism, *gate_zap_credentials]
-        else:
-            self.gate_zap_frames = None
+        self.zap_tasks: set[asyncio.Task] = set()
         # majordomo
         if not heartbeat:
             heartbeat = Settings.MDP_HEARTBEAT_INTERVAL
@@ -1235,9 +1147,15 @@ class AMajordomo:
             self.process_executor = ProcessPoolExecutor()
         else:
             self.process_executor = process_executor
-        self.internal_tasks = set()
+        # 执行内部方法的任务，或者内部子任务
+        self.internal_tasks: dict[
+            asyncio.Task,
+            tuple[Callable[..., Coroutine], str, bool, tuple, dict]
+        ] = dict()
+        # 由内部向后端发起的请求
+        self.internal_requests: dict[bytes, asyncio.Future] = dict()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
-        self.cache_request = dict()
+        self.cache_request: dict[bytes, tuple] = dict()
         self.running = False
         self._poller = z_aio.Poller()
         self._broker_task: Optional[asyncio.Task] = None
@@ -1273,70 +1191,6 @@ class AMajordomo:
     def unbind_backend(self, addr: str) -> None:
         if self.backend:
             self.backend.unbind(check_socket_addr(addr))
-
-    def bind_gate(self, addr: str, sock_opt: dict = None) -> None:
-        if not sock_opt:
-            sock_opt = {z_const.IDENTITY: self.identity}
-        else:
-            sock_opt.update({z_const.IDENTITY: self.identity})
-        self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
-        set_sock(self.gate, sock_opt)
-        self.gate.bind(check_socket_addr(addr))
-
-    def unbind_gate(self, addr: str) -> None:
-        if self.gate:
-            self.gate.unbind(check_socket_addr(addr))
-
-    async def connect_gate(self, addr: str) -> None:
-        if not self.gate:
-            raise RuntimeError("require bind gate_addr")
-        gate_c = self.ctx.socket(z_const.REQ, z_aio.Socket)
-        gate_c.set(z_const.SNDTIMEO, Settings.HEARTBEAT)
-        gate_c.set(z_const.RCVTIMEO, Settings.HEARTBEAT)
-        try:
-            gate_c.connect(check_socket_addr(addr))
-            await asyncio.sleep(1)
-            connect_req = (
-                Settings.GATE_MEMBER,
-                Settings.GATE_COMMAND_RING,
-                *(await self.build_gate_zap_frames()),
-            )
-            connect_req = tuple(to_bytes(s) for s in connect_req)
-            await gate_c.send_multipart(connect_req)
-            replies = await gate_c.recv_multipart()
-        except z_error.Again as error:
-            error = (
-                error.__repr__(),
-                ''.join(format_tb(error.__traceback__))
-            )
-            Mlogger.error("\n".join(error))
-            replies = None
-        finally:
-            gate_c.disconnect(addr)
-            gate_c.close()
-        if replies:
-            try:
-                (
-                    Settings.GATE_VERSION,
-                    command,
-                    *messages,
-                ) = replies
-                if messages := parse_zap_frame(messages):
-                    mechanism, credentials, messages = messages
-                gate_id = messages[0]
-            except ValueError:
-                return
-            else:
-                if gate_id in self.gate_cluster.get_workers():
-                    return
-                self.gate.connect(addr)
-                await asyncio.sleep(0)
-                await self.send_to_gate(
-                    gate_id,
-                    Settings.GATE_COMMAND_READY,
-                    (msg_pack(list(self.services.keys())),)
-                )
-                self.gate_cluster.unready_gates[gate_id] = addr
 
     def connect_zap(
         self,
@@ -1377,13 +1231,7 @@ class AMajordomo:
             self.now_ban(work)
             for work in self.workers.values()
         ]
-        gts = [
-            self.now_ban(gate)
-            for gate in self.gate_cluster.get_workers().values()
-        ]
-        await asyncio.gather(
-            *wts, *gts
-        )
+        await asyncio.gather(*wts)
 
     def close(self):
         self.thread_executor.shutdown()
@@ -1394,6 +1242,9 @@ class AMajordomo:
             self._broker_task = self._loop.create_task(self._broker_loop())
 
     def stop(self):
+        for internal_task in self.internal_tasks:
+            if not internal_task.done():
+                internal_task.cancel("AMajordomo Stop.")
         if self._broker_task:
             if not self._broker_task.cancelled():
                 self._broker_task.cancel()
@@ -1406,10 +1257,6 @@ class AMajordomo:
             self._poller.unregister(self.backend)
             self.backend.close()
             self.backend = None
-        if self.gate:
-            self._poller.unregister(self.gate)
-            self.gate.close()
-            self.gate = None
         if self.zap:
             self.disconnect_zap()
             self._poller.unregister(self.zap)
@@ -1447,15 +1294,14 @@ class AMajordomo:
         self.services[service.name] = service
 
     async def register_worker(
-        self, worker_id, max_allowed_request, socket, mdp_version, service
+        self, worker_id, max_allowed_request, sock, service
     ):
         worker = self.RemoteWorkerClass(
             worker_id, self.heartbeat,
-            max_allowed_request, socket,
-            mdp_version, service
+            max_allowed_request, sock,
+            Settings.MDP_WORKER, service
         )
         worker.prolong(self._loop.time())
-        worker.ready = True
         worker.destroy_task = self._loop.create_task(
             self.ban_at_expiration(worker)
         )
@@ -1481,95 +1327,40 @@ class AMajordomo:
         self.workers.pop(worker.identity, None)
         return True
 
-    async def register_gate(
-        self, gate_id, socket, mdp_version, work_services
-    ):
-        gate = RemoteGateRPC(
-            gate_id, self.heartbeat,
-            socket, mdp_version,
-            self.gate_cluster,
-            work_services
-        )
-        gate.prolong(self._loop.time())
-        gate.ready = True
-        gate.destroy_task = self._loop.create_task(
-            self.ban_at_expiration(gate)
-        )
-        self.gate_cluster.add_worker(gate)
-
-    async def ban_gate(self, gate: RemoteGateRPC):
-        """
-        和 ban_worker 分开，方便以后加逻辑
-        """
-        Mlogger.warning(f"ban gate({gate.identity}).")
-        if gate.is_alive():
-            await self.send_to_gate(
-                gate.identity,
-                Settings.GATE_COMMAND_DISCONNECT,
-            )
-            gate.ready = False
-            gate.heartbeat_task.cancel()
-        self.gate_cluster.remove_worker(gate)
-        if gate.addr:
-            self.gate.disconnect(gate.addr)
-        return True
-
-    async def ban_at_expiration(
-        self, worker: Union[RemoteWorker, RemoteGateRPC]
-    ):
+    async def ban_at_expiration(self, worker: RemoteWorker):
         while 1:
             if worker.expiry <= self._loop.time():
-                Mlogger.debug(f"ban ({worker.identity}) at expiration")
-                if isinstance(worker, RemoteGateRPC):
-                    await self.ban_gate(worker)
-                elif isinstance(worker, self.RemoteWorkerClass):
-                    await self.ban_worker(worker)
+                Mlogger.debug(f"ban worker({worker.identity}) at expiration")
+                await self.ban_worker(worker)
                 return
             await asyncio.sleep(
                 1e-3 * worker.heartbeat * worker.heartbeat_liveness
             )
 
-    async def now_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
-        Mlogger.debug(f"now ban ({worker.identity})")
+    async def now_ban(self, worker: RemoteWorker):
+        Mlogger.debug(f"now ban worker({worker.identity})")
         if worker.destroy_task:
             worker.destroy_task.cancel()
-        if isinstance(worker, RemoteGateRPC):
-            await self.ban_gate(worker)
-        elif isinstance(worker, self.RemoteWorkerClass):
-            await self.ban_worker(worker)
+        await self.ban_worker(worker)
 
-    async def delay_ban(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+    async def delay_ban(self, worker: RemoteWorker):
         worker.prolong(self._loop.time())
 
-    async def send_heartbeat(self, worker: Union[RemoteWorker, RemoteGateRPC]):
+    async def send_heartbeat(self, worker: RemoteWorker):
         while 1:
             time_from_last_message = (
                     self._loop.time() - worker.last_message_sent_time
             )
             if time_from_last_message >= 1e-3 * worker.heartbeat:
-                if isinstance(worker, self.RemoteWorkerClass):
-                    await self.send_to_backend(
-                        worker.identity,
-                        Settings.MDP_COMMAND_HEARTBEAT
-                    )
-                elif isinstance(worker, RemoteGateRPC):
-                    await self.send_to_gate(
-                        worker.identity,
-                        Settings.MDP_COMMAND_HEARTBEAT
-                    )
+                await self.send_to_backend(
+                    worker.identity,
+                    Settings.MDP_COMMAND_HEARTBEAT
+                )
                 await asyncio.sleep(1e-3 * worker.heartbeat)
             else:
                 await asyncio.sleep(
                     1e-3 * worker.heartbeat - time_from_last_message
                 )
-
-    def cleanup_internal_task(self, task: asyncio.Task):
-        self.internal_tasks.remove(task)
-        if exception := task.exception():
-            exception_info = ''.join(format_tb(exception.__traceback__))
-            exception_info = (f"{exception.__class__}:{exception.__repr__()}"
-                              f"\n{exception_info}")
-            Mlogger.warning(f"internal task exception:\n{exception_info}")
 
     def cleanup_frontend_task(self, task: asyncio.Task):
         self.frontend_tasks.remove(task)
@@ -1587,22 +1378,55 @@ class AMajordomo:
                               f"\n{exception_info}")
             Mlogger.warning(f"backend task exception:\n{exception_info}")
 
-    def cleanup_gate_task(self, task: asyncio.Task):
-        self.gate_tasks.remove(task)
+    def create_internal_task(
+        self, coro_func: Callable[..., Coroutine], name=None, reload=False,
+        func_args=None, func_kwargs=None
+    ):
+        if Settings.DEBUG > 1:
+            Mlogger.debug(
+                f"create internal task<{coro_func} name={name} reload={reload} "
+                f"func_args={func_args} func_kwargs={func_kwargs}"
+            )
+        if func_args is None:
+            func_args = tuple()
+        if func_kwargs is None:
+            func_kwargs = dict()
+        task = self._loop.create_task(
+            coro_func(*func_args, **func_kwargs), name=name
+        )
+        self.internal_tasks[task] = (
+            coro_func, name, reload, func_args, func_kwargs
+        )
+        task.add_done_callback(self.cleanup_internal_task)
+
+    def cleanup_internal_task(self, task: asyncio.Task):
+        coro_func, name, reload, args, kwargs = self.internal_tasks.pop(task)
         if exception := task.exception():
-            exception_info = "".join(format_tb(exception.__traceback__))
+            exception_info = ''.join(format_tb(exception.__traceback__))
             exception_info = (f"{exception.__class__}:{exception.__repr__()}"
                               f"\n{exception_info}")
-            Mlogger.warning(f"gate task exception:\n{exception_info}")
+            Mlogger.warning(f"internal task exception:\n{exception_info}")
+            if isinstance(exception, asyncio.CancelledError):
+                return
+        if reload:
+            if Settings.DEBUG:
+                Mlogger.debug(f"recreate task from {coro_func}")
+            self.create_internal_task(
+                coro_func, name, reload, args, kwargs
+            )
 
-    async def internal_process(
+    async def internal_interface(
         self, client_id: bytes, request_id: bytes, func_name, args, kwargs
     ):
+        if client_id not in self.clients:
+            if Settings.DEBUG > 2:
+                raise RuntimeError(f"client_id({client_id}) not in clients")
+            return
         reply = None
         exception = None
         kwargs.update({
-            "client_id": client_id,
-            "request_id": request_id,
+            "__client_id": client_id,
+            "__request_id": request_id,
         })
         try:
             if not self.internal_func.get(func_name, None):
@@ -1637,54 +1461,29 @@ class AMajordomo:
         except Exception as error:
             exception = error
         reply = await generate_reply(result=reply, exception=exception)
-        if client_id in self.clients:
-            if isinstance(reply, HugeData):
-                task = self._loop.create_task(
-                    self.reply_hugedata(
-                        client_id, request_id, self.reply_frontend, reply
-                    ),
-                    name=f"MajordomoReplyCliHD-{client_id}-{request_id}"
+        if isinstance(reply, HugeData):
+            task = self._loop.create_task(
+                self.reply_hugedata(
+                    client_id, request_id, self.reply_frontend, reply
+                ),
+                name=f"MajordomoReplyCliHD-{client_id}-{request_id}"
+            )
+        elif isinstance(reply, AsyncGenerator):
+            task = self._loop.create_task(
+                self.reply_agenerator(
+                    client_id, request_id, self.reply_frontend, reply
+                ),
+                name=f"MajordomoReplyCliAG-{client_id}-{request_id}"
+            )
+        else:
+            task = self._loop.create_task(
+                self.reply_frontend(
+                    client_id, Settings.MDP_INTERNAL_SERVICE,
+                    request_id, msg_pack(reply)
                 )
-            elif isinstance(reply, AsyncGenerator):
-                task = self._loop.create_task(
-                    self.reply_agenerator(
-                        client_id, request_id, self.reply_frontend, reply
-                    ),
-                    name=f"MajordomoReplyCliAG-{client_id}-{request_id}"
-                )
-            else:
-                task = self._loop.create_task(
-                    self.reply_frontend(
-                        client_id, Settings.MDP_INTERNAL_SERVICE,
-                        request_id, msg_pack(reply)
-                    )
-                )
-            self.frontend_tasks.add(task)
-            task.add_done_callback(self.cleanup_frontend_task)
-        elif client_id in self.gate_cluster.get_workers():
-            if isinstance(reply, HugeData):
-                task = self._loop.create_task(
-                    self.reply_hugedata(
-                        client_id, request_id, self.reply_gate, reply
-                    ),
-                    name=f"MajordomoReplyGateHD-{client_id}-{request_id}"
-                )
-            elif isinstance(reply, AsyncGenerator):
-                task = self._loop.create_task(
-                    self.reply_agenerator(
-                        client_id, request_id, self.reply_gate, reply
-                    ),
-                    name=f"MajordomoReplyGateAG-{client_id}-{request_id}"
-                )
-            else:
-                task = self._loop.create_task(
-                    self.reply_gate(
-                        client_id, Settings.MDP_INTERNAL_SERVICE,
-                        request_id, msg_pack(reply)
-                    )
-                )
-            self.gate_tasks.add(task)
-            task.add_done_callback(self.cleanup_gate_task)
+            )
+        self.frontend_tasks.add(task)
+        task.add_done_callback(self.cleanup_frontend_task)
 
     async def reply_hugedata(self, client_id, request_id, reply_func, hugedata):
         try:
@@ -1763,16 +1562,6 @@ class AMajordomo:
                 Settings.STREAM_EXCEPT_TAG,
                 e
             )
-
-    async def build_gate_zap_frames(self) -> tuple[bytes, ...]:
-        """
-        用于继承后根据 ZAP 校验方法构建 ZAP 凭据帧，
-        使用协程是为了方便使用 loop.run_in_executor
-        """
-        if self.gate_zap_frames:
-            return tuple(to_bytes(z) for z in self.gate_zap_frames)
-        else:
-            return tuple()
 
     async def request_zap(
         self, identity: bytes, address: bytes, request_id: bytes,
@@ -1863,324 +1652,55 @@ class AMajordomo:
                 f"done: {future.done()}, cancelled: {future.cancelled()}"
             )
 
-    async def process_messages_from_gate(self, messages):
+    async def process_ready_command(self, worker_id, service_info):
         try:
-            (
-                gate_id,
-                empty_frame,
-                gate_version,
-                command,
-                *messages
-            ) = messages
-            if empty_frame or gate_version != Settings.GATE_MEMBER:
+            service_name, service_description, max_allowed_request = (
+                from_bytes(service_info)
+            ).split(Settings.MDP_DESCRIPTION_SEP)
+            max_allowed_request = int(max_allowed_request)
+        except ValueError:
+            return
+        if service_name not in self.services:
+            self.register_service(service_name, service_description)
+        service = self.services[service_name]
+        await self.register_worker(
+            worker_id, max_allowed_request,
+            self.backend, service
+        )
+
+    async def process_heartbeat_command_from_backend(self, worker):
+        if not worker.ready:
+            return await self.now_ban(worker)
+        await self.delay_ban(worker)
+
+    async def process_reply_command_from_backend(self, service_name, messages):
+        try:
+            client_id, empty_frame, request_id, *body = messages
+            if empty_frame:
                 return
         except ValueError:
             return
-
-        if Settings.DEBUG > 1:
-            Mlogger.debug(
-                f"gate id: {gate_id}\n"
-                f"command: {command}\n"
-                f"messages: {messages}\n"
-            )
-
-        if self.zap:
-            if messages := parse_zap_frame(messages):
-                mechanism, credentials, messages = messages
-            else:
-                return
-        else:
-            mechanism = credentials = None
-
-        if not (gate := self.gate_cluster.get_workers().get(gate_id, None)):
-            Mlogger.warning(f"The gate({gate_id}) was not registered.")
-        if command == Settings.GATE_COMMAND_RING:
-            if mechanism:
-                request_id = b"gate_ring"
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-            self.gate_tasks.add(
+        if request_id in self.internal_requests:
+            self.internal_requests[request_id].set_result(body)
+        elif client_id in self.clients:
+            self.frontend_tasks.add(
                 task := self._loop.create_task(
-                    self.send_to_gate(
-                        gate_id,
-                        Settings.GATE_COMMAND_REPLY,
-                        (self.identity,)
+                    self.reply_frontend(
+                        client_id, service_name, request_id, *body
                     )
                 )
             )
-            task.add_done_callback(self.cleanup_gate_task)
+            task.add_done_callback(self.cleanup_frontend_task)
 
-        elif command == Settings.GATE_COMMAND_READY:
-            if mechanism:
-                request_id = b"gate_ready"
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-            if gate:
-                return await self.now_ban(gate)
-            try:
-                work_services = msg_unpack(messages[0])
-            except MsgUnpackError:
-                return
-            if gate_id not in self.gate_cluster.unready_gates:
-                self.gate_tasks.add(
-                    task := self._loop.create_task(
-                        self.send_to_gate(
-                            gate_id,
-                            Settings.GATE_COMMAND_READY,
-                            (msg_pack(list(self.services.keys())),)
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_gate_task)
-            await self.register_gate(
-                gate_id, self.gate,
-                gate_version, work_services
-            )
-
-        elif command == Settings.GATE_COMMAND_HEARTBEAT:
-            if messages:
-                return
-            if mechanism:
-                request_id = b"gate_heartbeat"
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-            else:
-                zap_result = True
-            if gate:
-                if not gate.ready or not zap_result:
-                    return await self.now_ban(gate)
-                await self.delay_ban(gate)
-
-        elif command == Settings.GATE_COMMAND_REQUEST:
-            try:
-                (
-                    service_name,
-                    request_id,
-                    *body
-                ) = messages
-            except MsgUnpackError:
-                return
-            if mechanism:
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-
-            service_name = from_bytes(service_name)
-            if service_name == Settings.MDP_INTERNAL_SERVICE:
-                func_name, *body = body
-                func_name = msg_unpack(func_name)
-                if not body:
-                    args, kwargs = tuple(), dict()
-                elif len(body) == 1:
-                    args, kwargs = msg_unpack(body[0]), dict()
-                elif len(body) == 2:
-                    args, kwargs = (msg_unpack(b) for b in body)
-                else:
-                    return
-                self.internal_tasks.add(
-                    task := self._loop.create_task(
-                        self.internal_process(
-                            gate_id, request_id, func_name, args, kwargs
-                        ),
-                        name=f"InternalFunc({func_name})-{gate_id}-{request_id}"
-                    )
-                )
-                task.add_done_callback(self.cleanup_internal_task)
-            else:
-                self.backend_tasks.add(
-                    task := self._loop.create_task(
-                        self.request_backend(
-                            service_name, gate_id,
-                            request_id, body
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_backend_task)
-
-        elif command == Settings.GATE_COMMAND_REPLY:
-            try:
-                service_name, request_id, *body = messages
-            except ValueError:
-                return
-            if mechanism:
-                # 流式回复的request_id是不变的
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result and Settings.DEBUG:
-                    Mlogger.warning(
-                        f"ZAP verification of Gate({gate_id})"
-                        f" fails,'{mechanism}' mechanism is used, and the "
-                        f"credential is '{credentials}', and the request_id "
-                        f"is '{request_id}'"
-                    )
-                    return
-            if not gate:
-                return
-            if not gate.ready:
-                return await self.now_ban(gate)
-            await self.delay_ban(gate)
-            if client_id := self.request_map.get(request_id, None):
-                if client_id in self.clients:
-                    self.frontend_tasks.add(
-                        task := self._loop.create_task(
-                            self.reply_frontend(
-                                client_id, service_name,
-                                request_id, *body
-                            )
-                        )
-                    )
-                    task.add_done_callback(self.cleanup_frontend_task)
-                elif client_id in self.gate_cluster.get_workers():
-                    self.gate_tasks.add(
-                        task := self._loop.create_task(
-                            self.reply_gate(
-                                client_id, service_name,
-                                request_id, *body
-                            )
-                        )
-                    )
-                    task.add_done_callback(self.cleanup_gate_task)
-
-            elif request_id in self.gate_replies:
-                if len(body) == 1:
-                    body = msg_unpack(body[0])
-                    self.gate_replies[request_id].set_result(body)
-                elif len(body) > 1:
-                    *option, body = body
-                    if option[0] == Settings.STREAM_GENERATOR_TAG:
-                        if not (reply := self.gate_replies[request_id]).done():
-                            stream_reply = StreamReply(
-                                Settings.STREAM_END_TAG,
-                                maxsize=Settings.STREAM_REPLY_MAXSIZE,
-                                timeout=Settings.REPLY_TIMEOUT
-                            )
-                            self.gate_replies[request_id].set_result(
-                                stream_reply
-                            )
-                        else:
-                            stream_reply = reply.result()
-                        if (len(option) > 1 and option[1] ==
-                                Settings.STREAM_EXCEPT_TAG):
-                            exc = RemoteException(msg_unpack(body))
-                            await throw_exception_agenerator(
-                                stream_reply, exc
-                            )
-                        else:
-                            if body != Settings.STREAM_END_TAG:
-                                body = msg_unpack(body)
-                            await stream_reply.asend(body)
-                    elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
-                        if not (reply := self.gate_replies[request_id]).done():
-                            huge_reply = HugeData(
-                                Settings.HUGE_DATA_END_TAG,
-                                Settings.HUGE_DATA_EXCEPT_TAG,
-                                compress_module=(
-                                    Settings.HUGE_DATA_COMPRESS_MODULE
-                                ),
-                                compress_level=(
-                                    Settings.HUGE_DATA_COMPRESS_LEVEL
-                                ),
-                                blksize=Settings.HUGE_DATA_SIZEOF
-                            )
-                            self.gate_replies[request_id].set_result(huge_reply)
-                        else:
-                            huge_reply = reply.result()
-                        await self._loop.run_in_executor(
-                            self.thread_executor, huge_reply.add_data, body
-                        )
-
-        elif command == Settings.GATE_COMMAND_DISCONNECT:
-            if mechanism:
-                request_id = b"gate_disconnect"
-                zap_result = await self.request_zap(
-                    gate_id, gate_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-            if gate:
-                gate.ready = False
-                gate.expiry = self._loop.time()
-                await self.now_ban(gate)
-
-    async def request_gate(
-        self,
-        request_id: bytes,
-        service: str,
-        body: tuple[Union[bytes, str], ...]
-    ):
-        if not self.gate_cluster.get_workers():
-            raise GateUnAvailableError()
-        elif gate := await self.gate_cluster.acquire_service_idle_worker(
-                service
-        ):
-            option = (service, request_id)
-            await self.send_to_gate(
-                gate.identity,
-                Settings.GATE_COMMAND_REQUEST,
-                option,
-                body
-            )
-        else:
-            raise BusyGateError()
-
-    async def reply_gate(
-        self,
-        gate_id: bytes,
-        service: str,
-        request_id: bytes,
-        *body,
-    ):
-        await self.send_to_gate(
-            gate_id,
-            Settings.GATE_COMMAND_REPLY,
-            (service, request_id),
-            body
+    async def process_disconnect_command_from_backend(self, worker):
+        worker.ready = False
+        worker.expiry = self._loop.time()
+        Mlogger.warning(
+            f"recv disconnect and ban worker({worker.identity})"
         )
+        await self.now_ban(worker)
 
-    async def send_to_gate(
-        self,
-        gate_id,
-        command: Union[bytes, str],
-        option: tuple[Union[bytes, str], ...] = None,
-        messages: Union[
-            Union[bytes, str], tuple[Union[bytes, str], ...]] = None,
-    ):
-        if isinstance(messages, (bytes, str)):
-            messages = (messages,)
-        elif not messages:
-            messages = tuple()
-        if option:
-            messages = (*option, messages)
-        messages = (
-            gate_id,
-            b"",
-            Settings.GATE_MEMBER,
-            command,
-            *(await self.build_gate_zap_frames()),
-            *messages
-        )
-        messages = tuple(to_bytes(s) for s in messages)
-        await self.gate.send_multipart(messages)
-        if gate := self.gate_cluster.get_workers().get(gate_id):
-            gate.last_message_sent_time = self._loop.time()
-
-    async def process_replies_from_backend(self, replies: list):
+    async def process_messages_from_backend(self, messages: list):
         try:
             (
                 worker_id,
@@ -2188,8 +1708,18 @@ class AMajordomo:
                 mdp_version,
                 command,
                 *messages
-            ) = replies
-            if empty_frame or mdp_version != Settings.MDP_WORKER:
+            ) = messages
+            if (
+                    empty_frame
+                    or mdp_version != Settings.MDP_WORKER
+                    or command not in (
+                        Settings.MDP_COMMAND_READY,
+                        Settings.MDP_COMMAND_HEARTBEAT,
+                        Settings.MDP_COMMAND_REQUEST,
+                        Settings.MDP_COMMAND_REPLY,
+                        Settings.MDP_COMMAND_DISCONNECT
+                    )
+            ):
                 return
         except ValueError:
             return
@@ -2204,124 +1734,54 @@ class AMajordomo:
         if self.zap:
             if messages := parse_zap_frame(messages):
                 mechanism, credentials, messages = messages
+                request_id = b"worker_" + command
+                zap_result = await self.request_zap(
+                    worker_id, worker_id, request_id,
+                    mechanism, credentials
+                )
+                if not zap_result:
+                    if Settings.DEBUG:
+                        Mlogger.warning(
+                            f"ZAP verification of Worker({worker_id})"
+                            f" fails,'{mechanism}' mechanism is used, and the "
+                            f"credential is '{credentials}', and the request_id "
+                            f"is '{request_id}'"
+                        )
+                    return
             else:
                 return
-        else:
-            mechanism = credentials = None
         if not (worker := self.workers.get(worker_id, None)):
             Mlogger.warning(f"The worker({worker_id}) was not registered.")
 
         # MDP 定义的 Worker 命令
-        if command == Settings.MDP_COMMAND_READY:
-            if mechanism:
-                request_id = b"worker_ready"
-                zap_result = await self.request_zap(
-                    worker_id, worker_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-            if len(messages) > 1:
-                return
+        if command == Settings.MDP_COMMAND_READY and len(messages) == 1:
             if worker:
                 return await self.now_ban(worker)
-            try:
-                service_name, service_description, max_allowed_request = (
-                    from_bytes(messages[0])
-                ).split(Settings.MDP_DESCRIPTION_SEP)
-                max_allowed_request = int(max_allowed_request)
-            except ValueError:
-                return
-            if service_name not in self.services:
-                self.register_service(service_name, service_description)
-            service = self.services[service_name]
-            await self.register_worker(
-                worker_id, max_allowed_request,
-                self.backend, mdp_version, service
+            return await self.process_ready_command(
+                worker_id, messages[0]
             )
 
-        elif command == Settings.MDP_COMMAND_HEARTBEAT:
-            if messages:
-                return
-            if mechanism:
-                request_id = b"worker_heartbeat"
-                zap_result = await self.request_zap(
-                    worker_id, worker_id, request_id,
-                    mechanism, credentials
-                )
-            else:
-                zap_result = True
+        elif command == Settings.MDP_COMMAND_HEARTBEAT and worker and not messages:
+            return await self.process_heartbeat_command_from_backend(worker)
 
-            if worker:
-                if not worker.ready or not zap_result:
-                    return await self.now_ban(worker)
-                await self.delay_ban(worker)
-
-        elif command == Settings.MDP_COMMAND_REPLY:
-            try:
-                client_id, empty_frame, request_id, *body = messages
-                if empty_frame:
-                    return
-            except ValueError:
-                return
-            if mechanism:
-                # 流式回复的request_id是不变的
-                zap_result = await self.request_zap(
-                    worker_id, worker_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    Mlogger.warning(
-                        f"ZAP verification of Worker({worker_id})"
-                        f" fails,'{mechanism}' mechanism is used, and the "
-                        f"credential is '{credentials}', and the request_id "
-                        f"is '{request_id}'"
-                    )
-                    return
-            if not worker:
-                return
+        elif command == Settings.MDP_COMMAND_REPLY and worker:
             if not worker.ready:
                 return await self.now_ban(worker)
-            if client_id in self.clients:
-                self.frontend_tasks.add(
-                    task := self._loop.create_task(
-                        self.reply_frontend(
-                            client_id, worker.service.name, request_id, *body
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_frontend_task)
-            if client_id in self.gate_cluster.get_workers():
-                self.gate_tasks.add(
-                    task := self._loop.create_task(
-                        self.reply_gate(
-                            client_id, worker.service.name, request_id, *body
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_gate_task)
+
+            await self.process_reply_command_from_backend(
+                worker.service.name, messages
+            )
             service = worker.service
             await service.release_worker(worker)
             await self.delay_ban(worker)
+            return
 
-        elif command == Settings.MDP_COMMAND_DISCONNECT:
-            if mechanism:
-                request_id = b"worker_disconnect"
-                zap_result = await self.request_zap(
-                    worker_id, worker_id, request_id,
-                    mechanism, credentials
-                )
-                if not zap_result:
-                    return
-            if len(messages) > 1:
-                return
-            if worker:
-                worker.ready = False
-                worker.expiry = self._loop.time()
-                Mlogger.warning(
-                    f"recv disconnect and ban worker({worker.identity})"
-                )
-                await self.now_ban(worker)
+        elif (
+                command == Settings.MDP_COMMAND_DISCONNECT
+                and worker
+                and len(messages) == 1
+        ):
+            return await self.process_disconnect_command_from_backend(worker)
 
     async def request_backend(
         self,
@@ -2345,26 +1805,12 @@ class AMajordomo:
                     )
                 )
                 task.add_done_callback(self.cleanup_backend_task)
-            elif self.gate_cluster.get_workers():
-                # 转发请求其他代理。
-                self.request_map[request_id] = client_id
-                self.gate_tasks.add(
-                    task := self._loop.create_task(
-                        self.request_gate(
-                            request_id, service_name, body
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_gate_task)
             else:
                 raise BusyWorkerError()
-        except (
-                ServiceUnAvailableError, GateUnAvailableError,
-                BusyGateError, BusyWorkerError
-        ) as exception:
-            exception = await generate_reply(exception=exception)
-            except_reply = msg_pack(exception)
+        except (ServiceUnAvailableError, BusyWorkerError) as exception:
             if client_id in self.clients:
+                exception = await generate_reply(exception=exception)
+                except_reply = msg_pack(exception)
                 self.frontend_tasks.add(
                     task := self._loop.create_task(
                         self.reply_frontend(
@@ -2374,16 +1820,6 @@ class AMajordomo:
                     )
                 )
                 task.add_done_callback(self.cleanup_frontend_task)
-            elif client_id in self.gate_cluster.get_workers():
-                self.gate_tasks.add(
-                    task := self._loop.create_task(
-                        self.reply_gate(
-                            client_id, service_name, request_id,
-                            except_reply
-                        )
-                    )
-                )
-                task.add_done_callback(self.cleanup_gate_task)
 
     async def send_to_backend(
         self,
@@ -2409,7 +1845,7 @@ class AMajordomo:
         await self.backend.send_multipart(request)
         self.workers[worker_id].last_message_sent_time = self._loop.time()
 
-    async def process_request_from_frontend(self, request: list):
+    async def process_messages_from_frontend(self, request: list):
         try:
             (
                 client_id,
@@ -2465,16 +1901,11 @@ class AMajordomo:
                 args, kwargs = (msg_unpack(b) for b in body)
             else:
                 return
-            self.internal_tasks.add(
-                task := self._loop.create_task(
-                    self.internal_process(
-                        client_id, request_id,
-                        func_name, args, kwargs
-                    ),
-                    name=f"InternalFun({func_name})-{client_id}-{request_id}"
-                )
+            self.create_internal_task(
+                self.internal_interface,
+                name=f"InternalFun({func_name})-{client_id}-{request_id}",
+                func_args=(client_id, request_id, func_name, args, kwargs)
             )
-            task.add_done_callback(self.cleanup_internal_task)
         else:
             self.backend_tasks.add(
                 task := self._loop.create_task(
@@ -2523,8 +1954,6 @@ class AMajordomo:
                 self._poller.register(self.frontend, z_const.POLLIN)
             if self.backend:
                 self._poller.register(self.backend, z_const.POLLIN)
-            if self.gate:
-                self._poller.register(self.gate, z_const.POLLIN)
             if self.zap:
                 self._poller.register(self.zap, z_const.POLLIN)
             self.running = True
@@ -2535,7 +1964,7 @@ class AMajordomo:
                 if self.backend and self.backend in socks:
                     replies = await self.backend.recv_multipart()
                     bt = self._loop.create_task(
-                        self.process_replies_from_backend(replies),
+                        self.process_messages_from_backend(replies),
                     )
                     self.backend_tasks.add(bt)
                     bt.add_done_callback(self.cleanup_backend_task)
@@ -2544,18 +1973,10 @@ class AMajordomo:
                     replies = await self.frontend.recv_multipart()
                     # 同后端任务处理。
                     ft = self._loop.create_task(
-                        self.process_request_from_frontend(replies),
+                        self.process_messages_from_frontend(replies),
                     )
                     self.frontend_tasks.add(ft)
                     ft.add_done_callback(self.cleanup_frontend_task)
-
-                if self.gate and self.gate in socks:
-                    messages = await self.gate.recv_multipart()
-                    gt = self._loop.create_task(
-                        self.process_messages_from_gate(messages)
-                    )
-                    self.gate_tasks.add(gt)
-                    gt.add_done_callback(self.cleanup_gate_task)
 
                 if self.zap and self.zap in socks:
                     replies = await self.zap.recv_multipart()
@@ -2603,12 +2024,1085 @@ class AMajordomo:
             return b"400"
 
 
+class GateClusterService(ABCService):
+
+    def __init__(self, cluster_name, local_gate: "Gate"):
+        self.name = cluster_name
+        self.identity = name2uuid(cluster_name).bytes
+        self.local_node = local_gate
+        self.description = Settings.GATE_CLUSTER_DESCRIPTION
+        self.services: dict[str, asyncio.Queue[bytes]] = dict()
+        self.workers: dict[bytes, RemoteGate] = dict()
+        self.idle_workers: asyncio.Queue[bytes] = asyncio.Queue()
+        self.unready_gates: dict[bytes, str] = dict()
+
+    def add_worker(self, gate: Optional[RemoteGate]) -> None:
+        if gate.identity in self.unready_gates:
+            gate.addr = self.unready_gates.pop(gate.identity, None)
+        self.workers[gate.identity] = gate
+        for service in gate.active_services:
+            if service not in self.services:
+                self.services[service] = asyncio.Queue()
+            self.services[service].put_nowait(gate.identity)
+        self.idle_workers.put_nowait(gate.identity)
+        self.running = True
+
+    def remove_worker(self, gate: Optional[RemoteGate]) -> None:
+        if gate.identity in self.workers:
+            self.workers.pop(gate.identity)
+
+    def get_workers(self) -> dict[bytes, Union[RemoteGate]]:
+        return {
+            g_id: gate for g_id, gate in self.workers.items()
+            if gate.ready
+        }
+
+    def online_nodes(self) -> list[bytes]:
+        return [self.local_node.identity, *self.get_workers().keys()]
+
+    def remote_nodes(self) -> list[bytes]:
+        return list(self.get_workers().keys())
+
+    def all_nodes(self):
+        nodes = {
+            self.local_node.identity, *self.workers.keys(), 
+            *self.unready_gates.keys()
+        }
+        return list(nodes)
+
+    async def acquire_idle_worker(self) -> Optional[RemoteGate]:
+        return await self.acquire_service_idle_worker(self.name)
+
+    async def acquire_service_idle_worker(
+        self, service: str
+    ) -> Optional[RemoteGate]:
+        if service == self.name:
+            idle_gates = self.idle_workers
+        else:
+            idle_gates = self.services[service]
+        while 1:
+            try:
+                gate_id = await asyncio.wait_for(idle_gates.get(), Settings.TIMEOUT)
+            except asyncio.TimeoutError:
+                return None
+            try:
+                gate = self.workers[gate_id]
+                if gate.is_alive() and gate.active_services[service] != 0:
+                    gate.active_services[service] -= 1
+                    if gate.active_services[service] > 0:
+                        await idle_gates.put(gate_id)
+                    return gate
+            except KeyError:
+                continue
+
+    async def release_worker(self, gate: RemoteGate):
+        return await self.release_service_worker(self.name, gate)
+
+    async def release_service_worker(self, service: str, gate: RemoteGate):
+        if gate.identity in self.workers and gate.is_alive():
+            if service == self.name:
+                idle_gates = self.idle_workers
+            else:
+                idle_gates = self.services[service]
+            if gate.active_services[service] >= 0:
+                await idle_gates.put(gate.identity)
+            gate.active_services[service] += 1
+
+
+class Gate(AMajordomo):
+    GateServiceClass = GateClusterService
+    RemoteGateClass = RemoteGate
+
+    def __init__(
+        self,
+        port: int,
+        *,
+        identity: str = None,
+        context: Context = None,
+        heartbeat: int = None,
+        multicast: bool = True,
+        cluster_name: str = None,
+        gate_zap_mechanism: Union[str, bytes] = None,
+        gate_zap_credentials: tuple = None,
+        thread_executor: ThreadPoolExecutor = None,
+        process_executor: ProcessPoolExecutor = None
+    ):
+        if not identity:
+            identity = f"Gate-{secrets.token_hex(8)}"
+        Glogger.debug(f"Gate: {identity}")
+        if not context:
+            context = Context()
+        gate_zap_mechanism, gate_zap_credentials = check_zap_args(
+            gate_zap_mechanism, gate_zap_credentials
+        )
+        if gate_zap_mechanism:
+            self.gate_zap_frames = [gate_zap_mechanism, *gate_zap_credentials]
+        else:
+            self.gate_zap_frames = None
+        super().__init__(
+            identity=identity, context=context, heartbeat=heartbeat,
+            thread_executor=thread_executor, process_executor=process_executor
+        )
+        # gate
+        self.gate: Optional[z_aio.Socket] = None
+        self.gate_port = port
+        if not cluster_name:
+            cluster_name = Settings.GATE_CLUSTER_NAME
+        self.gate_cluster = self.GateServiceClass(cluster_name, self)
+        # 通知事件和对应的处理函数
+        self.event_handlers: dict[str, Callable[RemoteGate, ..., Coroutine]] = dict()
+        self.gate_replies: dict[bytes, asyncio.Future] = dict()
+        # 被转发的客户端请求和其他代理的请求和客户端id或其他地理的id的映射
+        self.request_map: dict[bytes, bytes] = dict()
+        self.gate_tasks = set()
+        self.bind_gate()
+        self.multicast = False
+        self.mcast_sock = None
+        self.mcast_msg = b"%s%s%s%s%s" % (
+            self.identity,
+            Settings.GATE_MEMBER,
+            Settings.GATE_COMMAND_NOTICE,
+            self.gate_cluster.identity,
+            to_bytes(self.gate_port, fmt="!i"),
+        )
+        if multicast:
+            self.multicast = True
+        self.register_event_handler(
+            "UpdateActiveService", self.update_active_service
+        )
+
+    def bind_gate(self, sock_opt: dict = None) -> None:
+        if not sock_opt:
+            sock_opt = {z_const.IDENTITY: self.identity}
+        else:
+            sock_opt.update({z_const.IDENTITY: self.identity})
+        self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
+        set_sock(self.gate, sock_opt)
+        self.gate.bind(f"tcp://*:{self.gate_port}")
+
+    def unbind_gate(self, addr: str) -> None:
+        if self.gate:
+            self.gate.unbind(check_socket_addr(addr))
+
+    async def connect_gate(self, gate_id, addr: str) -> None:
+        Glogger.debug(f"Connect Gate({addr})")
+        self.gate.connect(addr)
+        self.gate_cluster.unready_gates[gate_id] = addr
+        self._loop.call_later(
+            1e-3 * self.heartbeat,
+            self.cleanup_unready_gate, gate_id
+        )
+        await asyncio.sleep(0)
+        await self.send_invite_command(gate_id)
+
+    async def disconnect_all(self):
+        await super().disconnect_all()
+        gts = [
+            self.now_ban_gate(gate)
+            for gate in self.gate_cluster.get_workers().values()
+        ]
+        await asyncio.gather(*gts)
+
+    def run(self):
+        super().run()
+        if self.multicast:
+            self.create_internal_task(
+                self._multicast_self, "multicast_self", True
+            )
+
+    def stop(self):
+        super().stop()
+        if self.mcast_sock:
+            self.mcast_sock.close()
+            self.mcast_sock = None
+        if self.gate:
+            self._poller.unregister(self.gate)
+            self.gate.close()
+            self.gate = None
+
+    def register_event_handler(self, name, coro_func):
+        self.event_handlers[name] = coro_func
+
+    async def process_ready_command(self, worker_id, service_info):
+        await super().process_ready_command(worker_id, service_info)
+        service = self.workers[worker_id].service
+        self.gate_tasks.add(
+            task := self._loop.create_task(
+                self.send_notice_command(
+                    uuid4().bytes,
+                    "UpdateActiveService",
+                    (
+                        msg_pack(service.name),
+                        msg_pack(sum(
+                            worker.max_allowed_request
+                            for worker in service.workers.values()
+                        ))
+                    )
+                )
+            )
+        )
+        task.add_done_callback(self.cleanup_gate_task)
+
+    async def internal_interface(
+        self, client_id: bytes, request_id: bytes, func_name, args, kwargs
+    ):
+        if client_id in self.clients:
+            return await super().internal_interface(
+                client_id, request_id, func_name, args, kwargs
+            )
+        elif client_id not in self.gate_cluster.get_workers():
+            if Settings.DEBUG > 2:
+                raise RuntimeError(
+                    f"client_id({client_id}) not in clients or gates"
+                )
+            return
+        reply = None
+        exception = None
+        kwargs.update(
+            {
+                "client_id": client_id,
+                "request_id": request_id,
+            }
+        )
+        try:
+            if not self.internal_func.get(func_name, None):
+                if Settings.SECURE:
+                    return
+                raise AttributeError(
+                    "Function not found: {0}".format(func_name)
+                )
+            func = getattr(self, func_name)
+            if Settings.DEBUG > 1:
+                Glogger.debug(
+                    f"internal process, "
+                    f"func_name: {func_name}, "
+                    f"args: {args}, "
+                    f"kwargs: {kwargs}"
+                )
+            if inspect.iscoroutinefunction(func):
+                reply = await func(*args, **kwargs)
+            else:
+                if func.__executor__ == "thread":
+                    reply = await run_in_executor(
+                        self._loop, self.thread_executor,
+                        func, *args, **kwargs
+                    )
+                elif func.__executor__ == "process":
+                    reply = await run_in_executor(
+                        self._loop, self.process_executor,
+                        func, *args, **kwargs
+                    )
+                else:
+                    reply = func(*args, **kwargs)
+        except Exception as error:
+            exception = error
+        reply = await generate_reply(result=reply, exception=exception)
+        if isinstance(reply, HugeData):
+            task = self._loop.create_task(
+                self.reply_hugedata(
+                    client_id, request_id, self.reply_gate, reply
+                ),
+                name=f"GateReplyGateHD-{client_id}-{request_id}"
+            )
+        elif isinstance(reply, AsyncGenerator):
+            task = self._loop.create_task(
+                self.reply_agenerator(
+                    client_id, request_id, self.reply_gate, reply
+                ),
+                name=f"GateReplyGateAG-{client_id}-{request_id}"
+            )
+        else:
+            task = self._loop.create_task(
+                self.reply_gate(
+                    client_id, Settings.MDP_INTERNAL_SERVICE,
+                    request_id, msg_pack(reply)
+                )
+            )
+        self.gate_tasks.add(task)
+        task.add_done_callback(self.cleanup_gate_task)
+
+    async def process_reply_command_from_backend(self, service_name, messages):
+        try:
+            client_id, empty_frame, request_id, *body = messages
+            if empty_frame:
+                return
+        except ValueError:
+            return
+        if client_id in self.gate_cluster.get_workers():
+            self.gate_tasks.add(
+                task := self._loop.create_task(
+                    self.reply_gate(
+                        client_id, service_name, request_id, *body
+                    )
+                )
+            )
+            task.add_done_callback(self.cleanup_gate_task)
+        else:
+            await super().process_reply_command_from_backend(
+                service_name, messages
+            )
+
+    async def forward_request(
+        self, service_name, request_id, client_id, body
+    ):
+        if Settings.DEBUG > 1:
+            Glogger.warning(
+                f"Service({service_name}) unavailable, forward request"
+            )
+        # 转发请求其他代理。
+        self.request_map[request_id] = client_id
+        if not self.gate_cluster.get_workers():
+            raise GateUnAvailableError()
+        elif service_name not in self.gate_cluster.services:
+            raise ServiceUnAvailableError(service_name)
+        elif gate := await self.gate_cluster.acquire_service_idle_worker(
+                service_name
+        ):
+            self.gate_tasks.add(
+                task := self._loop.create_task(
+                    self.send_whisper_command(
+                        gate.identity,
+                        request_id,
+                        service_name,
+                        body
+                    )
+                )
+            )
+            task.add_done_callback(self.cleanup_gate_task)
+        else:
+            raise BusyGateError()
+
+    async def request_backend(
+        self,
+        service_name: str,
+        client_id: bytes,
+        request_id: bytes,
+        body: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]]
+    ):
+        service = self.services.get(service_name)
+        try:
+            if (
+                    service and service.running
+                    and (worker := await service.acquire_idle_worker())
+            ):
+                option = (client_id, b"", request_id)
+                self.backend_tasks.add(
+                    task := self._loop.create_task(
+                        self.send_to_backend(
+                            worker.identity, Settings.MDP_COMMAND_REQUEST,
+                            option, body
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_backend_task)
+            else:
+                await self.forward_request(
+                    service_name, request_id, client_id, body
+                )
+        except (
+                ServiceUnAvailableError, GateUnAvailableError, BusyGateError
+        ) as exception:
+            exception = await generate_reply(exception=exception)
+            except_reply = msg_pack(exception)
+            if Settings.DEBUG:
+                Glogger.error(except_reply)
+            if client_id in self.gate_cluster.get_workers():
+                Glogger.debug("reply gate")
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_gate(
+                            client_id, service_name, request_id,
+                            except_reply
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_gate_task)
+            if client_id in self.clients:
+                Glogger.debug("reply client")
+                self.frontend_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_frontend(
+                            client_id, service_name, request_id,
+                            except_reply
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_frontend_task)
+
+    async def build_gate_zap_frames(self) -> tuple[bytes, ...]:
+        """
+        用于继承后根据 ZAP 校验方法构建 ZAP 凭据帧，
+        使用协程是为了方便使用 loop.run_in_executor
+        """
+        if self.gate_zap_frames:
+            return tuple(to_bytes(z) for z in self.gate_zap_frames)
+        else:
+            return tuple()
+
+    def cleanup_unready_gate(self, gate_id):
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Cleanup unready gate({gate_id})")
+        if gate_addr := self.gate_cluster.unready_gates.pop(gate_id, None):
+            try:
+                self.gate.disconnect(gate_addr)
+            except Exception as e:
+                Glogger.debug(e)
+
+    async def register_gate(
+        self, gate_id, sock, member_version, active_services
+    ):
+        gate = self.RemoteGateClass(
+            gate_id, self.heartbeat,
+            sock, member_version,
+            self.gate_cluster,
+            active_services
+        )
+        gate.prolong(self._loop.time())
+        gate.destroy_task = self._loop.create_task(
+            self.ban_gate_at_expiration(gate)
+        )
+        gate.heartbeat_task = self._loop.create_task(
+            self.send_gate_heartbeat(gate)
+        )
+        self.gate_cluster.add_worker(gate)
+
+    async def ban_gate(self, gate: RemoteGate):
+        """
+        和 ban_worker 分开，方便以后加逻辑
+        """
+        Glogger.warning(f"ban gate({gate.identity}).")
+        if gate.is_alive():
+            await self.send_to_gate(
+                gate.identity,
+                Settings.GATE_COMMAND_LEAVE,
+            )
+            gate.ready = False
+            gate.heartbeat_task.cancel()
+        self.gate_cluster.remove_worker(gate)
+        if gate.addr:
+            Glogger.warning(f"disconnect gate({gate.addr})")
+            self.gate.disconnect(gate.addr)
+        return True
+
+    async def ban_gate_at_expiration(self, gate: RemoteGate):
+        while 1:
+            if gate.expiry <= self._loop.time():
+                Glogger.debug(f"ban gate({gate.identity}) at expiration")
+                await self.ban_gate(gate)
+                return
+            await asyncio.sleep(
+                1e-3 * gate.heartbeat * gate.heartbeat_liveness
+            )
+
+    async def now_ban_gate(self, gate: RemoteGate):
+        Glogger.debug(f"now ban gate({gate.identity})")
+        if gate.destroy_task:
+            gate.destroy_task.cancel()
+        await self.ban_gate(gate)
+
+    async def delay_ban_gate(self, gate: RemoteGate):
+        gate.prolong(self._loop.time())
+
+    async def send_gate_heartbeat(self, gate: RemoteGate):
+        while 1:
+            if self.mcast_sock:
+                await asyncio.sleep(1e-3 * gate.heartbeat)
+            else:
+                time_from_last_message = (
+                        self._loop.time() - gate.last_message_sent_time
+                )
+                if time_from_last_message >= 1e-3 * gate.heartbeat:
+                    await self.send_to_gate(
+                        gate.identity,
+                        Settings.MDP_COMMAND_HEARTBEAT
+                    )
+                    await asyncio.sleep(1e-3 * gate.heartbeat)
+                else:
+                    await asyncio.sleep(
+                        1e-3 * gate.heartbeat - time_from_last_message
+                    )
+
+    def cleanup_gate_task(self, task: asyncio.Task):
+        self.gate_tasks.remove(task)
+        if exception := task.exception():
+            exception_info = "".join(format_tb(exception.__traceback__))
+            exception_info = (f"{exception.__class__}:{exception.__repr__()}"
+                              f"\n{exception_info}")
+            Glogger.warning(f"gate task exception:\n{exception_info}")
+
+    async def send_invite_command(self, gate_id):
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Invite Gate({gate_id})")
+        await self.send_to_gate(
+            gate_id,
+            Settings.GATE_COMMAND_INVITE
+        )
+
+    async def process_invite_command(self, gate_id):
+        await self.send_join_command(gate_id)
+
+    async def send_join_command(self, gate_id):
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Join to Gate({gate_id})")
+        services = {
+            name: sum(
+                worker.max_allowed_request
+                for worker in service.workers.values()
+            )
+            for name, service in self.services.items()
+        }
+        await self.send_to_gate(
+            gate_id,
+            Settings.GATE_COMMAND_JOIN,
+            messages=msg_pack(services)
+        )
+
+    async def process_join_command(self, gate_id, active_services):
+        if gate_id not in self.gate_cluster.all_nodes():
+            if Settings.DEBUG:
+                Glogger.debug(
+                    "recv JOIN command, send JOIN command to gate"
+                )
+            self.gate_tasks.add(
+                task := self._loop.create_task(
+                    self.send_join_command(gate_id)
+                )
+            )
+            task.add_done_callback(self.cleanup_gate_task)
+        await self.register_gate(
+            gate_id, self.gate,
+            Settings.GATE_MEMBER,
+            active_services
+        )
+
+    async def send_whisper_command(
+        self, gate_id, request_id, service_name, body
+    ):
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Send WHISPER to {gate_id}")
+        option = (service_name, request_id)
+        await self.send_to_gate(
+            gate_id,
+            Settings.GATE_COMMAND_WHISPER,
+            option,
+            body
+        )
+
+    async def process_gate_request(
+        self, gate_id, request_id, service_name, body
+    ):
+        service_name = from_bytes(service_name)
+        if service_name == Settings.MDP_INTERNAL_SERVICE:
+            func_name, *body = body
+            func_name = msg_unpack(func_name)
+            if not body:
+                args, kwargs = tuple(), dict()
+            elif len(body) == 1:
+                args, kwargs = msg_unpack(body[0]), dict()
+            elif len(body) == 2:
+                args, kwargs = (msg_unpack(b) for b in body)
+            else:
+                return
+            self.create_internal_task(
+                self.internal_interface,
+                name=f"InternalFunc({func_name})-{gate_id}-{request_id}",
+                func_args=(gate_id, request_id, func_name, args, kwargs)
+            )
+        else:
+            self.backend_tasks.add(
+                task := self._loop.create_task(
+                    self.request_backend(
+                        service_name, gate_id,
+                        request_id, body
+                    )
+                )
+            )
+            task.add_done_callback(self.cleanup_backend_task)
+
+    async def process_gate_reply(
+        self, request_id, service_name, body
+    ):
+        if client_id := self.request_map.get(request_id, None):
+            if client_id in self.clients:
+                self.frontend_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_frontend(
+                            client_id, service_name,
+                            request_id, *body
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_frontend_task)
+            elif client_id in self.gate_cluster.get_workers():
+                self.gate_tasks.add(
+                    task := self._loop.create_task(
+                        self.reply_gate(
+                            client_id, service_name,
+                            request_id, *body
+                        )
+                    )
+                )
+                task.add_done_callback(self.cleanup_gate_task)
+
+        elif request_id in self.gate_replies:
+            if len(body) == 1:
+                body = msg_unpack(body[0])
+                self.gate_replies[request_id].set_result(body)
+            elif len(body) > 1:
+                *option, body = body
+                if option[0] == Settings.STREAM_GENERATOR_TAG:
+                    if not (reply := self.gate_replies[request_id]).done():
+                        stream_reply = StreamReply(
+                            Settings.STREAM_END_TAG,
+                            maxsize=Settings.STREAM_REPLY_MAXSIZE,
+                            timeout=Settings.REPLY_TIMEOUT
+                        )
+                        self.gate_replies[request_id].set_result(
+                            stream_reply
+                        )
+                    else:
+                        stream_reply = reply.result()
+                    if (len(option) > 1 and option[1] ==
+                            Settings.STREAM_EXCEPT_TAG):
+                        exc = RemoteException(msg_unpack(body))
+                        await throw_exception_agenerator(
+                            stream_reply, exc
+                        )
+                    else:
+                        if body != Settings.STREAM_END_TAG:
+                            body = msg_unpack(body)
+                        await stream_reply.asend(body)
+                elif option[0] == Settings.STREAM_HUGE_DATA_TAG:
+                    if not (reply := self.gate_replies[request_id]).done():
+                        huge_reply = HugeData(
+                            Settings.HUGE_DATA_END_TAG,
+                            Settings.HUGE_DATA_EXCEPT_TAG,
+                            compress_module=(
+                                Settings.HUGE_DATA_COMPRESS_MODULE
+                            ),
+                            compress_level=(
+                                Settings.HUGE_DATA_COMPRESS_LEVEL
+                            ),
+                            blksize=Settings.HUGE_DATA_SIZEOF
+                        )
+                        self.gate_replies[request_id].set_result(huge_reply)
+                    else:
+                        huge_reply = reply.result()
+                    await self._loop.run_in_executor(
+                        self.thread_executor, huge_reply.add_data, body
+                    )
+
+    async def process_whisper_command(self, gate: RemoteGate, messages):
+        if not gate:
+            return
+        if not gate.ready:
+            return await self.now_ban_gate(gate)
+        await self.delay_ban_gate(gate)
+        try:
+            (
+                service_name,
+                request_id,
+                *body
+            ) = messages
+        except MsgUnpackError:
+            return
+        if request_id in self.request_map or request_id in self.gate_replies:
+            await self.process_gate_reply(request_id, service_name, body)
+        else:
+            await self.process_gate_request(
+                gate.identity, request_id, service_name, body
+            )
+
+    async def send_notice_command(
+        self, notice_id, event_name, body
+    ):
+        """
+        只发不管
+        """
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Send NOTICE ({event_name})")
+        option = (notice_id, event_name)
+        for gate_id in self.gate_cluster.remote_nodes():
+            await self.send_to_gate(
+                gate_id,
+                Settings.GATE_COMMAND_NOTICE,
+                option,
+                body
+            )
+
+    async def process_notice_command(self, gate: RemoteGate, messages):
+        """
+        只收不回
+        """
+        if not gate:
+            return
+        if not gate.ready:
+            return await self.now_ban_gate(gate)
+        await self.delay_ban_gate(gate)
+        try:
+            (
+                notice_id,
+                event_name,
+                *body
+            ) = messages
+            event_name = from_bytes(event_name)
+            if event_name not in self.event_handlers:
+                return
+        except ValueError:
+            return
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"notice_id: {notice_id}, event_name: {event_name}")
+        self.gate_tasks.add(
+            task := self._loop.create_task(
+                self.event_handlers[event_name](gate, *body),
+                name=f"{event_name}-{notice_id}"
+            )
+        )
+        task.add_done_callback(self.cleanup_gate_task)
+
+    async def process_messages_from_gate(self, messages):
+        try:
+            (
+                gate_id,
+                empty_frame,
+                gate_version,
+                command,
+                *messages
+            ) = messages
+            if (
+                    empty_frame
+                    or gate_version != Settings.GATE_MEMBER
+                    or command not in (
+                        Settings.GATE_COMMAND_NOTICE,
+                        Settings.GATE_COMMAND_INVITE,
+                        Settings.GATE_COMMAND_JOIN,
+                        Settings.GATE_COMMAND_WHISPER,
+                        Settings.GATE_COMMAND_HEARTBEAT,
+                        Settings.GATE_COMMAND_LEAVE
+                    )
+            ):
+                return
+        except ValueError:
+            return
+
+        if Settings.DEBUG > 1:
+            Glogger.debug(
+                f"gate id: {gate_id}\n"
+                f"command: {command}\n"
+                f"messages: {messages}\n"
+            )
+
+        if self.zap:
+            if messages := parse_zap_frame(messages):
+                mechanism, credentials, messages = messages
+                request_id = b"gate_" + command
+                zap_result = await self.request_zap(
+                    gate_id, gate_id, request_id,
+                    mechanism, credentials
+                )
+                if not zap_result:
+                    if Settings.DEBUG:
+                        Glogger.warning(
+                            f"ZAP verification of Gate({gate_id})"
+                            f" fails,'{mechanism}' mechanism is used, and the "
+                            f"credential is '{credentials}', and the request_id "
+                            f"is '{request_id}'"
+                        )
+                    return
+            else:
+                return
+
+        if not (gate := self.gate_cluster.get_workers().get(gate_id, None)):
+            Glogger.warning(f"The gate({gate_id}) was not registered.")
+
+        if command == Settings.GATE_COMMAND_INVITE:
+            await self.process_invite_command(gate_id)
+
+        elif command == Settings.GATE_COMMAND_JOIN:
+            if gate:
+                Glogger.warning(
+                    f"recv JOIN command, but Gate({gate_id}) already join."
+                )
+                return await self.now_ban_gate(gate)
+            try:
+                active_services = msg_unpack(messages[0])
+            except MsgUnpackError:
+                return
+            await self.process_join_command(gate_id, active_services)
+
+        elif command == Settings.GATE_COMMAND_HEARTBEAT:
+            if not messages and gate:
+                if not gate.ready:
+                    return await self.now_ban_gate(gate)
+                await self.delay_ban_gate(gate)
+
+        elif command == Settings.GATE_COMMAND_WHISPER:
+            await self.process_whisper_command(gate, messages)
+
+        elif command == Settings.GATE_COMMAND_NOTICE:
+            await self.process_notice_command(gate, messages)
+
+        elif command == Settings.GATE_COMMAND_LEAVE:
+            if gate:
+                gate.ready = False
+                gate.expiry = self._loop.time()
+                await self.now_ban_gate(gate)
+
+    async def reply_gate(
+        self,
+        gate_id: bytes,
+        service: str,
+        request_id: bytes,
+        *body,
+    ):
+        await self.send_to_gate(
+            gate_id,
+            Settings.GATE_COMMAND_WHISPER,
+            (service, request_id),
+            body
+        )
+
+    async def send_to_gate(
+        self,
+        gate_id,
+        command: Union[bytes, str],
+        option: tuple[Union[bytes, str], ...] = None,
+        messages: Union[Union[bytes, str], tuple[Union[bytes, str], ...]] = None,
+    ):
+        if isinstance(messages, (bytes, str)):
+            messages = (messages,)
+        elif not messages:
+            messages = tuple()
+        if option:
+            messages = (*option, *messages)
+        messages = (
+            gate_id,
+            b"",
+            Settings.GATE_MEMBER,
+            command,
+            *(await self.build_gate_zap_frames()),
+            *messages
+        )
+        messages = tuple(to_bytes(s) for s in messages)
+        await self.gate.send_multipart(messages)
+        if gate := self.gate_cluster.get_workers().get(gate_id):
+            gate.last_message_sent_time = self._loop.time()
+
+    def _multicast_recv_callback(self, data, addr):
+        task = self._loop.create_task(
+            self.process_mcast_messages(data, addr)
+        )
+        self.gate_tasks.add(task)
+        task.add_done_callback(self.cleanup_gate_task)
+
+    async def _multicast_self(self):
+        if Settings.DEBUG:
+            Glogger.debug("Multicast.")
+        mcast_group, mcast_port = (
+            Settings.GATE_MULTICAST_GROUP, Settings.GATE_MULTICAST_PORT
+        )
+        if Settings.GATE_IP_VERSION == 6:
+            raw_sock = socket.socket(
+                socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+            )
+            raw_sock.setsockopt(
+                socket.IPPROTO_IPV6,
+                socket.IPV6_MULTICAST_HOPS,
+                Settings.GATE_MULTICAST_HOP_LIMIT
+            )
+            mreq = struct.pack(
+                "16sI",
+                socket.inet_pton(socket.AF_INET6, mcast_group),
+                socket.INADDR_ANY
+            )
+            raw_sock.setsockopt(
+                socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq
+            )
+        else:
+            mcast_port = int(mcast_port)
+            raw_sock = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+            )
+            raw_sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_MULTICAST_TTL, Settings.GATE_MULTICAST_TTL
+            )
+            mreq = struct.pack(
+                "4sL", socket.inet_aton(mcast_group), socket.INADDR_ANY
+            )
+            raw_sock.setsockopt(
+                socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq
+            )
+        raw_sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_REUSEPORT, 1
+        )
+        raw_sock.bind(('', mcast_port))
+        self.mcast_sock, _ = await self._loop.create_datagram_endpoint(
+            lambda: MulticastProtocol(self._multicast_recv_callback),
+            sock=raw_sock
+        )
+
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"send mcast messages:\n {self.mcast_msg}")
+        while 1:
+            await asyncio.sleep(1e-3 * self.heartbeat)
+            try:
+                await self._loop.run_in_executor(
+                    self.thread_executor,
+                    self.mcast_sock.sendto,
+                    self.mcast_msg, (mcast_group, mcast_port)
+                )
+                # self.mcast_sock.send(msg)
+            except Exception as e:
+                if Settings.GATE_IP_VERSION == 6:
+                    raw_sock.setsockopt(
+                        socket.IPPROTO_IPV6,
+                        socket.IPV6_LEAVE_GROUP, mreq
+                    )
+                else:
+                    raw_sock.setsockopt(
+                        socket.IPPROTO_IP,
+                        socket.IP_DROP_MEMBERSHIP, mreq
+                    )
+                self.mcast_sock.close()
+                self.mcast_sock = None
+                raise e
+
+    async def process_mcast_messages(self, messages, addr: tuple):
+        try:
+            if Settings.DEBUG > 1:
+                Glogger.debug(
+                    f"recv mcast message from {addr}:\n{messages}"
+                )
+            v_end = 16 + len(Settings.GATE_MEMBER)
+            c_end = v_end + len(Settings.GATE_COMMAND_NOTICE)
+            gate_id, gate_v, command, cluster_id, port = (
+                messages[:16],
+                messages[16:v_end],
+                messages[v_end:c_end],
+                messages[-20:-4],
+                from_bytes(messages[-4:], to_num=True),
+            )
+        except (ValueError, TypeError):
+            return
+        if Settings.DEBUG > 1:
+            Glogger.debug(
+                f"gate_id: {gate_id}, gate_v: {gate_v}, command: {command}, "
+                f"cluster_id: {cluster_id}, port: {port}"
+            )
+        if (
+                gate_id == self.identity
+                or gate_v != Settings.GATE_MEMBER
+                or command != Settings.GATE_COMMAND_NOTICE
+                or cluster_id != self.gate_cluster.identity
+        ):
+            return
+        if gate := self.gate_cluster.get_workers().get(gate_id, None):
+            await self.delay_ban_gate(gate)
+        if gate_id not in self.gate_cluster.all_nodes():
+            host = addr[0]
+            if len(addr) > 2:
+                host = f"[{host}]"
+            self.gate_tasks.add(
+                task := self._loop.create_task(
+                    self.connect_gate(gate_id, f"tcp://{host}:{port}")
+                )
+            )
+            task.add_done_callback(self.cleanup_gate_task)
+
+    async def _broker_loop(self):
+        try:
+            if self.frontend:
+                self._poller.register(self.frontend, z_const.POLLIN)
+            if self.backend:
+                self._poller.register(self.backend, z_const.POLLIN)
+            if self.gate:
+                self._poller.register(self.gate, z_const.POLLIN)
+            if self.zap:
+                self._poller.register(self.zap, z_const.POLLIN)
+            self.running = True
+
+            while 1:
+                socks = await self._poller.poll(self.heartbeat)
+                socks = dict(socks)
+                if self.backend and self.backend in socks:
+                    replies = await self.backend.recv_multipart()
+                    bt = self._loop.create_task(
+                        self.process_messages_from_backend(replies),
+                    )
+                    self.backend_tasks.add(bt)
+                    bt.add_done_callback(self.cleanup_backend_task)
+
+                if self.frontend and self.frontend in socks:
+                    replies = await self.frontend.recv_multipart()
+                    # 同后端任务处理。
+                    ft = self._loop.create_task(
+                        self.process_messages_from_frontend(replies),
+                    )
+                    self.frontend_tasks.add(ft)
+                    ft.add_done_callback(self.cleanup_frontend_task)
+
+                if self.gate and self.gate in socks:
+                    messages = await self.gate.recv_multipart()
+                    gt = self._loop.create_task(
+                        self.process_messages_from_gate(messages)
+                    )
+                    self.gate_tasks.add(gt)
+                    gt.add_done_callback(self.cleanup_gate_task)
+
+                if self.zap and self.zap in socks:
+                    replies = await self.zap.recv_multipart()
+                    zt = self._loop.create_task(
+                        self.process_replies_from_zap(replies),
+                    )
+                    self.zap_tasks.add(zt)
+                    zt.add_done_callback(self.zap_tasks.remove)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            exception = "".join(format_exception(*sys.exc_info()))
+            Glogger.error(exception)
+            raise
+        finally:
+            await self.disconnect_all()
+            Glogger.info("Gate loop exit.")
+            self.close()
+
+    @interface
+    def query_service(self, service_name, **kwargs):
+        if service_name in self.services:
+            return self.services[service_name].description
+        elif service_name in self.gate_cluster.services:
+            return f"GateCluster.{service_name}"
+        else:
+            return None
+
+    @interface
+    def get_services(self, **kwargs):
+        services = list(self.services.keys())
+        services.append(Settings.MDP_INTERNAL_SERVICE)
+        services.extend(self.gate_cluster.services.keys())
+        return services
+
+    async def update_active_service(self, gate: RemoteGate, *body):
+        service_name = msg_unpack(body[0])
+        num = msg_unpack(body[1])
+        assert isinstance(service_name, str)
+        assert isinstance(num, int)
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"update active service: {service_name}({num})")
+        gate.active_services[service_name] = num
+        if service_name not in self.gate_cluster.services:
+            self.gate_cluster.services[service_name] = asyncio.Queue()
+            self.gate_cluster.services[service_name].put_nowait(gate.identity)
+
+
 class Client:
 
     def __init__(
         self,
         broker_addr: str = None,
-        identity: str = "gc",
+        identity: str = None,
         context: Context = None,
         heartbeat: int = None,
         reply_timeout: float = None,
@@ -2628,8 +3122,11 @@ class Client:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = asyncio.get_event_loop()
-
-        self.identity = f"{identity}-{uuid4().hex}".encode("utf-8")
+        if not identity:
+            identity = f"gc-{secrets.token_hex(8)}"
+        self.identity = name2uuid(identity).bytes
+        if Settings.DEBUG > 1:
+            Clogger.debug(f"Client id: {self.identity}")
         self.ready: Optional[asyncio.Future] = None
         self._broker_addr = broker_addr
         self._recv_task: Optional[asyncio.Task] = None
@@ -2717,11 +3214,11 @@ class Client:
         self, service_name: Union[str, bytes], *body,
     ) -> bytes:
         """
-                客户端使用 DEALER 类型 socket，每个请求都有一个id，
-                worker 每个回复都会带上这个请求id。 客户端需要将回复和请求对应上。
-                :param service_name: 要访问的服务的名字
-                """
-        request_id = to_bytes(uuid4().hex)
+        客户端使用 DEALER 类型 socket，每个请求都有一个id，
+        worker 每个回复都会带上这个请求id。 客户端需要将回复和请求对应上。
+        :param service_name: 要访问的服务的名字
+        """
+        request_id = uuid4().bytes
         request = (
             b"",
             Settings.MDP_CLIENT,
@@ -2819,13 +3316,22 @@ class Client:
             request_id,
             *body
         ) = messages
+        if Settings.DEBUG > 1:
+            Clogger.debug(
+                f"service_name: {service_name}\n"
+                f"request_id: {request_id}"
+            )
         if request_id not in self.replies:
             return
         if len(body) == 1:
             body = msg_unpack(body[0])
+            if Settings.DEBUG > 1:
+                Clogger.debug(f"body: {body}")
             self.replies[request_id].set_result(body)
         elif len(body) > 1:
             *option, body = body
+            if Settings.DEBUG > 1:
+                Clogger.debug(f"option: {option}")
             if option[0] == Settings.STREAM_GENERATOR_TAG:
                 if not (reply := self.replies[request_id]).done():
                     stream_reply = StreamReply(
@@ -2833,9 +3339,7 @@ class Client:
                         maxsize=self.stream_reply_maxsize,
                         timeout=self.reply_timeout
                     )
-                    self.replies[request_id].set_result(
-                        stream_reply
-                    )
+                    self.replies[request_id].set_result(stream_reply)
                 else:
                     stream_reply = reply.result()
                 if (len(option) > 1 and option[1] ==
@@ -2981,7 +3485,7 @@ class Client:
             )
             if Settings.SECURE:
                 raise RuntimeError(msg)
-            logger.warning(msg)
+            Clogger.warning(msg)
         return await self._request(service_name, func_name, args, kwargs)
 
     def __getattr__(self, item):
@@ -3017,7 +3521,9 @@ class SimpleClient:
         zap_mechanism: Union[str, bytes] = None,
         zap_credentials: tuple = None,
     ):
-        self.identity = f"sgc-{uuid4().hex}".encode("utf-8")
+        self.identity = name2uuid(f"sgc-{secrets.token_hex(8)}").bytes
+        if Settings.DEBUG > 1:
+            Clogger.debug(f"SimpleClient id: {self.identity}")
         self._broker_addr = check_socket_addr(broker_addr)
         zap_mechanism, zap_credentials = check_zap_args(
             zap_mechanism, zap_credentials
@@ -3063,7 +3569,7 @@ class SimpleClient:
         """
         执行rpc调用
         """
-        request_id = to_bytes(uuid4().hex)
+        request_id = uuid4().bytes
         request = (
             Settings.MDP_CLIENT,
             self._remote_service if self._remote_service else 

@@ -2,7 +2,6 @@
 # Author      : ShiFan
 # Created Date: 2023/5/10 16:47
 """Gate rpc constants"""
-import asyncio
 import os
 from importlib import import_module
 from logging.config import dictConfig
@@ -37,26 +36,33 @@ def logging_process(settings: "GlobalSettings", logging: dict):
     return logging
 
 
+debug_format = (
+    "%(asctime)s %(name)s "
+    "[%(processName)s(%(process)d):%(threadName)s(%(thread)d)]\n"
+    "%(pathname)s[%(funcName)s:%(lineno)d] \n"
+    "- %(levelname)s %(message)s"
+)
+verbose_format = (
+    "%(asctime)s %(name)s %(module)s.[%(funcName)s:%(lineno)d] \n"
+    "- %(levelname)s %(message)s"
+)
+simple_format = "%(asctime)s %(name)s %(module)s - %(levelname)s %(message)s"
+
 _DEFAULT_LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "debug": {
-            "format": "%(asctime)s %(levelname)s %(name)s "
-                      "[%(processName)s(%(process)d):"
-                      "%(threadName)s(%(thread)d)]\n"
-                      "%(pathname)s[%(funcName)s:%(lineno)d] "
-                      "-\n%(message)s",
+            "()": "gaterpc.utils.ColorFormatter",
+            "format": debug_format,
         },
         "verbose": {
-            "format": "%(asctime)s %(levelname)s %(name)s "
-                      "%(module)s.[%(funcName)s:%(lineno)d] "
-                      "-\n%(message)s",
+            "format": verbose_format,
         },
-        "simple": {
-            "format": "%(asctime)s %(levelname)s  %(name)s %(module)s "
-                      "- %(message)s"
-        },
+        "console": {
+            "()": "gaterpc.utils.ColorFormatter",
+            "format": verbose_format
+        }
     },
     "handlers": {
         "asyncio": {
@@ -82,7 +88,7 @@ _DEFAULT_LOGGING = {
         "console": {
             "level": "DEBUG",
             "class": "logging.StreamHandler",
-            "formatter": "simple",
+            "formatter": "console",
         },
     },
     "loggers": {
@@ -156,12 +162,11 @@ class GlobalSettings(object):
     # ZMQ
     ZMQ_CONTEXT = dict()
     ZMQ_SOCK = {
-        z_const.SocketOption.IPV6: 1,
         z_const.SocketOption.HWM: 3000,
         # millisecond
-        # z_const.SNDTIMEO: 10 * 1000,
+        # z_const.SocketOption.SNDTIMEO: 10 * 1000,
         # millisecond
-        # z_const.RCVTIMEO: 10 * 1000
+        # z_const.SocketOption.RCVTIMEO: 10 * 1000
     }
     # ZAP
     ZAP_VERSION: bytes = b"1.0"
@@ -197,21 +202,6 @@ class GlobalSettings(object):
     MDP_COMMAND_HEARTBEAT: bytes = b"\x04"
     MDP_COMMAND_DISCONNECT: bytes = b"\x05"
     MDP_DESCRIPTION_SEP: str = ":"
-    # Gate
-    GATE_CLUSTER_NAME: str = "GateCluster"
-    GATE_CLUSTER_DESCRIPTION: str = "GateRPC cluster service"
-
-    GATE_VERSION: str = "01"
-    GATE_MEMBER: bytes = LazyAttribute(
-        render=lambda instance, p:
-        f"GATEM{instance.GATE_VERSION}".encode("utf-8")
-    )
-    GATE_COMMAND_RING: bytes = b"\x00"
-    GATE_COMMAND_READY: bytes = b"\x01"
-    GATE_COMMAND_REQUEST: bytes = b"\x02"
-    GATE_COMMAND_REPLY: bytes = b"\x03"
-    GATE_COMMAND_HEARTBEAT: bytes = b"\x04"
-    GATE_COMMAND_DISCONNECT: bytes = b"\x05"
     # RPC
     MESSAGE_MAX: int = 5000  # 参考ZMQ HWM
     STREAM_REPLY_MAXSIZE = 0
@@ -228,6 +218,26 @@ class GlobalSettings(object):
     REPLY_TIMEOUT: float = LazyAttribute(
         render=lambda instance, p: 2 * instance.TIMEOUT if p is empty else p
     )
+    # Gate
+    GATE_CLUSTER_NAME: str = "GateCluster"
+    GATE_CLUSTER_DESCRIPTION: str = "GateRPC cluster service"
+    GATE_VERSION: str = "01"
+    GATE_MEMBER: bytes = LazyAttribute(
+        render=lambda instance, p: f"GATE{instance.GATE_VERSION}".encode("utf-8")
+    )
+
+    GATE_IP_VERSION: int = 4
+    GATE_MULTICAST_GROUP: str = "224.0.7.7"
+    GATE_MULTICAST_PORT: int = 9777
+    GATE_MULTICAST_TTL: int = 2
+    GATE_MULTICAST_HOP_LIMIT: int = 255
+
+    GATE_COMMAND_NOTICE: bytes = b"\x00"
+    GATE_COMMAND_INVITE: bytes = b"\x01"
+    GATE_COMMAND_JOIN: bytes = b"\x02"
+    GATE_COMMAND_WHISPER: bytes = b"\x03"
+    GATE_COMMAND_HEARTBEAT: bytes = b"\x04"
+    GATE_COMMAND_LEAVE: bytes = b"\x05"
     # log
     DEFAULT_LOGGING = LazyAttribute(
         _DEFAULT_LOGGING,
@@ -253,6 +263,9 @@ class GlobalSettings(object):
                 continue
             self.configure(name, value)
 
+        self.BASE_PATH.mkdir(exist_ok=True)
+        self.RUN_PATH.mkdir(exist_ok=True)
+        self.LOG_PATH.mkdir(exist_ok=True)
         if self.DEBUG:
             self.ENVIRONMENT["PYTHONASYNCIODEBUG"] = "1"
 
@@ -262,6 +275,10 @@ class GlobalSettings(object):
         if self.LOGGING:
             dictConfig(self.LOGGING)
         else:
+            if self.DEBUG > 0:
+                self.DEFAULT_LOGGING["handlers"]["gaterpc"]["formatter"] = "debug"
+                for logger in self.DEFAULT_LOGGING["loggers"].values():
+                    logger["level"] = "DEBUG"
             dictConfig(self.DEFAULT_LOGGING)
 
 

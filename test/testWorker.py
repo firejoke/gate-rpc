@@ -170,6 +170,6 @@ def test(backend_addr=None):
 
 if __name__ == '__main__':
     if len(argv := sys.argv) > 1:
-        test(argv[0])
+        test(argv[1])
     else:
         test()

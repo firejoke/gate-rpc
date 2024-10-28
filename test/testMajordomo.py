@@ -19,7 +19,7 @@ sys.path.append(base_path.parent.as_posix())
 
 from gaterpc.global_settings import Settings
 from gaterpc.core import (
-    AsyncZAPService, Context, Worker, Service, AMajordomo,
+    AsyncZAPService, Context, Worker, Service, AMajordomo, Gate
 )
 from gaterpc.utils import (
     HugeData, UnixEPollEventLoopPolicy, interface, msg_pack, msg_unpack,
@@ -45,13 +45,11 @@ Settings.configure("USER_SETTINGS", testSettings)
 logger = getLogger("commands")
 
 
-class TAMajordomo(AMajordomo):
+class Mixin:
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.clients.add(self.identity)
         self.rw_queue = asyncio.Queue()
-        self.rw_task: Optional[asyncio.Task] = None
-        self.rw_replies = dict()
 
     async def request_worker(self):
         await asyncio.sleep(3)
@@ -116,33 +114,28 @@ class TAMajordomo(AMajordomo):
             t.add_done_callback(self.cleanup_backend_task)
             if log["gtid"] == 100000:
                 logger.debug(f"sent use time: {self._loop.time() - st}")
-            self.rw_replies[request_id] = self._loop.create_future()
+            self.internal_requests[request_id] = self._loop.create_future()
+            self.create_internal_task(
+                self.process_rw_replies, func_args=(request_id,)
+            )
             i += 1
             await asyncio.sleep(0)
 
     rw_replies_num = 0
 
-    async def reply_frontend(
-        self, client_id: bytes,
-        service_name: Union[str, bytes],
-        request_id: Union[str, bytes],
-        *body
+    async def process_rw_replies(
+        self, request_id: Union[str, bytes],
     ):
-        if client_id == self.identity:
-            if request_id in self.rw_replies:
-                # logger.debug(f"result: {msg_unpack(body[0])}")
-                self.rw_replies.pop(request_id).set_result(body)
-                if not self.rw_replies_num:
-                    logger.debug(f"first replies: {self._loop.time()}")
-                self.rw_replies_num += 1
-                if not self.rw_replies_num % 10000:
-                    logger.debug(
-                        f"worker replies number: {self.rw_replies_num}, "
-                        f"time: {self._loop.time()}"
-                    )
-        else:
-            await super().reply_frontend(
-                client_id, service_name, request_id, *body
+        body = await self.internal_requests[request_id]
+        # logger.debug(f"result: {msg_unpack(body[0])}")
+        self.internal_requests.pop(request_id)
+        if not self.rw_replies_num:
+            logger.debug(f"first replies: {self._loop.time()}")
+        self.rw_replies_num += 1
+        if not self.rw_replies_num % 10000:
+            logger.debug(
+                f"worker replies number: {self.rw_replies_num}, "
+                f"time: {self._loop.time()}"
             )
 
     async def test_rw(self):
@@ -174,21 +167,22 @@ class TAMajordomo(AMajordomo):
             raise e
 
     def run(self):
-        if not self._broker_task:
-            self._broker_task = self._loop.create_task(self._broker_loop())
-        if not self.rw_task:
-            self.rw_task = self._loop.create_task(self.request_worker())
+        super().run()
+        self.create_internal_task(self.request_worker, name="rw_task")
 
     def stop(self):
-        if self.rw_task:
-            if not self.rw_task.cancelled():
-                self.rw_task.cancel()
-            self.rw_task = None
-        if self._broker_task:
-            if not self._broker_task.cancelled():
-                self._broker_task.cancel()
-            self.close()
-            self._broker_task = None
+        super().stop()
+
+
+class TAMajordomo(Mixin, AMajordomo):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+class TGagte(Mixin, Gate):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Mixin.__init__(self, *args, **kwargs)
 
 
 async def zap_server(ctx):
@@ -212,9 +206,7 @@ def start_zap(ctx):
     loop.run_until_complete(zap_server(ctx))
 
 
-async def majordomo(
-    frontend=None, backend=None, bind_gate=None, connect_gate=None
-):
+async def majordomo(frontend=None, backend=None):
     Settings.setup()
     # loop = asyncio.get_event_loop()
     # loop.slow_callback_duration = 0.01
@@ -234,18 +226,15 @@ async def majordomo(
 
     gr_majordomo = TAMajordomo(
         context=ctx,
-        # gate_zap_mechanism=Settings.ZAP_MECHANISM_PLAIN,
-        # gate_zap_credentials=(
-        #     Settings.ZAP_PLAIN_DEFAULT_USER,
-        #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
-        # )
     )
     if g_secret:
-        gr_majordomo.bind_backend(sock_opt={
+        gr_majordomo.bind_backend(
+            sock_opt={
                 z_const.CURVE_SECRETKEY: g_secret,
                 z_const.CURVE_PUBLICKEY: g_public,
                 z_const.CURVE_SERVER: True,
-            })
+            }
+        )
     else:
         gr_majordomo.bind_backend()
     if frontend:
@@ -260,43 +249,83 @@ async def majordomo(
             )
         else:
             gr_majordomo.bind_frontend(frontend)
-    if bind_gate:
-        gr_majordomo.bind_gate(bind_gate)
     await asyncio.sleep(1)
     logger.info("start test")
     try:
         # zap.start()
         # gr_majordomo.connect_zap(zap_addr=zipc)
         gr_majordomo.run()
-        if connect_gate:
-            try:
-                await gr_majordomo.connect_gate(connect_gate)
-            except Exception as e:
-                logger.error(e)
-                raise e
         await asyncio.sleep(5)
         # await gr_majordomo.test_rw()
-        await gr_majordomo.rw_task
         await gr_majordomo._broker_task
     finally:
-        exc = gr_majordomo.rw_task.exception()
         gr_majordomo.stop()
         logger.info(f"request_zap.cache_info: {gr_majordomo.zap_cache}")
         # zap.stop()
-        if exc:
-            raise exc
+
+
+async def tgate(
+    gate_port, mcast_port=None, frontend=None, backend=None
+):
+    Settings.setup()
+    if backend:
+        Settings.WORKER_ADDR = backend
+    if mcast_port:
+        Settings.GATE_MULTICAST_PORT = mcast_port
+    Settings.ZAP_REPLY_TIMEOUT = 10.0
+    ctx = Context()
+    gate = TGagte(gate_port, context=ctx)
+    if g_secret:
+        gate.bind_backend(
+            sock_opt={
+                z_const.CURVE_SECRETKEY: g_secret,
+                z_const.CURVE_PUBLICKEY: g_public,
+                z_const.CURVE_SERVER: True,
+            }
+        )
+    else:
+        gate.bind_backend()
+    if frontend:
+        if g_secret:
+            gate.bind_frontend(
+                frontend,
+                sock_opt={
+                    z_const.CURVE_SECRETKEY: g_secret,
+                    z_const.CURVE_PUBLICKEY: g_public,
+                    z_const.CURVE_SERVER: True,
+                }
+            )
+        else:
+            gate.bind_frontend(frontend)
+    await asyncio.sleep(1)
+    logger.info("start test")
+    try:
+        gate.run()
+        await asyncio.sleep(5)
+        await gate._broker_task
+    finally:
+        gate.stop()
 
 
 def test(
     frontend="ipc:///tmp/gate-rpc/run/c1",
-    backend=None, bind_gate=None, connect_gate=None
+    backend=None, gate_port=None, mcast_port=None
 ):
     print(f"frontend: {frontend}, backend: {backend}")
-    print(f"bind_gate: {bind_gate}, connect_gate: {connect_gate}")
     asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
-    asyncio.run(
-        majordomo(frontend, backend, bind_gate, connect_gate)
-    )
+    if gate_port:
+        gate_port = int(gate_port)
+        print(f"gate_port: {gate_port}, broadcast_port: {mcast_port}")
+        asyncio.run(
+            tgate(
+                gate_port, mcast_port=mcast_port,
+                frontend=frontend, backend=backend
+            )
+        )
+    else:
+        asyncio.run(
+            majordomo(frontend, backend, )
+        )
 
 
 if __name__ == "__main__":
