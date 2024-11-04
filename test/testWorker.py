@@ -5,11 +5,13 @@ import asyncio
 import hashlib
 import secrets
 import sys
+from ctypes import c_wchar_p
 from logging import getLogger
 from pathlib import Path
 
 import zmq.auth
 import zmq.constants as z_const
+from zmq.backend import curve_keypair
 
 
 base_path = Path(__file__).parent
@@ -31,9 +33,10 @@ if curve_dir.exists():
     g_public, _ = zmq.auth.load_certificate(
         curve_dir.joinpath("gate.key")
     )
-    cw_public, cw_secret = zmq.auth.load_certificate(
-        curve_dir.joinpath("cw.key_secret")
-    )
+    # cw_public, cw_secret = zmq.auth.load_certificate(
+    #     curve_dir.joinpath("cw.key_secret")
+    # )
+    cw_public, cw_secret = curve_keypair()
 else:
     g_public = b""
     cw_public = cw_secret = b""
@@ -118,7 +121,11 @@ class GRWorker(Worker):
 
 async def worker(backend_addr=None):
     Settings.setup()
-    if cw_secret:
+    if g_public:
+        print(
+            f"g_public: {g_public}\n"
+            f"cw_public: {cw_public}, cw_secret: {cw_secret}"
+        )
         Settings.ZMQ_SOCK.update({
             z_const.CURVE_SECRETKEY: cw_secret,
             z_const.CURVE_PUBLICKEY: cw_public,
@@ -138,7 +145,6 @@ async def worker(backend_addr=None):
         #     Settings.ZAP_PLAIN_DEFAULT_USER,
         #     Settings.ZAP_PLAIN_DEFAULT_PASSWORD
         # ),
-        max_allowed_request=100000
     )
     logger.info(gr_worker.service)
     if gr_worker.service is not gr:
@@ -164,7 +170,7 @@ async def worker(backend_addr=None):
 
 
 def test(backend_addr=None):
-    asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
+    # asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
     asyncio.run(worker(backend_addr))
 
 

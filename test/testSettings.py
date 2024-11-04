@@ -13,12 +13,12 @@ sys.path.append(base_path.parent.as_posix())
 from gaterpc.utils import empty
 
 
-DEBUG = 3
+DEBUG = 0
 SECURE = True
 
 ZMQ_SOCK = {
     z_const.SocketOption.IPV6: 1,
-    z_const.SocketOption.HWM: 5000,
+    z_const.SocketOption.HWM: 7000,
     # millisecond
     # z_const.SNDTIMEO: 10 * 1000,
     # millisecond
@@ -26,6 +26,7 @@ ZMQ_SOCK = {
 }
 # WORKER_ADDR: str = "tcp://0:777"
 
+MESSAGE_MAX: int = 30000
 # GATE_IP_VERSION: int = 6
 # GATE_MULTICAST_GROUP: str = "ff08::7"
 # GATE_MULTICAST_PORT: int = 9777
@@ -77,17 +78,17 @@ LOGGING = {
     "loggers": {
         "gaterpc": {
             "level": "DEBUG",
-            "handlers": ["test_gate"],
+            "handlers": ["console"],
             "propagate": True,
         },
         "gaterpc.zap": {
             "level": "DEBUG",
-            "handlers": ["test_gate"],
+            "handlers": ["console"],
             "propagate": False,
         },
         "gaterpc.worker": {
             "level": "DEBUG",
-            "handlers": ["test_gate"],
+            "handlers": ["console"],
             "propagate": False,
         },
         "gaterpc.client": {

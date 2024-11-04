@@ -25,8 +25,8 @@ gate-rpc
 
 在实例化 Worker、Service、AMajordomo、Client、Gate 等各类之前，
 需要运行 Settings.setup 函数来初始化全局配置 [#f1]_ 。
- 当日志使用 utils.AQueueHandler类，并且 listener 指向的是一个使用 asyncio 的异步队列时，
- Settings.setup 方法要在协程里调用，因为 setup 方法内会初始化日志配置。
+当日志使用 utils.AQueueHandler 类，并且 listener 指向的是一个使用 asyncio 的异步队列时，
+Settings.setup 方法要在协程里调用，因为 setup 方法内会初始化日志配置。
 
 ::
 
@@ -118,6 +118,8 @@ LazyAttribute 初始化时接受三个可选参数：
   - GATE_MULTICAST_PORT: str = Gate 的多播端口
   - GATE_MULTICAST_TTL: int = ipv4 的多播的TTL
   - GATE_MULTICAST_HOP_LIMIT: int = ipv6 的多播跳数
+  - GATE_CURVE_PUBKEY: bytes = GATE 节点间连接加密的私钥
+  - GATE_CURVE_KEY: bytes = GATE 节点间连接加密公钥
 
 特殊返回值的序列化通过 MessagePack 的全局实例 gaterpc.utils.message_pack 来定制 [#f2]_ 。
 
@@ -453,8 +455,11 @@ decompress 方法对每一块返回的大小限制则是由压缩模块来实现
         )
 
 
-在用到 Gate 集群时，不要使用 Settings.ZMQ_SOCK 全局配置，
-因为 Gate 集群的节点互联是使用的单一 ROUTE 套接字，绑定和连接都是同一个 ROUTE 套接字
+在用到 Gate 集群时，不建议使用 Settings.ZMQ_SOCK 全局配置，
+
+~`因为 Gate 集群的节点互联是使用的单一 ROUTE 套接字，绑定和连接都是同一个 ROUTE 套接字`~
+
+Gate 集群节点间互联，会单独使用一个 DEALER 套接字连接其他节点的 ROUTE 套接字
 
 在使用由 gaterpc.utils.AQueueHandler 做为处理器的日志处理器时，
 要避免跨越线程和跨事件循环实例来记录日志，

@@ -14,6 +14,7 @@ import zmq.auth
 import zmq.constants as z_const
 
 
+
 base_path = Path(__file__).parent
 sys.path.append(base_path.parent.as_posix())
 
@@ -26,6 +27,7 @@ from gaterpc.utils import (
     run_in_executor,
     to_bytes,
 )
+from gaterpc.exceptions import BusyWorkerError, ServiceUnAvailableError
 import testSettings
 
 
@@ -34,12 +36,9 @@ if curve_dir.exists():
     g_public, g_secret = zmq.auth.load_certificate(
         curve_dir.joinpath("gate.key_secret")
     )
-    cw_public, _ = zmq.auth.load_certificate(
-        curve_dir.joinpath("cw.key")
-    )
+    print(f"g_public: {g_public}, g_secret: {g_secret}")
 else:
     g_public = g_secret = b""
-    cw_public = b""
 
 Settings.configure("USER_SETTINGS", testSettings)
 logger = getLogger("commands")
@@ -47,15 +46,15 @@ logger = getLogger("commands")
 
 class Mixin:
 
+    rw_replies_num = 0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.rw_queue = asyncio.Queue()
 
     async def request_worker(self):
         await asyncio.sleep(3)
-        try:
-            rpc_service = self.services[Settings.SERVICE_DEFAULT_NAME]
-        except KeyError:
+        if Settings.SERVICE_DEFAULT_NAME not in self.services:
             logger.error("RPC service don't running.")
             await asyncio.sleep(1)
             self.rw_task = self._loop.create_task(self.request_worker())
@@ -66,13 +65,10 @@ class Mixin:
             if i > 100000:
                 break
             try:
-                worker = await rpc_service.acquire_idle_worker()
-            except asyncio.TimeoutError:
-                continue
-            if not st:
-                st = self._loop.time()
-                logger.debug(f"start time: {st}")
-            log = {
+                if not st:
+                    st = self._loop.time()
+                    logger.debug(f"start time: {st}")
+                log = {
                     "gtid": i + 1,
                     "action": "update",
                     "key": "tttxxxhhh",
@@ -83,12 +79,27 @@ class Mixin:
                         "remote_hosts": ["hostname1", "hostname2", "hostname3"]
                     }
                 }
-            request_id = to_bytes(uuid4().hex)
-            body = (
-                msg_pack("emit"),
-                msg_pack((log,))
-            )
-            option = (self.identity, b"", request_id)
+                request_id = to_bytes(uuid4().hex)
+                body = (
+                    msg_pack("emit"),
+                    msg_pack((log,))
+                )
+                await self.request_backend(
+                    Settings.SERVICE_DEFAULT_NAME,
+                    self.identity,
+                    request_id,
+                    body
+                )
+                if not log["gtid"] % 10000:
+                    logger.info(f"sent {log['gtid']}")
+                if log["gtid"] == 100000:
+                    logger.info(f"sent use time: {self._loop.time() - st}")
+                i += 1
+                self.create_internal_task(
+                    self.process_rw_replies, func_args=(request_id,)
+                )
+            except (ServiceUnAvailableError, BusyWorkerError):
+                continue
 
             # 要注意并发太多时，对套接字类型的选择和缓冲区的配置，同时适时的让出io
             # 可以适当提高Settings里的ZMQ_SOCk配置里的 z_const.HWM，
@@ -97,31 +108,7 @@ class Mixin:
             # sysctl -w net.core.wmem_max=67108864
             # sysctl -w net.core.rmem_max=67108864
 
-            # 可以顺序等待发送
-            # await self.send_to_backend(
-            #     worker.identity, Settings.MDP_COMMAND_REQUEST,
-            #     option, body
-            # )
-            # 也可以创建为发送任务，乱序发送
-            self.backend_tasks.add(
-                t := self._loop.create_task(
-                    self.send_to_backend(
-                            worker.identity, Settings.MDP_COMMAND_REQUEST,
-                            option, body
-                        )
-                )
-            )
-            t.add_done_callback(self.cleanup_backend_task)
-            if log["gtid"] == 100000:
-                logger.debug(f"sent use time: {self._loop.time() - st}")
-            self.internal_requests[request_id] = self._loop.create_future()
-            self.create_internal_task(
-                self.process_rw_replies, func_args=(request_id,)
-            )
-            i += 1
-            await asyncio.sleep(0)
-
-    rw_replies_num = 0
+            # await asyncio.sleep(0)
 
     async def process_rw_replies(
         self, request_id: Union[str, bytes],
@@ -231,7 +218,7 @@ async def majordomo(frontend=None, backend=None):
         gr_majordomo.bind_backend(
             sock_opt={
                 z_const.CURVE_SECRETKEY: g_secret,
-                z_const.CURVE_PUBLICKEY: g_public,
+                # z_const.CURVE_PUBLICKEY: g_public,
                 z_const.CURVE_SERVER: True,
             }
         )
@@ -243,7 +230,7 @@ async def majordomo(frontend=None, backend=None):
                 frontend,
                 sock_opt={
                     z_const.CURVE_SECRETKEY: g_secret,
-                    z_const.CURVE_PUBLICKEY: g_public,
+                    # z_const.CURVE_PUBLICKEY: g_public,
                     z_const.CURVE_SERVER: True,
                 }
             )
@@ -267,6 +254,9 @@ async def majordomo(frontend=None, backend=None):
 async def tgate(
     gate_port, mcast_port=None, frontend=None, backend=None
 ):
+    if g_secret:
+        Settings.GATE_CURVE_KEY = g_secret
+        Settings.GATE_CURVE_PUBKEY = g_public
     Settings.setup()
     if backend:
         Settings.WORKER_ADDR = backend
@@ -279,7 +269,7 @@ async def tgate(
         gate.bind_backend(
             sock_opt={
                 z_const.CURVE_SECRETKEY: g_secret,
-                z_const.CURVE_PUBLICKEY: g_public,
+                # z_const.CURVE_PUBLICKEY: g_public,
                 z_const.CURVE_SERVER: True,
             }
         )
@@ -291,7 +281,7 @@ async def tgate(
                 frontend,
                 sock_opt={
                     z_const.CURVE_SECRETKEY: g_secret,
-                    z_const.CURVE_PUBLICKEY: g_public,
+                    # z_const.CURVE_PUBLICKEY: g_public,
                     z_const.CURVE_SERVER: True,
                 }
             )
@@ -312,7 +302,7 @@ def test(
     backend=None, gate_port=None, mcast_port=None
 ):
     print(f"frontend: {frontend}, backend: {backend}")
-    asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
+    # asyncio.set_event_loop_policy(UnixEPollEventLoopPolicy())
     if gate_port:
         gate_port = int(gate_port)
         print(f"gate_port: {gate_port}, broadcast_port: {mcast_port}")
@@ -324,7 +314,7 @@ def test(
         )
     else:
         asyncio.run(
-            majordomo(frontend, backend, )
+            majordomo(frontend, backend)
         )
 
 

@@ -19,6 +19,7 @@ from uuid import uuid4
 import zmq.constants as z_const
 import zmq.asyncio as z_aio
 import zmq.error as z_error
+from zmq.backend import curve_keypair
 from zmq import Context as SyncContext
 from zmq import Socket as SyncSocket
 from zmq import ZMQError
@@ -173,7 +174,7 @@ class ABCService(ABC):
         pass
 
     @abstractmethod
-    async def acquire_idle_worker(self) -> Optional[ABCWorker]:
+    async def acquire_idle_worker(self) -> ABCWorker:
         pass
 
     @abstractmethod
@@ -357,7 +358,7 @@ class Worker(ABCWorker):
 
     async def disconnect(self):
         if self.is_alive():
-            Wlogger.warning("Disconnecting from broker")
+            Wlogger.warning("Disconnecting")
             self._poller.unregister(self._socket)
             self._socket.disconnect(self._broker_addr)
             self._socket.close()
@@ -654,11 +655,11 @@ class Service(ABCService):
             name = Settings.SERVICE_DEFAULT_NAME
         self.name = name
         self.description: Annotated[str, "Keep it short"] = description
-        self.workers: dict[bytes, ABCWorker] = dict()
+        self.workers: dict[bytes, Union[Worker, RemoteWorker]] = dict()
         self.idle_workers: asyncio.Queue[bytes] = asyncio.Queue()
         self.running = False
 
-    def add_worker(self, worker: ABCWorker):
+    def add_worker(self, worker: Union[Worker, RemoteWorker]):
         if worker.identity in self.workers:
             return
         worker.service = self
@@ -666,7 +667,7 @@ class Service(ABCService):
         self.idle_workers.put_nowait(worker.identity)
         self.running = True
 
-    def remove_worker(self, worker: ABCWorker):
+    def remove_worker(self, worker: Union[Worker, RemoteWorker]):
         if worker.identity in self.workers:
             self.workers.pop(worker.identity)
         if hasattr(worker, "stop"):
@@ -674,10 +675,12 @@ class Service(ABCService):
         if not self.workers:
             self.running = False
 
-    def get_workers(self) -> dict[bytes, ABCWorker]:
+    def get_workers(self) -> dict[bytes, Union[Worker, RemoteWorker]]:
         return self.workers
 
-    async def acquire_idle_worker(self) -> Optional[ABCWorker]:
+    async def acquire_idle_worker(self) -> Union[Worker, RemoteWorker]:
+        if not self.running:
+            raise ServiceUnAvailableError(self.name)
         while 1:
             try:
                 worker_id = await asyncio.wait_for(
@@ -685,7 +688,7 @@ class Service(ABCService):
                     Settings.TIMEOUT
                 )
             except asyncio.TimeoutError:
-                return None
+                raise BusyWorkerError()
             try:
                 worker = self.workers[worker_id]
                 if worker.is_alive() and worker.max_allowed_request != 0:
@@ -696,7 +699,7 @@ class Service(ABCService):
             except KeyError:
                 continue
 
-    async def release_worker(self, worker: ABCWorker):
+    async def release_worker(self, worker: Union[Worker, RemoteWorker]):
         if worker.identity in self.workers and worker.is_alive():
             if worker.max_allowed_request >= 0:
                 await self.idle_workers.put(worker.identity)
@@ -1052,34 +1055,6 @@ def parse_zap_frame(messages):
         return None
 
 
-class RemoteGate(RemoteWorker):
-
-    def __init__(
-        self,
-        identity: bytes,
-        heartbeat: int,
-        sock: z_aio.Socket,
-        member_version: bytes,
-        cluster: "GateClusterService",
-        active_services: dict[str, int],
-    ):
-        """
-        远程 GateRPC 的本地映射
-        :param identity: Gate ID
-        :param heartbeat: 心跳间隔
-        :param member_version: 成员协议版本
-        :param cluster: GateCluster 服务实例
-        :param active_services: 工作服务
-        """
-        super().__init__(
-            identity, heartbeat,
-            Settings.MESSAGE_MAX, sock, member_version,
-            cluster
-        )
-        self.active_services = active_services
-        self.addr = None
-
-
 class AMajordomo:
     """
     异步管家模式
@@ -1124,7 +1099,7 @@ class AMajordomo:
         self.frontend_tasks: set[asyncio.Task] = set()
         # backend
         self.backend: Optional[z_aio.Socket] = None
-        self.services: dict[str, ABCService] = dict()
+        self.services: dict[str, Service] = dict()
         self.workers: dict[bytes, RemoteWorker] = dict()
         self.backend_tasks: set[asyncio.Task] = set()
         # zap
@@ -1152,7 +1127,7 @@ class AMajordomo:
             asyncio.Task,
             tuple[Callable[..., Coroutine], str, bool, tuple, dict]
         ] = dict()
-        # 由内部向后端发起的请求
+        # 保存由内部向后端发起的请求
         self.internal_requests: dict[bytes, asyncio.Future] = dict()
         # TODO: 用于跟踪客户端的请求，如果处理请求的后端服务掉线了，向可用的其他后端服务重发。
         self.cache_request: dict[bytes, tuple] = dict()
@@ -1318,7 +1293,7 @@ class AMajordomo:
         Mlogger.warning(f"ban worker({worker.identity}).")
         if worker.is_alive():
             await self.send_to_backend(
-                worker.identity,
+                worker,
                 Settings.MDP_COMMAND_DISCONNECT
             )
             worker.ready = False
@@ -1353,7 +1328,7 @@ class AMajordomo:
             )
             if time_from_last_message >= 1e-3 * worker.heartbeat:
                 await self.send_to_backend(
-                    worker.identity,
+                    worker,
                     Settings.MDP_COMMAND_HEARTBEAT
                 )
                 await asyncio.sleep(1e-3 * worker.heartbeat)
@@ -1485,11 +1460,11 @@ class AMajordomo:
         self.frontend_tasks.add(task)
         task.add_done_callback(self.cleanup_frontend_task)
 
-    async def reply_hugedata(self, client_id, request_id, reply_func, hugedata):
+    async def reply_hugedata(self, client, request_id, reply_func, hugedata):
         try:
             async for data in hugedata.compress(self._loop):
                 await reply_func(
-                    client_id,
+                    client,
                     Settings.MDP_INTERNAL_SERVICE,
                     request_id,
                     Settings.STREAM_HUGE_DATA_TAG,
@@ -1497,7 +1472,7 @@ class AMajordomo:
                 )
         except Exception as e:
             await reply_func(
-                client_id,
+                client,
                 Settings.MDP_INTERNAL_SERVICE,
                 request_id,
                 Settings.STREAM_HUGE_DATA_TAG,
@@ -1511,14 +1486,14 @@ class AMajordomo:
                 )
             )
             await reply_func(
-                client_id,
+                client,
                 Settings.MDP_INTERNAL_SERVICE,
                 request_id,
                 Settings.STREAM_HUGE_DATA_TAG,
                 e
             )
         await reply_func(
-            client_id,
+            client,
             Settings.MDP_INTERNAL_SERVICE,
             request_id,
             Settings.STREAM_HUGE_DATA_TAG,
@@ -1527,20 +1502,20 @@ class AMajordomo:
         hugedata.destroy()
 
     async def reply_agenerator(
-        self, client_id, request_id, reply_func, agenerator: AsyncGenerator
+        self, client, request_id, reply_func, agenerator: AsyncGenerator
     ):
         try:
             async for sub_reply in agenerator:
                 messages = msg_pack(sub_reply)
                 await reply_func(
-                    client_id,
+                    client,
                     Settings.MDP_INTERNAL_SERVICE,
                     request_id,
                     Settings.STREAM_GENERATOR_TAG,
                     messages
                 )
             await reply_func(
-                client_id,
+                client,
                 Settings.MDP_INTERNAL_SERVICE,
                 request_id,
                 Settings.STREAM_GENERATOR_TAG,
@@ -1555,7 +1530,7 @@ class AMajordomo:
                 )
             )
             await reply_func(
-                client_id,
+                client,
                 Settings.MDP_INTERNAL_SERVICE,
                 request_id,
                 Settings.STREAM_EXCEPT_TAG,
@@ -1680,8 +1655,9 @@ class AMajordomo:
                 return
         except ValueError:
             return
-        if request_id in self.internal_requests:
-            self.internal_requests[request_id].set_result(body)
+        if client_id == self.identity:
+            if request_id in self.internal_requests:
+                self.internal_requests[request_id].set_result(body)
         elif client_id in self.clients:
             self.frontend_tasks.add(
                 task := self._loop.create_task(
@@ -1788,27 +1764,35 @@ class AMajordomo:
         service_name: str,
         client_id: bytes,
         request_id: bytes,
-        body: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]]
+        body: Union[
+            list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]
+        ],
+        cache=False,
     ):
         service = self.services.get(service_name)
         try:
-            if not service or not service.running:
+            if not service:
                 raise ServiceUnAvailableError(service_name)
-            elif worker := await service.acquire_idle_worker():
-                option = (client_id, b"", request_id)
-                self.backend_tasks.add(
-                    task := self._loop.create_task(
-                        self.send_to_backend(
-                            worker.identity, Settings.MDP_COMMAND_REQUEST,
-                            option, body
-                        )
+            worker = await service.acquire_idle_worker()
+            option = (client_id, b"", request_id)
+            self.backend_tasks.add(
+                task := self._loop.create_task(
+                    self.send_to_backend(
+                        worker, Settings.MDP_COMMAND_REQUEST,
+                        option, body
                     )
                 )
-                task.add_done_callback(self.cleanup_backend_task)
-            else:
-                raise BusyWorkerError()
+            )
+            task.add_done_callback(self.cleanup_backend_task)
+            if client_id == self.identity:
+                self.internal_requests[request_id] = self._loop.create_future()
         except (ServiceUnAvailableError, BusyWorkerError) as exception:
             if client_id in self.clients:
+                # TODO: 在服务再次可用时，重试请求，需要吗？
+                # if cache:
+                #     self.cache_request[request_id] = (
+                #         service_name, client_id, request_id, body, self._loop.time()
+                #     )
                 exception = await generate_reply(exception=exception)
                 except_reply = msg_pack(exception)
                 self.frontend_tasks.add(
@@ -1820,10 +1804,11 @@ class AMajordomo:
                     )
                 )
                 task.add_done_callback(self.cleanup_frontend_task)
+            raise exception
 
     async def send_to_backend(
         self,
-        worker_id,
+        worker: RemoteWorker,
         command: bytes,
         option: tuple[Union[bytes, str], ...] = None,
         messages: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]] = None
@@ -1835,15 +1820,15 @@ class AMajordomo:
         if option:
             messages = (*option, *messages)
         messages = (
-            worker_id,
+            worker.identity,
             b"",
             Settings.MDP_WORKER,
             command,
             *messages
         )
         request = tuple(to_bytes(frame) for frame in messages)
-        await self.backend.send_multipart(request)
-        self.workers[worker_id].last_message_sent_time = self._loop.time()
+        await worker.sock.send_multipart(request)
+        self.workers[worker.identity].last_message_sent_time = self._loop.time()
 
     async def process_messages_from_frontend(self, request: list):
         try:
@@ -1886,10 +1871,6 @@ class AMajordomo:
                 return
         self.clients.add(client_id)
         service_name = from_bytes(service_name)
-        if Settings.DEBUG > 2:
-            self.cache_request[request_id] = (
-                service_name, client_id, request_id, body, self._loop.time()
-            )
         if service_name == Settings.MDP_INTERNAL_SERVICE:
             func_name, *body = body
             func_name = msg_unpack(func_name)
@@ -1929,13 +1910,6 @@ class AMajordomo:
                 f"service_name: {service_name}\n"
                 f"body: {body}\n"
             )
-        if request_id in self.cache_request:
-            request = self.cache_request.pop(request_id)
-            if Settings.DEBUG > 2:
-                Mlogger.debug(
-                    f"request({request_id}) use time from backend:"
-                    f" {self._loop.time() - request[-1]}"
-                )
         if client_id in self.clients:
             reply = (
                 client_id,
@@ -2024,6 +1998,33 @@ class AMajordomo:
             return b"400"
 
 
+class RemoteGate(RemoteWorker):
+
+    def __init__(
+        self,
+        identity: bytes,
+        heartbeat: int,
+        sock: z_aio.Socket,
+        member_version: bytes,
+        cluster: "GateClusterService",
+        active_services: dict[str, int],
+    ):
+        """
+        远程 GateRPC 的本地映射
+        :param identity: Gate ID
+        :param heartbeat: 心跳间隔
+        :param member_version: 成员协议版本
+        :param cluster: GateCluster 服务实例
+        :param active_services: 工作服务
+        """
+        super().__init__(
+            identity, heartbeat,
+            Settings.MESSAGE_MAX, sock, member_version,
+            cluster
+        )
+        self.active_services = active_services
+
+
 class GateClusterService(ABCService):
 
     def __init__(self, cluster_name, local_gate: "Gate"):
@@ -2034,11 +2035,11 @@ class GateClusterService(ABCService):
         self.services: dict[str, asyncio.Queue[bytes]] = dict()
         self.workers: dict[bytes, RemoteGate] = dict()
         self.idle_workers: asyncio.Queue[bytes] = asyncio.Queue()
-        self.unready_gates: dict[bytes, str] = dict()
+        self.unready_gates: dict[bytes, z_aio.Socket] = dict()
 
     def add_worker(self, gate: Optional[RemoteGate]) -> None:
         if gate.identity in self.unready_gates:
-            gate.addr = self.unready_gates.pop(gate.identity, None)
+            self.unready_gates.pop(gate.identity, None)
         self.workers[gate.identity] = gate
         for service in gate.active_services:
             if service not in self.services:
@@ -2051,6 +2052,15 @@ class GateClusterService(ABCService):
         if gate.identity in self.workers:
             self.workers.pop(gate.identity)
 
+    def cleanup_unready_gate(self, gate_id):
+        if Settings.DEBUG:
+            Glogger.debug(f"Cleanup unready gate({gate_id})")
+        if sock := self.unready_gates.pop(gate_id, None):
+            try:
+                sock.close()
+            except Exception as e:
+                Glogger.error(f"Failed to close the temporary connection: {e}")
+
     def get_workers(self) -> dict[bytes, Union[RemoteGate]]:
         return {
             g_id: gate for g_id, gate in self.workers.items()
@@ -2060,9 +2070,6 @@ class GateClusterService(ABCService):
     def online_nodes(self) -> list[bytes]:
         return [self.local_node.identity, *self.get_workers().keys()]
 
-    def remote_nodes(self) -> list[bytes]:
-        return list(self.get_workers().keys())
-
     def all_nodes(self):
         nodes = {
             self.local_node.identity, *self.workers.keys(), 
@@ -2070,21 +2077,24 @@ class GateClusterService(ABCService):
         }
         return list(nodes)
 
-    async def acquire_idle_worker(self) -> Optional[RemoteGate]:
+    async def acquire_idle_worker(self) -> RemoteGate:
+        if not self.running:
+            raise ServiceUnAvailableError(self.name)
         return await self.acquire_service_idle_worker(self.name)
 
     async def acquire_service_idle_worker(
         self, service: str
-    ) -> Optional[RemoteGate]:
+    ) -> RemoteGate:
         if service == self.name:
             idle_gates = self.idle_workers
         else:
-            idle_gates = self.services[service]
+            if not (idle_gates := self.services.get(service)):
+                raise ServiceUnAvailableError(service)
         while 1:
             try:
                 gate_id = await asyncio.wait_for(idle_gates.get(), Settings.TIMEOUT)
             except asyncio.TimeoutError:
-                return None
+                raise BusyGateError()
             try:
                 gate = self.workers[gate_id]
                 if gate.is_alive() and gate.active_services[service] != 0:
@@ -2168,7 +2178,7 @@ class Gate(AMajordomo):
         if multicast:
             self.multicast = True
         self.register_event_handler(
-            "UpdateActiveService", self.update_active_service
+            "UpdateService", self.update_service
         )
 
     def bind_gate(self, sock_opt: dict = None) -> None:
@@ -2176,6 +2186,12 @@ class Gate(AMajordomo):
             sock_opt = {z_const.IDENTITY: self.identity}
         else:
             sock_opt.update({z_const.IDENTITY: self.identity})
+        if Settings.GATE_CURVE_KEY:
+            sock_opt.update({
+                z_const.CURVE_SECRETKEY: Settings.GATE_CURVE_KEY,
+                z_const.CURVE_SERVER: True,
+            })
+
         self.gate = self.ctx.socket(z_const.ROUTER, z_aio.Socket)
         set_sock(self.gate, sock_opt)
         self.gate.bind(f"tcp://*:{self.gate_port}")
@@ -2184,16 +2200,46 @@ class Gate(AMajordomo):
         if self.gate:
             self.gate.unbind(check_socket_addr(addr))
 
-    async def connect_gate(self, gate_id, addr: str) -> None:
+    async def connect_gate(
+        self, gate_id, addr: str, sock_opt: dict = None
+    ) ->  None:
         Glogger.debug(f"Connect Gate({addr})")
-        self.gate.connect(addr)
-        self.gate_cluster.unready_gates[gate_id] = addr
-        self._loop.call_later(
-            1e-3 * self.heartbeat,
-            self.cleanup_unready_gate, gate_id
-        )
+        # self.gate.connect(addr)
+        # self.gate_cluster.unready_gates[gate_id] = addr
+        # self._loop.call_later(
+        #     1e-3 * self.heartbeat,
+        #     self.cleanup_unready_gate, gate_id
+        # )
+        if gate_id in self.gate_cluster.workers:
+            raise RuntimeError(f"Gate has already been connected.")
+        if not (sock := self.gate_cluster.unready_gates.get(gate_id)):
+            if not sock_opt:
+                sock_opt = {z_const.IDENTITY: self.identity}
+            else:
+                sock_opt.update({z_const.IDENTITY: self.identity})
+            if Settings.GATE_CURVE_PUBKEY:
+                _pub, _pri = curve_keypair()
+                sock_opt.update({
+                    z_const.CURVE_SECRETKEY: _pri,
+                    z_const.CURVE_PUBLICKEY: _pub,
+                    z_const.CURVE_SERVERKEY: Settings.GATE_CURVE_PUBKEY,
+                })
+            sock = self.ctx.socket(
+                z_const.DEALER, z_aio.Socket
+            )
+            set_sock(sock, sock_opt)
+            sock.connect(addr)
+            self._loop.call_later(
+                self.heartbeat * Settings.MDP_HEARTBEAT_INTERVAL / 1000,
+                self.gate_cluster.cleanup_unready_gate,
+                gate_id
+            )
+            self.gate_cluster.unready_gates[gate_id] = sock
+
         await asyncio.sleep(0)
-        await self.send_invite_command(gate_id)
+        if Settings.DEBUG > 1:
+            Glogger.debug(f"Invite Gate({gate_id})")
+        await self.send_invite_command(sock)
 
     async def disconnect_all(self):
         await super().disconnect_all()
@@ -2250,7 +2296,7 @@ class Gate(AMajordomo):
             return await super().internal_interface(
                 client_id, request_id, func_name, args, kwargs
             )
-        elif client_id not in self.gate_cluster.get_workers():
+        elif not (gate := self.gate_cluster.get_workers().get(client_id)):
             if Settings.DEBUG > 2:
                 raise RuntimeError(
                     f"client_id({client_id}) not in clients or gates"
@@ -2300,21 +2346,21 @@ class Gate(AMajordomo):
         if isinstance(reply, HugeData):
             task = self._loop.create_task(
                 self.reply_hugedata(
-                    client_id, request_id, self.reply_gate, reply
+                    gate, request_id, self.reply_gate, reply
                 ),
                 name=f"GateReplyGateHD-{client_id}-{request_id}"
             )
         elif isinstance(reply, AsyncGenerator):
             task = self._loop.create_task(
                 self.reply_agenerator(
-                    client_id, request_id, self.reply_gate, reply
+                    gate, request_id, self.reply_gate, reply
                 ),
                 name=f"GateReplyGateAG-{client_id}-{request_id}"
             )
         else:
             task = self._loop.create_task(
                 self.reply_gate(
-                    client_id, Settings.MDP_INTERNAL_SERVICE,
+                    gate, Settings.MDP_INTERNAL_SERVICE,
                     request_id, msg_pack(reply)
                 )
             )
@@ -2328,11 +2374,11 @@ class Gate(AMajordomo):
                 return
         except ValueError:
             return
-        if client_id in self.gate_cluster.get_workers():
+        if gate := self.gate_cluster.get_workers().get(client_id):
             self.gate_tasks.add(
                 task := self._loop.create_task(
                     self.reply_gate(
-                        client_id, service_name, request_id, *body
+                        gate, service_name, request_id, *body
                     )
                 )
             )
@@ -2353,71 +2399,72 @@ class Gate(AMajordomo):
         self.request_map[request_id] = client_id
         if not self.gate_cluster.get_workers():
             raise GateUnAvailableError()
-        elif service_name not in self.gate_cluster.services:
-            raise ServiceUnAvailableError(service_name)
-        elif gate := await self.gate_cluster.acquire_service_idle_worker(
-                service_name
-        ):
-            self.gate_tasks.add(
-                task := self._loop.create_task(
-                    self.send_whisper_command(
-                        gate.identity,
-                        request_id,
-                        service_name,
-                        body
-                    )
+        gate = await self.gate_cluster.acquire_service_idle_worker(service_name)
+        self.gate_tasks.add(
+            task := self._loop.create_task(
+                self.send_whisper_command(
+                    gate,
+                    request_id,
+                    service_name,
+                    body
                 )
             )
-            task.add_done_callback(self.cleanup_gate_task)
-        else:
-            raise BusyGateError()
+        )
+        task.add_done_callback(self.cleanup_gate_task)
 
     async def request_backend(
         self,
         service_name: str,
         client_id: bytes,
         request_id: bytes,
-        body: Union[list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]]
+        body: Union[
+            list[Union[bytes, str], ...], tuple[Union[bytes, str], ...]
+        ],
+        cache=False
     ):
-        service = self.services.get(service_name)
         try:
-            if (
-                    service and service.running
-                    and (worker := await service.acquire_idle_worker())
-            ):
+            try:
+                if not (service := self.services.get(service_name)):
+                    raise ServiceUnAvailableError(service_name)
+                worker = await service.acquire_idle_worker()
                 option = (client_id, b"", request_id)
                 self.backend_tasks.add(
                     task := self._loop.create_task(
                         self.send_to_backend(
-                            worker.identity, Settings.MDP_COMMAND_REQUEST,
+                            worker, Settings.MDP_COMMAND_REQUEST,
                             option, body
                         )
                     )
                 )
                 task.add_done_callback(self.cleanup_backend_task)
-            else:
+            except (ServiceUnAvailableError, BusyWorkerError) as exception:
+                if service_name not in self.gate_cluster.services:
+                    raise exception
                 await self.forward_request(
                     service_name, request_id, client_id, body
                 )
+            if client_id == self.identity:
+                self.internal_requests[request_id] = self._loop.create_future()
         except (
-                ServiceUnAvailableError, GateUnAvailableError, BusyGateError
+                ServiceUnAvailableError, GateUnAvailableError,
+                BusyWorkerError, BusyGateError
         ) as exception:
-            exception = await generate_reply(exception=exception)
-            except_reply = msg_pack(exception)
-            if Settings.DEBUG:
+            except_reply = await generate_reply(exception=exception)
+            except_reply = msg_pack(except_reply)
+            if Settings.DEBUG > 1:
                 Glogger.error(except_reply)
-            if client_id in self.gate_cluster.get_workers():
+            if gate := self.gate_cluster.get_workers().get(client_id):
                 Glogger.debug("reply gate")
                 self.gate_tasks.add(
                     task := self._loop.create_task(
                         self.reply_gate(
-                            client_id, service_name, request_id,
+                            gate, service_name, request_id,
                             except_reply
                         )
                     )
                 )
                 task.add_done_callback(self.cleanup_gate_task)
-            if client_id in self.clients:
+            elif client_id in self.clients:
                 Glogger.debug("reply client")
                 self.frontend_tasks.add(
                     task := self._loop.create_task(
@@ -2428,6 +2475,7 @@ class Gate(AMajordomo):
                     )
                 )
                 task.add_done_callback(self.cleanup_frontend_task)
+            raise exception
 
     async def build_gate_zap_frames(self) -> tuple[bytes, ...]:
         """
@@ -2439,21 +2487,13 @@ class Gate(AMajordomo):
         else:
             return tuple()
 
-    def cleanup_unready_gate(self, gate_id):
-        if Settings.DEBUG > 1:
-            Glogger.debug(f"Cleanup unready gate({gate_id})")
-        if gate_addr := self.gate_cluster.unready_gates.pop(gate_id, None):
-            try:
-                self.gate.disconnect(gate_addr)
-            except Exception as e:
-                Glogger.debug(e)
-
-    async def register_gate(
-        self, gate_id, sock, member_version, active_services
-    ):
+    async def register_gate(self, gate_id, active_services):
+        if Settings.DEBUG:
+            Glogger.info(f"register Gate({gate_id})")
+        sock = self.gate_cluster.unready_gates[gate_id]
         gate = self.RemoteGateClass(
             gate_id, self.heartbeat,
-            sock, member_version,
+            sock, Settings.GATE_MEMBER,
             self.gate_cluster,
             active_services
         )
@@ -2473,15 +2513,14 @@ class Gate(AMajordomo):
         Glogger.warning(f"ban gate({gate.identity}).")
         if gate.is_alive():
             await self.send_to_gate(
-                gate.identity,
+                gate,
                 Settings.GATE_COMMAND_LEAVE,
             )
             gate.ready = False
             gate.heartbeat_task.cancel()
         self.gate_cluster.remove_worker(gate)
-        if gate.addr:
-            Glogger.warning(f"disconnect gate({gate.addr})")
-            self.gate.disconnect(gate.addr)
+        Glogger.warning(f"gate({gate.identity}).sock.close()")
+        gate.sock.close()
         return True
 
     async def ban_gate_at_expiration(self, gate: RemoteGate):
@@ -2513,8 +2552,8 @@ class Gate(AMajordomo):
                 )
                 if time_from_last_message >= 1e-3 * gate.heartbeat:
                     await self.send_to_gate(
-                        gate.identity,
-                        Settings.MDP_COMMAND_HEARTBEAT
+                        gate,
+                        Settings.GATE_COMMAND_HEARTBEAT
                     )
                     await asyncio.sleep(1e-3 * gate.heartbeat)
                 else:
@@ -2530,11 +2569,9 @@ class Gate(AMajordomo):
                               f"\n{exception_info}")
             Glogger.warning(f"gate task exception:\n{exception_info}")
 
-    async def send_invite_command(self, gate_id):
-        if Settings.DEBUG > 1:
-            Glogger.debug(f"Invite Gate({gate_id})")
+    async def send_invite_command(self, sock):
         await self.send_to_gate(
-            gate_id,
+            sock,
             Settings.GATE_COMMAND_INVITE
         )
 
@@ -2542,6 +2579,13 @@ class Gate(AMajordomo):
         await self.send_join_command(gate_id)
 
     async def send_join_command(self, gate_id):
+        if not (
+                (gate_sock := self.gate_cluster.unready_gates.get(gate_id))
+            or (gate_sock := self.gate_cluster.workers.get(gate_id))
+        ):
+            if not Settings.SECURE:
+                Glogger.error(f"Not connected to the {gate_id}.")
+            return
         if Settings.DEBUG > 1:
             Glogger.debug(f"Join to Gate({gate_id})")
         services = {
@@ -2552,37 +2596,22 @@ class Gate(AMajordomo):
             for name, service in self.services.items()
         }
         await self.send_to_gate(
-            gate_id,
+            gate_sock,
             Settings.GATE_COMMAND_JOIN,
             messages=msg_pack(services)
         )
 
     async def process_join_command(self, gate_id, active_services):
-        if gate_id not in self.gate_cluster.all_nodes():
-            if Settings.DEBUG:
-                Glogger.debug(
-                    "recv JOIN command, send JOIN command to gate"
-                )
-            self.gate_tasks.add(
-                task := self._loop.create_task(
-                    self.send_join_command(gate_id)
-                )
-            )
-            task.add_done_callback(self.cleanup_gate_task)
-        await self.register_gate(
-            gate_id, self.gate,
-            Settings.GATE_MEMBER,
-            active_services
-        )
+        await self.register_gate(gate_id, active_services)
 
     async def send_whisper_command(
-        self, gate_id, request_id, service_name, body
+        self, gate, request_id, service_name, body
     ):
         if Settings.DEBUG > 1:
-            Glogger.debug(f"Send WHISPER to {gate_id}")
+            Glogger.debug(f"Send WHISPER to {gate.identity}")
         option = (service_name, request_id)
         await self.send_to_gate(
-            gate_id,
+            gate,
             Settings.GATE_COMMAND_WHISPER,
             option,
             body
@@ -2633,11 +2662,11 @@ class Gate(AMajordomo):
                     )
                 )
                 task.add_done_callback(self.cleanup_frontend_task)
-            elif client_id in self.gate_cluster.get_workers():
+            elif gate := self.gate_cluster.get_workers().get(client_id):
                 self.gate_tasks.add(
                     task := self._loop.create_task(
                         self.reply_gate(
-                            client_id, service_name,
+                            gate, service_name,
                             request_id, *body
                         )
                     )
@@ -2722,9 +2751,9 @@ class Gate(AMajordomo):
         if Settings.DEBUG > 1:
             Glogger.debug(f"Send NOTICE ({event_name})")
         option = (notice_id, event_name)
-        for gate_id in self.gate_cluster.remote_nodes():
+        for gate in self.gate_cluster.get_workers().values():
             await self.send_to_gate(
-                gate_id,
+                gate,
                 Settings.GATE_COMMAND_NOTICE,
                 option,
                 body
@@ -2850,13 +2879,13 @@ class Gate(AMajordomo):
 
     async def reply_gate(
         self,
-        gate_id: bytes,
+        gate: RemoteGate,
         service: str,
         request_id: bytes,
         *body,
     ):
         await self.send_to_gate(
-            gate_id,
+            gate,
             Settings.GATE_COMMAND_WHISPER,
             (service, request_id),
             body
@@ -2864,7 +2893,7 @@ class Gate(AMajordomo):
 
     async def send_to_gate(
         self,
-        gate_id,
+        gate: Union[RemoteGate, z_aio.Socket],
         command: Union[bytes, str],
         option: tuple[Union[bytes, str], ...] = None,
         messages: Union[Union[bytes, str], tuple[Union[bytes, str], ...]] = None,
@@ -2876,7 +2905,6 @@ class Gate(AMajordomo):
         if option:
             messages = (*option, *messages)
         messages = (
-            gate_id,
             b"",
             Settings.GATE_MEMBER,
             command,
@@ -2884,9 +2912,12 @@ class Gate(AMajordomo):
             *messages
         )
         messages = tuple(to_bytes(s) for s in messages)
-        await self.gate.send_multipart(messages)
-        if gate := self.gate_cluster.get_workers().get(gate_id):
+        if isinstance(gate, RemoteGate):
+            await gate.sock.send_multipart(messages)
+            # if gate := self.gate_cluster.get_workers().get(gate.identity):
             gate.last_message_sent_time = self._loop.time()
+        elif isinstance(gate, z_aio.Socket):
+            await gate.send_multipart(messages)
 
     def _multicast_recv_callback(self, data, addr):
         task = self._loop.create_task(
@@ -2970,7 +3001,7 @@ class Gate(AMajordomo):
 
     async def process_mcast_messages(self, messages, addr: tuple):
         try:
-            if Settings.DEBUG > 1:
+            if Settings.DEBUG > 2:
                 Glogger.debug(
                     f"recv mcast message from {addr}:\n{messages}"
                 )
@@ -2985,11 +3016,6 @@ class Gate(AMajordomo):
             )
         except (ValueError, TypeError):
             return
-        if Settings.DEBUG > 1:
-            Glogger.debug(
-                f"gate_id: {gate_id}, gate_v: {gate_v}, command: {command}, "
-                f"cluster_id: {cluster_id}, port: {port}"
-            )
         if (
                 gate_id == self.identity
                 or gate_v != Settings.GATE_MEMBER
@@ -2997,9 +3023,16 @@ class Gate(AMajordomo):
                 or cluster_id != self.gate_cluster.identity
         ):
             return
+        if Settings.DEBUG > 1:
+            Glogger.debug(
+                f"gate_id: {gate_id}, gate_v: {gate_v}, command: {command}, "
+                f"cluster_id: {cluster_id}, port: {port}"
+            )
         if gate := self.gate_cluster.get_workers().get(gate_id, None):
             await self.delay_ban_gate(gate)
-        if gate_id not in self.gate_cluster.all_nodes():
+        elif gate_sock := self.gate_cluster.unready_gates.get(gate_id):
+            await self.send_invite_command(gate_sock)
+        elif gate_id not in self.gate_cluster.online_nodes():
             host = addr[0]
             if len(addr) > 2:
                 host = f"[{host}]"
@@ -3084,7 +3117,7 @@ class Gate(AMajordomo):
         services.extend(self.gate_cluster.services.keys())
         return services
 
-    async def update_active_service(self, gate: RemoteGate, *body):
+    async def update_service(self, gate: RemoteGate, *body):
         service_name = msg_unpack(body[0])
         num = msg_unpack(body[1])
         assert isinstance(service_name, str)

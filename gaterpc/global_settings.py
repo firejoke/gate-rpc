@@ -186,7 +186,7 @@ class GlobalSettings(object):
     # MDP
     MDP_HEARTBEAT_INTERVAL: int = LazyAttribute(
         render=lambda instance, p: instance.HEARTBEAT if p is empty else p
-    )  # # millisecond
+    )  # millisecond
     MDP_HEARTBEAT_LIVENESS: int = 3
     MDP_INTERNAL_SERVICE: str = "Gate"
     MDP_VERSION: str = "01"
@@ -225,6 +225,8 @@ class GlobalSettings(object):
     GATE_MEMBER: bytes = LazyAttribute(
         render=lambda instance, p: f"GATE{instance.GATE_VERSION}".encode("utf-8")
     )
+    GATE_CURVE_PUBKEY: bytes = b""
+    GATE_CURVE_KEY: bytes = b""
 
     GATE_IP_VERSION: int = 4
     GATE_MULTICAST_GROUP: str = "224.0.7.7"

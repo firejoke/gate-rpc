@@ -98,7 +98,7 @@ def check_socket_addr(socket_addr: Optional[str]) -> Optional[str]:
 
 
 class MulticastProtocol(asyncio.DatagramProtocol):
-    def __init__(self, recv_callback: Callable[[bytes, tuple]]):
+    def __init__(self, recv_callback: Callable[[bytes, tuple], None]):
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.recv_callback = recv_callback
 

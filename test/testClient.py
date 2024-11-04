@@ -11,6 +11,8 @@ from traceback import format_exception
 
 import zmq.constants as z_const
 import zmq.auth
+from zmq import curve_keypair
+
 
 base_path = Path(__file__).parent
 sys.path.append(base_path.parent.as_posix())
@@ -27,12 +29,8 @@ if curve_dir.exists():
     g_public, _ = zmq.auth.load_certificate(
         curve_dir.joinpath("gate.key")
     )
-    cw_public, cw_secret = zmq.auth.load_certificate(
-        curve_dir.joinpath("cw.key_secret")
-    )
 else:
     g_public = b""
-    cw_public = cw_secret = b""
 
 Settings.configure("USER_SETTINGS", testSettings)
 logger = getLogger("commands")
@@ -52,11 +50,12 @@ def cleanup_t(t: asyncio.Task):
 
 async def client(frontend_addr):
     loop = asyncio.get_running_loop()
-    if cw_secret:
+    if g_public:
+        _p, _k = curve_keypair()
         Settings.ZMQ_SOCK.update(
             {
-                z_const.CURVE_SECRETKEY: cw_secret,
-                z_const.CURVE_PUBLICKEY: cw_public,
+                z_const.CURVE_SECRETKEY: _k,
+                z_const.CURVE_PUBLICKEY: _p,
                 z_const.CURVE_SERVERKEY: g_public,
             }
         )
