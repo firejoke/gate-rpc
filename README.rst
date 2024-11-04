@@ -457,7 +457,7 @@ decompress 方法对每一块返回的大小限制则是由压缩模块来实现
 
 在用到 Gate 集群时，不建议使用 Settings.ZMQ_SOCK 全局配置，
 
-~`因为 Gate 集群的节点互联是使用的单一 ROUTE 套接字，绑定和连接都是同一个 ROUTE 套接字`~
+<del>`因为 Gate 集群的节点互联是使用的单一 ROUTE 套接字，绑定和连接都是同一个 ROUTE 套接字`</del>
 
 Gate 集群节点间互联，会单独使用一个 DEALER 套接字连接其他节点的 ROUTE 套接字
 
