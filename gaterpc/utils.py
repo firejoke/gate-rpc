@@ -36,10 +36,15 @@ from importlib import import_module
 from pathlib import Path
 from functools import _make_key, partial, update_wrapper
 
-from collections import deque, namedtuple
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections import OrderedDict, deque, namedtuple
+from collections.abc import (
+    AsyncGenerator, Callable, Generator, Awaitable, Coroutine
+)
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from typing import Any, Optional, TypeVar, Union, ByteString, overload
+from typing import (
+    Any, Optional, TypeVar, Union, ByteString,
+    overload,
+)
 
 import msgpack
 
@@ -188,74 +193,74 @@ empty = Empty()
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
-class LRUCache:
-    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3
+class KVLRUCache:
 
-    def __init__(self, maxsize: int):
+    def __init__(self, maxsize: int = 128, max_tracking_entries: int = 1000):
+        if maxsize <= 0:
+            raise ValueError("maxsize must be a positive integer")
         self.maxsize = maxsize
-        self.hits = self.misses = 0
+        self.max_tracking_entries = max_tracking_entries
+        self.tracking_entries = OrderedDict()
         self.full = False
-        self.root = []
-        self.root[:] = [self.root, self.root, None, None]
-        self.cache = dict()
+        self.cache = OrderedDict()
 
     def __contains__(self, item):
         if item in self.cache:
             return True
         return False
 
+    def __len__(self):
+        return len(self.cache)
+
     def __setitem__(self, key, value):
         if key in self.cache:
+            if value != self.cache[key]:
+                self.cache[key] = value
+                self.cache.move_to_end(key)
             return
         if self.full:
-            oldroot = self.root
-            oldroot[self.KEY] = key
-            oldroot[self.RESULT] = value
-            self.root = oldroot[self.NEXT]
-            oldkey = self.root[self.KEY]
-            oldresult = self.root[self.RESULT]
-            self.root[self.KEY] = self.root[self.RESULT] = None
-            del self.cache[oldkey]
-            self.cache[key] = oldroot
-        else:
-            last = self.root[self.PREV]
-            link = [last, self.root, key, value]
-            last[self.NEXT] = self.root[self.PREV] = self.cache[key] = link
-            self.full = len(self.cache) >= self.maxsize
+            self.cache.popitem(last=False)
+        self.cache[key] = value
+        self.full = len(self.cache) >= self.maxsize
 
     def __getitem__(self, item):
-        if (link := self.cache.get(item, None)) is not None:
-            link_prev, link_next, _key, result = link
-            link_prev[self.NEXT] = link_next
-            link_next[self.PREV] = link_prev
-            last = self.root[self.PREV]
-            last[self.NEXT] = self.root[self.PREV] = link
-            link[self.PREV] = last
-            link[self.NEXT] = self.root
-            self.hits += 1
-            return result
-        self.misses += 1
+        if item in self.cache:
+            self.cache.move_to_end(item)
+            hit = True
+        else:
+            hit = False
+        if self.max_tracking_entries > 0:
+            hits, misses = self.tracking_entries.get(item, (0, 0))
+            if hits or misses:
+                self.tracking_entries.move_to_end(item)
+            if len(self.tracking_entries) >= self.max_tracking_entries:
+                self.tracking_entries.popitem(last=False)
+            if hit:
+                hits += 1
+            else:
+                misses += 1
+            self.tracking_entries[item] = (hits, misses)
+        if hit:
+            return self.cache[item]
         raise KeyError
 
     def __repr__(self):
-        return (f"hits: {self.hits}, misses: {self.misses},"
+        hits = misses = 0
+        for _h, _m in self.tracking_entries.values():
+            hits += _h
+            misses += _m
+        return (f"hits: {hits}, misses: {misses},"
                 f" maxsize: {self.maxsize}, cache size: {len(self.cache)}")
 
 
-def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
+def _coroutine_lru_cache_wrapper(
+    user_function: Callable[..., Awaitable], maxsize, typed, _CacheInfo
+):
     loop = asyncio.get_event_loop()
-    sentinel = object()
     make_key = _make_key
-    PREV, NEXT, KEY, RESULT = 0, 1, 2, 3
-
-    cache = {}
+    cache = OrderedDict()
     hits = misses = 0
     full = False
-    cache_get = cache.get
-    cache_len = cache.__len__
-    lock = threading.RLock()
-    root = []
-    root[:] = [root, root, None, None]
 
     if maxsize == 0:
 
@@ -270,70 +275,42 @@ def _coroutine_lru_cache_wrapper(user_function, maxsize, typed, _CacheInfo):
         async def wrapper(*args, **kwds):
             nonlocal hits, misses
             key = make_key(args, kwds, typed)
-            result = cache_get(key, sentinel)
-            if result is not sentinel:
+            if key not in cache:
+                misses += 1
+                cache[key] = result = await user_function(*args, **kwds)
+            else:
                 hits += 1
-                return await result
-            cache[key] = f = loop.create_future()
-            misses += 1
-            result = await user_function(*args, **kwds)
-            f.set_result(result)
+                cache.move_to_end(key)
+                result = cache[key]
             return result
 
     else:
 
         async def wrapper(*args, **kwds):
-            nonlocal root, hits, misses, full
+            nonlocal hits, misses, full
             key = make_key(args, kwds, typed)
-            with lock:
-                link = cache_get(key)
-                if link is not None:
-                    link_prev, link_next, _key, result = link
-                    link_prev[NEXT] = link_next
-                    link_next[PREV] = link_prev
-                    last = root[PREV]
-                    last[NEXT] = root[PREV] = link
-                    link[PREV] = last
-                    link[NEXT] = root
-                    hits += 1
-                    return result
+            if key not in cache:
                 misses += 1
-            f = loop.create_future()
-            with lock:
-                if key in cache:
-                    pass
-                elif full:
-                    oldroot = root
-                    oldroot[KEY] = key
-                    oldroot[RESULT] = f
-                    root = oldroot[NEXT]
-                    oldkey = root[KEY]
-                    oldresult = root[RESULT]
-                    root[KEY] = root[RESULT] = None
-                    del cache[oldkey]
-                    cache[key] = oldroot
-                else:
-                    last = root[PREV]
-                    link = [last, root, key, f]
-                    last[NEXT] = root[PREV] = cache[key] = link
-                    full = (cache_len() >= maxsize)
-
-            f.set_result(await user_function(*args, **kwds))
-            return await f
+                if full:
+                    cache.popitem(last=False)
+                cache[key] = result = await user_function(*args, **kwds)
+            else:
+                hits += 1
+                cache.move_to_end(key)
+                result = cache[key]
+            full = len(cache) >= maxsize
+            return result
 
     def cache_info():
         """Report cache statistics"""
-        with lock:
-            return _CacheInfo(hits, misses, maxsize, cache_len())
+        return _CacheInfo(hits, misses, maxsize, len(cache))
 
     def cache_clear():
         """Clear the cache and cache statistics"""
         nonlocal hits, misses, full
-        with lock:
-            cache.clear()
-            root[:] = [root, root, None, None]
-            hits = misses = 0
-            full = False
+        cache.clear()
+        hits = misses = 0
+        full = False
 
     wrapper.cache_info = cache_info
     wrapper.cache_clear = cache_clear
