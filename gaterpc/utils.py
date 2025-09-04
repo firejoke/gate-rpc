@@ -204,6 +204,10 @@ class KVLRUCache:
         self.full = False
         self.cache = OrderedDict()
 
+    def drop(self, key):
+        self.tracking_entries.pop(key, None)
+        self.cache.pop(key, None)
+
     def __contains__(self, item):
         if item in self.cache:
             return True
