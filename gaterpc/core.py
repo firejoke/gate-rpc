@@ -32,7 +32,7 @@ from .exceptions import (
     RemoteException,
 )
 from .utils import (
-    MulticastProtocol, HugeData, LRUCache, MsgUnpackError, StreamReply,
+    MulticastProtocol, HugeData, KVLRUCache, MsgUnpackError, StreamReply,
     check_socket_addr, Empty, empty, generator_to_agenerator,
     throw_exception_agenerator,
     interface, run_in_executor, from_bytes, msg_pack, msg_unpack, to_bytes,
@@ -1107,7 +1107,7 @@ class AMajordomo:
         self.zap_addr: str = ""
         self.zap_domain: bytes = b""
         self.zap_replies: dict[bytes, asyncio.Future] = dict()
-        self.zap_cache = LRUCache(128)
+        self.zap_cache = KVLRUCache(128, 256)
         self.zap_tasks: set[asyncio.Task] = set()
         # majordomo
         if not heartbeat:
