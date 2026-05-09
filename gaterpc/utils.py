@@ -2,7 +2,6 @@
 # Author      : ShiFan
 # Created Date: 2023/5/22 16:36
 import asyncio
-import atexit
 import bz2
 import copy
 import functools
@@ -21,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+import weakref
 
 import zlib
 
@@ -41,6 +41,7 @@ from collections.abc import (
     AsyncGenerator, Callable, Generator, Awaitable, Coroutine
 )
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import (
     Any, Optional, TypeVar, Union, ByteString,
     overload,
@@ -52,10 +53,35 @@ from .exceptions import BadGzip, HugeDataException, RemoteException
 
 
 logger = getLogger("commands")
-SyncManager = Manager()
 
 
-class UnixEPollEventLoopPolicy(asyncio.unix_events.DefaultEventLoopPolicy):
+class _LazySyncManager:
+    """延迟启动 multiprocessing.Manager，避免模块导入时 fork 子进程。"""
+
+    __slots__ = ("_manager",)
+
+    def __init__(self):
+        self._manager = None
+
+    def _ensure(self):
+        if self._manager is None:
+            self._manager = Manager()
+        return self._manager
+
+    def __getattr__(self, item):
+        return getattr(self._ensure(), item)
+
+
+SyncManager = _LazySyncManager()
+
+
+_BaseEventLoopPolicy = getattr(
+    asyncio.unix_events, 'DefaultEventLoopPolicy',
+    getattr(asyncio.unix_events, '_DefaultEventLoopPolicy', None)
+)
+
+
+class UnixEPollEventLoopPolicy(_BaseEventLoopPolicy):
     _loop_factory = asyncio.unix_events.SelectorEventLoop
 
     def new_event_loop(self):
@@ -195,11 +221,12 @@ _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 class KVLRUCache:
 
-    def __init__(self, maxsize: int = 128, max_tracking_entries: int = 1000):
+    def __init__(self, maxsize: int = 128, max_tracking_entries: int = 1000, debug: bool = False):
         if maxsize <= 0:
             raise ValueError("maxsize must be a positive integer")
         self.maxsize = maxsize
         self.max_tracking_entries = max_tracking_entries
+        self.debug = debug
         self.tracking_entries = OrderedDict()
         self.full = False
         self.cache = OrderedDict()
@@ -233,7 +260,7 @@ class KVLRUCache:
             hit = True
         else:
             hit = False
-        if self.max_tracking_entries > 0:
+        if self.debug and self.max_tracking_entries > 0:
             hits, misses = self.tracking_entries.get(item, (0, 0))
             if hits or misses:
                 self.tracking_entries.move_to_end(item)
@@ -260,7 +287,6 @@ class KVLRUCache:
 def _coroutine_lru_cache_wrapper(
     user_function: Callable[..., Awaitable], maxsize, typed, _CacheInfo
 ):
-    loop = asyncio.get_event_loop()
     make_key = _make_key
     cache = OrderedDict()
     hits = misses = 0
@@ -387,6 +413,8 @@ _PV = TypeVar("_PV")
 
 class LazyAttribute:
 
+    _CACHE_KEY = "_lazy_attribute_cache_"
+
     def __init__(
         self, raw: Any = empty,
         render: Callable[[_I, _PV], Any] = None,
@@ -400,15 +428,25 @@ class LazyAttribute:
         self._name = name
 
     def __get__(self, instance, owner=None):
-        if self._render:
-            return self._render(instance, self._raw)
-        return self._raw
+        if instance is None:
+            return self
+        if self._render is None:
+            return self._raw
+        cache = instance.__dict__.setdefault(self._CACHE_KEY, {})
+        if self._name in cache:
+            return cache[self._name]
+        value = self._render(instance, self._raw)
+        cache[self._name] = value
+        return value
 
     def __set__(self, instance, value):
         if self._process:
             self._raw = self._process(instance, value)
         else:
             self._raw = value
+        cache = instance.__dict__.get(self._CACHE_KEY)
+        if cache is not None:
+            cache.clear()
 
 
 class ColorFormatter(Formatter):
@@ -478,7 +516,7 @@ class QueueListener(object):
         self._thread = None
         if handlers:
             self.add_handlers(handlers)
-        atexit.register(self.stop)
+        self._finalizer = weakref.finalize(self, self._cleanup, self.queue, self._sentinel)
         self.start()
 
     def add_handlers(self, handlers: Union[list[Handler], tuple[Handler]]):
@@ -508,26 +546,40 @@ class QueueListener(object):
     def enqueue_sentinel(self):
         self.queue.put_nowait(self._sentinel)
 
-    def _monitor(self):
+    def start(self):
+        self_ref = weakref.ref(self)
         q = self.queue
+        sentinel = self._sentinel
         has_task_done = hasattr(q, 'task_done')
-        while True:
-            try:
-                record = self.dequeue()
-                if record is self._sentinel:
+
+        def _monitor():
+            while True:
+                try:
+                    record = q.get()
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    warnings.warn(e.__repr__())
+                    continue
+                if record is sentinel:
                     if has_task_done:
                         q.task_done()
-                    break
-                self.handle(record)
-                if has_task_done:
-                    q.task_done()
-            except queue.Empty:
-                break
-            except Exception as e:
-                warnings.warn(e.__repr__())
+                    return
+                listener = self_ref()
+                if listener is None:
+                    if has_task_done:
+                        q.task_done()
+                    return
+                try:
+                    listener.handle(record)
+                except Exception as e:
+                    warnings.warn(e.__repr__())
+                finally:
+                    if has_task_done:
+                        q.task_done()
+                del listener
 
-    def start(self):
-        self._thread = t = threading.Thread(target=self._monitor)
+        self._thread = t = threading.Thread(target=_monitor)
         t.daemon = True
         t.start()
 
@@ -536,6 +588,10 @@ class QueueListener(object):
             self.enqueue_sentinel()
             self._thread.join()
             self._thread = None
+
+    @staticmethod
+    def _cleanup(q, sentinel):
+        q.put_nowait(sentinel)
 
 
 class AQueueListener(object):
@@ -551,7 +607,7 @@ class AQueueListener(object):
         self._task: Optional[asyncio.Task] = None
         if handlers:
             self.add_handlers(handlers)
-        atexit.register(self.stop)
+        self._finalizer = weakref.finalize(self, self._cleanup, self.queue, self._sentinel)
         # self._loop.call_soon(self.start)
         self.start()
 
@@ -585,31 +641,49 @@ class AQueueListener(object):
     def enqueue_sentinel(self):
         self.queue.put_nowait(self._sentinel)
 
-    async def _monitor(self):
+    def start(self):
+        self_ref = weakref.ref(self)
         q = self.queue
+        sentinel = self._sentinel
         has_task_done = hasattr(q, 'task_done')
-        while True:
-            try:
-                record = await self.dequeue()
-                if record is self._sentinel:
+
+        async def _monitor():
+            while True:
+                try:
+                    record = await q.get()
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    warnings.warn(e.__repr__())
+                    continue
+                if record is sentinel:
                     if has_task_done:
                         q.task_done()
-                    break
-                await self.handle(record)
-                if has_task_done:
-                    q.task_done()
-            except queue.Empty:
-                break
-            except Exception as e:
-                warnings.warn(e.__repr__())
+                    return
+                listener = self_ref()
+                if listener is None:
+                    if has_task_done:
+                        q.task_done()
+                    return
+                try:
+                    await listener.handle(record)
+                except Exception as e:
+                    warnings.warn(e.__repr__())
+                finally:
+                    if has_task_done:
+                        q.task_done()
+                del listener
 
-    def start(self):
-        self._task = asyncio.create_task(self._monitor())
+        self._task = asyncio.create_task(_monitor())
 
     def stop(self):
         if self._task:
             self.enqueue_sentinel()
             # self._task.cancel()
+
+    @staticmethod
+    def _cleanup(q, sentinel):
+        q.put_nowait(sentinel)
 
 
 class AQueueHandler(Handler):
@@ -667,11 +741,20 @@ class MessagePack(object):
     用于配置全局的msgpack
     """
 
+    DEFAULT_MAX_STR_LEN = 32 * 1024 * 1024
+    DEFAULT_MAX_BIN_LEN = 32 * 1024 * 1024
+    DEFAULT_MAX_ARRAY_LEN = 1 << 20
+    DEFAULT_MAX_MAP_LEN = 1 << 20
+
     def __init__(self):
         self.prepare_pack: Optional[Callable] = None
         self.unpack_object_hook: Optional[Callable] = None
         self.unpack_object_pairs_hook: Optional[Callable] = None
         self.unpack_list_hook: Optional[Callable] = None
+        self.max_str_len: int = self.DEFAULT_MAX_STR_LEN
+        self.max_bin_len: int = self.DEFAULT_MAX_BIN_LEN
+        self.max_array_len: int = self.DEFAULT_MAX_ARRAY_LEN
+        self.max_map_len: int = self.DEFAULT_MAX_MAP_LEN
 
     def __setattr__(self, key, value):
         if key in (
@@ -698,7 +781,13 @@ class MessagePack(object):
             data,
             object_hook=self.unpack_object_hook,
             object_pairs_hook=self.unpack_object_pairs_hook,
-            list_hook=self.unpack_list_hook
+            list_hook=self.unpack_list_hook,
+            raw=False,
+            strict_map_key=False,
+            max_str_len=self.max_str_len,
+            max_bin_len=self.max_bin_len,
+            max_array_len=self.max_array_len,
+            max_map_len=self.max_map_len,
         )
         return obj
 
@@ -767,7 +856,7 @@ class StreamReply(AsyncGenerator):
         except RuntimeError:
             self._loop = asyncio.get_event_loop()
         self.end_message = end_message
-        self.replies = asyncio.Queue(maxsize, loop=self._loop)
+        self.replies = asyncio.Queue(maxsize)
         self.timeout = timeout
         self._exit = False
         self._pause = False
@@ -780,16 +869,15 @@ class StreamReply(AsyncGenerator):
 
     async def __anext__(self):
         if self._exit:
-            raise GeneratorExit
+            raise StopAsyncIteration
         if self.timeout:
             value = await asyncio.wait_for(
-                self.replies.get(), self.timeout, loop=self._loop
+                self.replies.get(), self.timeout
             )
         else:
-            value = self.replies.get_nowait()
+            value = await self.replies.get()
         self.replies.task_done()
         if value == self.end_message:
-            await asyncio.sleep(0.1)
             self._exit = True
             raise StopAsyncIteration
         if self._pause and isinstance(value, BaseException):
@@ -1138,6 +1226,25 @@ def _incremental_decompress(
 
 class HugeData:
 
+    _shared_process_executor = None
+
+    @classmethod
+    def get_process_executor(cls):
+        if cls._shared_process_executor is None:
+            cls._shared_process_executor = ProcessPoolExecutor(
+                max_workers=min(4, (os.cpu_count() or 1) + 1)
+            )
+        else:
+            try:
+                cls._shared_process_executor.submit(int)
+            except (BrokenProcessPool, RuntimeError):
+                cls._shared_process_executor = ProcessPoolExecutor(
+                    max_workers=min(4, (os.cpu_count() or 1) + 1)
+                )
+        return cls._shared_process_executor
+
+    DEFAULT_MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024
+
     def __init__(
         self,
         end_tag,
@@ -1148,6 +1255,7 @@ class HugeData:
         compress_level: int = 1,
         blksize: int = 1000,
         timeout: float = 1,
+        max_decompressed_size: Optional[int] = None,
     ):
         self.sel = selectors.DefaultSelector()
         self.end_tag = end_tag
@@ -1162,20 +1270,35 @@ class HugeData:
         self.compress_level: int = compress_level
         self.blksize: int = blksize
         self._p: tuple = os.pipe()
-        self._write_buffer = b""
+        self._write_buffer = bytearray()
+        self._write_offset = 0
         self._write_end = False
         self._remote_exception = None
         self.timeout = timeout
+        self.max_decompressed_size = (
+            max_decompressed_size
+            if max_decompressed_size is not None
+            else self.DEFAULT_MAX_DECOMPRESSED_SIZE
+        )
 
-        atexit.register(self.destroy)
+        self._finalizer = weakref.finalize(
+            self, HugeData._weak_cleanup,
+            self.data, self._p, self.sel
+        )
 
     def destroy(self):
+        finalizer = self._finalizer
+        if finalizer is None:
+            return
+        self._finalizer = None
+        if finalizer.detach() is None:
+            return
         if isinstance(self.data, SharedMemory):
             ensure_shm_unlink(self.data)
         elif isinstance(self.data, tuple):
             os.close(self.data[0])
             os.close(self.data[1])
-            self.data = None
+        self.data = None
         if self._p:
             os.close(self._p[0])
             os.close(self._p[1])
@@ -1183,27 +1306,40 @@ class HugeData:
         if self.sel:
             self.sel.close()
             self.sel = None
-        atexit.unregister(self.destroy)
 
-    def __del__(self):
-        self.destroy()
+    @staticmethod
+    def _weak_cleanup(data, pipe, sel):
+        if isinstance(data, SharedMemory):
+            ensure_shm_unlink(data)
+        elif isinstance(data, tuple):
+            os.close(data[0])
+            os.close(data[1])
+        if pipe:
+            os.close(pipe[0])
+            os.close(pipe[1])
+        if sel:
+            sel.close()
 
     def add_data(self, data: bytes):
         if not isinstance(self.data, tuple):
             raise TypeError("data")
         if self._write_end:
             raise RuntimeError("pipe close")
-        self._write_buffer += data
+        self._write_buffer.extend(data)
 
     def flush(self):
         self._write_end = True
 
+    _WRITE_BUFFER_COMPACT_THRESHOLD = 1 << 20
+
     def _write_data1(self):
-        if self._write_buffer:
-            r_d, self._write_buffer = (
-                self._write_buffer[:self.blksize],
-                self._write_buffer[self.blksize:]
-            )
+        if self._write_offset < len(self._write_buffer):
+            end = self._write_offset + self.blksize
+            r_d = bytes(self._write_buffer[self._write_offset:end])
+            self._write_offset += len(r_d)
+            if self._write_offset >= self._WRITE_BUFFER_COMPACT_THRESHOLD:
+                del self._write_buffer[:self._write_offset]
+                self._write_offset = 0
             r_d = len(r_d).to_bytes(2, sys.byteorder) + r_d
             os.write(self.data[1], r_d)
         elif self._write_end:
@@ -1242,7 +1378,7 @@ class HugeData:
             read_q.put_nowait(d)
 
         loop.add_reader(self._p[0], _read)
-        process_executor = ProcessPoolExecutor()
+        process_executor = self.get_process_executor()
         f = loop.run_in_executor(process_executor, func)
         try:
             await asyncio.sleep(0)
@@ -1274,7 +1410,6 @@ class HugeData:
             else:
                 exc = None
                 f.cancel()
-            process_executor.shutdown(False, cancel_futures=True)
             if exc:
                 raise exc
 
@@ -1308,12 +1443,14 @@ class HugeData:
             read_q.put_nowait(d)
 
         loop.add_reader(self._p[0], _read)
-        process_executor = ProcessPoolExecutor()
+        process_executor = self.get_process_executor()
         f = loop.run_in_executor(process_executor, func)
         try:
             await asyncio.sleep(0)
             cont = 1
             read_num = 0
+            decompressed_total = 0
+            limit = self.max_decompressed_size
             while cont:
                 if self._remote_exception:
                     remote_exception = msg_unpack(self._remote_exception)
@@ -1326,9 +1463,24 @@ class HugeData:
                 if data:
                     read_num += 1
                     if data.endswith(self.end_tag):
-                        yield data[:-1 * len(self.end_tag)]
+                        chunk = data[:-1 * len(self.end_tag)]
+                        decompressed_total += len(chunk)
+                        if limit and decompressed_total > limit:
+                            raise HugeDataException(
+                                f"decompressed payload exceeds limit "
+                                f"({limit} bytes); aborting to prevent "
+                                f"decompression bomb"
+                            )
+                        yield chunk
                         cont = 0
                     else:
+                        decompressed_total += len(data)
+                        if limit and decompressed_total > limit:
+                            raise HugeDataException(
+                                f"decompressed payload exceeds limit "
+                                f"({limit} bytes); aborting to prevent "
+                                f"decompression bomb"
+                            )
                         yield data
                 await asyncio.sleep(0)
         finally:
@@ -1340,7 +1492,6 @@ class HugeData:
             else:
                 exc = None
                 f.cancel()
-            process_executor.shutdown(False, cancel_futures=True)
             if exc:
                 raise exc
 
