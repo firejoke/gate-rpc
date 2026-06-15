@@ -204,7 +204,7 @@ class GlobalSettings(object):
     MDP_DESCRIPTION_SEP: str = ":"
     # RPC
     MESSAGE_MAX: int = 5000  # 参考ZMQ HWM
-    STREAM_REPLY_MAXSIZE = 0
+    STREAM_REPLY_MAXSIZE = 1024
     STREAM_GENERATOR_TAG = b"GateStreamGenerator"
     STREAM_EXCEPT_TAG = b"GateStreamException"
     STREAM_END_TAG = b"GateStreamEnd"
@@ -252,6 +252,9 @@ class GlobalSettings(object):
             setattr(GlobalSettings, name, value)
         else:
             setattr(self, name, value)
+        cache = self.__dict__.get(LazyAttribute._CACHE_KEY)
+        if cache is not None:
+            cache.clear()
 
     def setup(self, **options):
         if self.USER_SETTINGS:
